@@ -1,5 +1,8 @@
 # Inbrisk
 
+> [!WARNING]
+> **Early Alpha:** This project is currently in early alpha. It is under active development and may be unstable, undergo frequent breaking changes, or exhibit unexpected behavior and rough edges. Supervised usage is recommended.
+
 Local Windows computer-control MCP server. Your AI host sees the screen and
 drives apps over a local stdio connection — no network listener, no cloud.
 
