@@ -276,6 +276,57 @@ public sealed class InbriskTools
         return Text(sb.ToString());
     }
 
+    [McpServerTool(Name = "computer_close_window"), Description(
+        "Gracefully close a window (posts WM_CLOSE — save prompts appear " +
+        "normally, the app stays in control). Target by hwnd, process name, " +
+        "or title substring. Use this to clean up windows you opened when a " +
+        "task is done — don't leave them on the user's desktop.")]
+    public CallToolResult CloseWindow(
+        [Description("window handle — decimal or 0x-prefixed")] string? hwnd = null,
+        [Description("process name of the window to close, e.g. \"mspaint\"")] string? process = null,
+        [Description("substring of the window title")] string? titleContains = null,
+        CancellationToken ct = default)
+    {
+        var wins = _s.Rt.Windows();
+        WindowInfo? w = null;
+        if (ParseHwnd(hwnd) is { } h)
+            w = wins.FirstOrDefault(x => x.Hwnd == h);
+        else if (!string.IsNullOrWhiteSpace(process))
+        {
+            var hits = wins.Where(x => (x.ProcessName ?? "").Contains(process, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (hits.Count > 1)
+                return Text(JsonSerializer.Serialize(new { error = "AmbiguousTarget",
+                    detail = $"{hits.Count} windows owned by '{process}' — pick one by hwnd",
+                    candidates = hits.Select(x => $"0x{x.Hwnd:X} \"{x.Title}\"").ToList() }, J));
+            w = hits.FirstOrDefault();
+        }
+        else if (!string.IsNullOrWhiteSpace(titleContains))
+        {
+            var hits = wins.Where(x => x.Title.Contains(titleContains, StringComparison.OrdinalIgnoreCase)).ToList();
+            if (hits.Count > 1)
+                return Text(JsonSerializer.Serialize(new { error = "AmbiguousTarget",
+                    detail = $"{hits.Count} windows match '{titleContains}' — pick one by hwnd",
+                    candidates = hits.Select(x => $"0x{x.Hwnd:X} \"{x.Title}\"").ToList() }, J));
+            w = hits.FirstOrDefault();
+        }
+        else return Text(JsonSerializer.Serialize(new { error = "Malformed",
+            detail = "pass hwnd, process, or titleContains" }, J));
+
+        if (w == null)
+            return Text(JsonSerializer.Serialize(new { error = "TargetNotFound",
+                detail = "no matching window — list candidates with computer_windows" }, J));
+
+        var closed = _s.Rt.CloseWindow(w.Hwnd);
+        return Text(JsonSerializer.Serialize(new
+        {
+            success = true, closed,
+            hwnd = $"0x{w.Hwnd:X}", title = w.Title, process = w.ProcessName,
+            detail = closed
+                ? "window closed"
+                : "WM_CLOSE posted but window still exists — it may be showing a save prompt (observe it) or the app hung",
+        }, J));
+    }
+
     [McpServerTool(Name = "computer_reset_input"), Description(
         "Input recovery — call when the desktop seems frozen, clicks land " +
         "nowhere, or keys act as if a modifier is held (e.g. after an " +
@@ -1333,9 +1384,10 @@ public sealed class InbriskTools
     }
 
     [McpServerTool(Name = "browser_click"), Description(
-        "Click a DOM element by CSS selector in the debug browser (CDP, " +
-        "sub-second, no coordinate guessing). Element is scrolled into view " +
-        "first. Prefer this over computer_click for anything inside a web page.")]
+        "Click a DOM element in the debug browser (CDP, sub-second, no " +
+        "coordinate guessing). Two ways to target: uid from browser_snapshot " +
+        "(most reliable), or a CSS selector — 'a:has-text(\"Sign in\")' also " +
+        "works. Prefer this over computer_click inside web pages.")]
     public Task<CallToolResult> BrowserClick(
         [Description("CSS selector, e.g. \"#search-btn\", \"button[name='q']\" — omit when using uid")] string? selector = null,
         [Description("element uid from browser_snapshot — the reliable path: no selector guessing")] int? uid = null,
@@ -4126,8 +4178,8 @@ public sealed class InbriskTools
     [McpServerTool(Name = "computer_app_shutdown"), Description(
         "Gracefully shut down the Inbrisk SERVER and terminate this MCP " +
         "session — this does NOT close user applications. To close a user " +
-        "app's window, invoke its Close control or send alt+F4 via " +
-        "computer_hotkey while it's focused.")]
+        "app's window, use computer_close_window (or invoke its visible " +
+        "Close control / alt+F4 while focused).")]
     public CallToolResult AppShutdown(CancellationToken ct = default)
     {
         Task.Run(async () =>
@@ -5222,7 +5274,7 @@ public sealed class InbriskTools
         {
             OutcomeKind.Verified => "outcome is verified with concrete evidence; follow-up computer_observe is NOT needed",
             OutcomeKind.ObservedChange => "a window event was observed, but the target element's exact semantic outcome was not independently verified; call computer_find/computer_observe if confirmation is needed",
-            OutcomeKind.Unverified => "action was dispatched to OS/UIA, but no verifiable state change was observed; re-observe if confirmation is needed",
+            OutcomeKind.Unverified => "the action WAS dispatched to OS/UIA — treat it as done and do NOT retry it blindly; if confirmation is needed verify once via computer_screenshot or computer_observe",
             _ => null
         };
         if (verificationHint != null)

@@ -27,6 +27,7 @@ public sealed class LaunchUnitTests
         public IReadOnlyList<MonitorInfo> GetMonitors() => [];
         public RectPx GetVirtualDesktopBounds() => new(0, 0, 1920, 1080);
         public bool FocusWindow(long hwnd) => true;
+        public bool CloseWindow(long hwnd) => true;
     }
 
     private static WindowInfo Win(long hwnd, int pid, string title,

@@ -34,6 +34,7 @@ public sealed class ExpectationWaitTests
         public IReadOnlyList<MonitorInfo> GetMonitors() => [];
         public RectPx GetVirtualDesktopBounds() => new(0, 0, 1920, 1080);
         public bool FocusWindow(long hwnd) => true;
+        public bool CloseWindow(long hwnd) => true;
     }
 
     private static UiElement MakeEl(string id, string name, Role role, string? value = null, string? state = null)

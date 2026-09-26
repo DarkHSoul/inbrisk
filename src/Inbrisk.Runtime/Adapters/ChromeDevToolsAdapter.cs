@@ -328,7 +328,14 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter
                         return new AdapterResult(false, "ChromeDevTools.Click", "no attachable page target found", Error: ErrorCode.NotFound);
 
                     var script = $@"(() => {{
-                        const el = document.querySelector({JsonSerializer.Serialize(selector)});
+                        const sel = {JsonSerializer.Serialize(selector)};
+                        let el = null;
+                        try {{ el = document.querySelector(sel); }} catch (_) {{}}
+                        if (!el) {{
+                            const m = sel.match(/^(.*?):has-text\([""'](.*?)[""']\)$/);
+                            if (m) el = [...document.querySelectorAll(m[1] || '*')]
+                                .find(x => (x.innerText || '').includes(m[2]));
+                        }}
                         if (!el) return {{ success: false, error: 'selector not found' }};
                         el.scrollIntoView({{ behavior: 'instant', block: 'center', inline: 'center' }});
                         el.click();
@@ -373,7 +380,14 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter
                         return new AdapterResult(false, "ChromeDevTools.Type", "no attachable page target found", Error: ErrorCode.NotFound);
 
                     var script = $@"(() => {{
-                        const el = document.querySelector({JsonSerializer.Serialize(selector)});
+                        const sel = {JsonSerializer.Serialize(selector)};
+                        let el = null;
+                        try {{ el = document.querySelector(sel); }} catch (_) {{}}
+                        if (!el) {{
+                            const m = sel.match(/^(.*?):has-text\([""'](.*?)[""']\)$/);
+                            if (m) el = [...document.querySelectorAll(m[1] || '*')]
+                                .find(x => (x.innerText || '').includes(m[2]));
+                        }}
                         if (!el) return {{ success: false, error: 'selector not found' }};
                         el.scrollIntoView({{ behavior: 'instant', block: 'center', inline: 'center' }});
                         el.focus();

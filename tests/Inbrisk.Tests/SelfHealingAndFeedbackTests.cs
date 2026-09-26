@@ -16,6 +16,7 @@ public sealed class SelfHealingAndFeedbackTests
         public IReadOnlyList<MonitorInfo> GetMonitors() => Array.Empty<MonitorInfo>();
         public RectPx GetVirtualDesktopBounds() => new(0, 0, 1920, 1080);
         public bool FocusWindow(long hwnd) => true;
+        public bool CloseWindow(long hwnd) => true;
     }
 
     private sealed class MockBackend : IElementBackend

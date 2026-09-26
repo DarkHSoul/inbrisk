@@ -165,6 +165,8 @@ public sealed class InbriskRuntime : IDisposable
     public IReadOnlyList<WindowInfo> Windows() => _windows?.ListWindows() ?? [];
     public WindowInfo? Window(long hwnd) => _windows?.GetWindow(hwnd);
     public WindowInfo? ForegroundWindow() => _windows?.GetForegroundWindow();
+    /// <summary>Graceful window close (WM_CLOSE) — surfaces save prompts.</summary>
+    public bool CloseWindow(long hwnd) => _windows?.CloseWindow(hwnd) ?? false;
     public IReadOnlyList<MonitorInfo> Monitors() => _windows?.GetMonitors() ?? [];
     public RectPx VirtualDesktop() => _windows?.GetVirtualDesktopBounds() ?? new RectPx(0, 0, 1920, 1080);
 

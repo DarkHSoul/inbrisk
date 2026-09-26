@@ -12,6 +12,8 @@ public interface IWindowService
     IReadOnlyList<MonitorInfo> GetMonitors();
     RectPx GetVirtualDesktopBounds();
     bool FocusWindow(long hwnd);
+    /// <summary>Graceful close (WM_CLOSE). May surface save prompts.</summary>
+    bool CloseWindow(long hwnd);
 }
 
 public interface IIntegrityService

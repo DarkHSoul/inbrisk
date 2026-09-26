@@ -161,6 +161,25 @@ public sealed class WindowService : IWindowService
         return ok || NativeMethods.GetForegroundWindow() == h;
     });
 
+    /// <summary>
+    /// WM_CLOSE is posted, not sent — the owning thread processes it, so
+    /// unsaved-work prompts appear normally and hung apps don't hang us.
+    /// Returns true once the window is actually gone (polls briefly).
+    /// </summary>
+    public bool CloseWindow(long hwnd) => DesktopBridge.RunOnDefaultDesktop(() =>
+    {
+        var h = new IntPtr(hwnd);
+        if (!NativeMethods.IsWindow(h)) return false;
+        NativeMethods.PostMessageW(h, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
+        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(1500);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (!NativeMethods.IsWindow(h)) return true;
+            Thread.Sleep(100);
+        }
+        return !NativeMethods.IsWindow(h);
+    });
+
     internal static string GetTitle(IntPtr hwnd)
     {
         var len = NativeMethods.GetWindowTextLengthW(hwnd);

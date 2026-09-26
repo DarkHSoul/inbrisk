@@ -117,7 +117,14 @@ public static class McpHost
                     "of shell/PowerShell to locate or start it. To open a " +
                     "URL, do NOT pass it to computer_launch — call " +
                     "browser_browse{url} directly (it self-heals a " +
-                    "debug-enabled browser if needed). For " +
+                    "debug-enabled browser if needed). Inside web pages use " +
+                    "the browser_* tools only: browser_snapshot gives " +
+                    "element uids for browser_click(uid) — no selector " +
+                    "guessing — and browser_capture returns network/" +
+                    "console/vitals in one call; never hand-roll CDP " +
+                    "scripts for that. When a task is finished, clean up " +
+                    "windows you opened: computer_close_window posts a " +
+                    "graceful WM_CLOSE (hwnd, process, or title). For " +
                     "multi-step deterministic UI work, " +
                     "prefer computer_run over issuing many individual " +
                     "computer tools. Use individual tools for exploration or " +
