@@ -82,3 +82,9 @@ tools\publish.ps1 -Version 1.0.0    # release artifacts → artifacts\release\
 ```
 
 See ARCHITECTURE.md for the computer-control design.
+
+## License
+
+Copyright (c) 2026 DarkHSoul. All rights reserved.
+
+This project is licensed under a proprietary / source-available license. See the [LICENSE](LICENSE) file for detailed restrictions and terms. Unauthorized copying, modification, commercial use, or distribution is prohibited.
