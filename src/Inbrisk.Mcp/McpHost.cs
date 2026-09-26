@@ -111,7 +111,10 @@ public static class McpHost
                     "to interact with an " +
                     "application that is not currently running, prefer " +
                     "computer_launch (or a computer_run launch step) instead " +
-                    "of shell/PowerShell to locate or start it. For " +
+                    "of shell/PowerShell to locate or start it. To open a " +
+                    "URL, do NOT pass it to computer_launch — call " +
+                    "browser_browse{url} directly (it self-heals a " +
+                    "debug-enabled browser if needed). For " +
                     "multi-step deterministic UI work, " +
                     "prefer computer_run over issuing many individual " +
                     "computer tools. Use individual tools for exploration or " +

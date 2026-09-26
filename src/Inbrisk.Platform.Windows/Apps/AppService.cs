@@ -127,10 +127,24 @@ public sealed class AppService : IAppService
                     ambiguous.Select(c => new AppCandidate(c.DisplayName,
                         c.Method, c.Identifier, c.Score)).ToList());
             if (best == null)
+            {
+                // "open github.com" gets routed here constantly — a URL is
+                // not an app; point the model at the right tool instead of
+                // a bare not-found.
+                var looksLikeUrl = spec.App!.Contains("://") ||
+                    Uri.TryCreate(spec.App, UriKind.Absolute, out var u) &&
+                    u.Host.Contains('.') ||
+                    System.Text.RegularExpressions.Regex.IsMatch(spec.App!,
+                        @"^[\w\-]+(\.[\w\-]+)+(/|$)");
                 return Fail("TargetNotFound",
                     $"no application resolvable as '{spec.App}' " +
                     "(checked running windows, Start Menu, App Paths, " +
-                    "packaged apps, PATH)", total);
+                    "packaged apps, PATH)" +
+                    (looksLikeUrl
+                        ? " — that looks like a URL, not an app: use " +
+                          "browser_browse{url} to open it in the browser"
+                        : ""), total);
+            }
             chosen = best;
         }
         else
