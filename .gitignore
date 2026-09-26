@@ -1,0 +1,50 @@
+## Build results
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+publish/
+dist/
+artifacts/
+
+# Visual Studio / Rider / VSCode
+.vs/
+.vscode/
+.idea/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+*.userprefs
+
+# Test and coverage
+TestResults/
+[Tt]est[Rr]esults/
+*.trx
+*.coverage
+*.coveragexml
+
+# Temporary files & debug artifacts
+*.log
+*.tmp
+*.temp
+shot*.png
+nul
+
+# Python (tools)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Telemetry / Local user state
+telemetry.jsonl
+*.flag
+inbrisk_state.txt
+
+# Development notes & local experiment reports
+inbrisksetup.txt
+todo.txt
+tools/*.json

@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>inbrisk-mcp</AssemblyName>
+    <Version>0.5.0</Version>
+    <!-- provenance: every build stamps its UTC time + git commit (when the
+         source dir is a repo) into assembly metadata so an MCP client can
+         prove which binary answered the handshake -->
+    <BuildTimestamp>$([System.DateTime]::UtcNow.ToString("o"))</BuildTimestamp>
+    <BuildCommit>$([System.String]::Copy('$(SourceRevisionId)').Trim())</BuildCommit>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BuildTimestamp</_Parameter1>
+      <_Parameter2>$(BuildTimestamp)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BuildCommit</_Parameter1>
+      <_Parameter2>$(BuildCommit)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ModelContextProtocol" Version="2.1.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Inbrisk.Sdk\Inbrisk.Sdk.csproj" />
+    <ProjectReference Include="..\Inbrisk.Setup\Inbrisk.Setup.csproj" />
+  </ItemGroup>
+</Project>

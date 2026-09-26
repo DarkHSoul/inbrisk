@@ -1,0 +1,67 @@
+<Window x:Class="Inbrisk.TestApp.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:Inbrisk.TestApp"
+        Title="InbriskTestApp" Width="480" Height="780"
+        WindowStartupLocation="Manual" Left="200" Top="120">
+    <StackPanel Margin="16">
+        <TextBlock x:Name="StatusText" AutomationProperties.AutomationId="StatusText"
+                   Text="idle" FontWeight="Bold" Margin="0,0,0,12"/>
+        <TextBox x:Name="MainTextBox" AutomationProperties.AutomationId="MainTextBox"
+                 AutomationProperties.Name="Main text box" Height="28" Margin="0,0,0,8"/>
+        <Button x:Name="SaveButton" AutomationProperties.AutomationId="SaveButton"
+                AutomationProperties.Name="Save" Content="Save" Click="OnSave"
+                Width="120" HorizontalAlignment="Left" Margin="0,0,0,8"/>
+        <CheckBox x:Name="EnableCheck" AutomationProperties.AutomationId="EnableCheck"
+                  AutomationProperties.Name="Enable feature" Content="Enable feature" Margin="0,0,0,8"/>
+        <Button x:Name="DisabledButton" AutomationProperties.AutomationId="DisabledButton"
+                AutomationProperties.Name="Disabled button" Content="Disabled" IsEnabled="False"
+                Width="120" HorizontalAlignment="Left" Margin="0,0,0,8"/>
+        <Button x:Name="DialogButton" AutomationProperties.AutomationId="DialogButton"
+                AutomationProperties.Name="Open dialog" Content="Open dialog" Click="OnOpenDialog"
+                Width="120" HorizontalAlignment="Left" Margin="0,0,0,8"/>
+        <ComboBox x:Name="ChoiceCombo" AutomationProperties.AutomationId="ChoiceCombo"
+                  AutomationProperties.Name="Choice" SelectedIndex="0" Margin="0,0,0,8">
+            <ComboBoxItem Content="Alpha" IsSelected="True"/>
+            <ComboBoxItem Content="Beta"/>
+            <ComboBoxItem Content="Gamma"/>
+        </ComboBox>
+        <ListBox x:Name="ItemList" AutomationProperties.AutomationId="ItemList"
+                 AutomationProperties.Name="Item list" Height="90" Margin="0,0,0,8">
+            <ListBoxItem Content="ItemOne"/>
+            <ListBoxItem Content="ItemTwo"/>
+            <ListBoxItem Content="ItemThree"/>
+        </ListBox>
+        <Border x:Name="SecondaryPanel" AutomationProperties.AutomationId="SecondaryPanel"
+                AutomationProperties.Name="Secondary Panel"
+                BorderBrush="LightGray" BorderThickness="1" Padding="6" Margin="0,0,0,8">
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="Panel:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                <Button x:Name="SecondarySaveButton" AutomationProperties.AutomationId="SecondarySaveButton"
+                        AutomationProperties.Name="Commit (Secondary)" Content="Commit (Secondary)" Click="OnSecondarySave"
+                        Width="120"/>
+            </StackPanel>
+        </Border>
+        <StackPanel Orientation="Horizontal" Margin="0,0,0,8">
+            <Button x:Name="LoadRemoteButton" AutomationProperties.AutomationId="LoadRemoteButton"
+                    AutomationProperties.Name="Load Remote" Content="Load Remote" Click="OnLoadRemote"
+                    Width="120" Margin="0,0,8,0"/>
+            <TextBlock x:Name="RemoteItemText" AutomationProperties.AutomationId="RemoteItemText"
+                       Text="" VerticalAlignment="Center"/>
+        </StackPanel>
+        <TextBlock Text="Virtualized Songs:" Margin="0,4,0,2" FontWeight="SemiBold"/>
+        <ListBox x:Name="VirtualizedSongList" AutomationProperties.AutomationId="VirtualizedSongList"
+                 AutomationProperties.Name="Virtualized songs" Height="80"
+                 VirtualizingStackPanel.IsVirtualizing="True"
+                 VirtualizingStackPanel.VirtualizationMode="Recycling"
+                 ScrollViewer.CanContentScroll="True" Margin="0,0,0,8"/>
+        <StackPanel Orientation="Horizontal" Margin="0,4,0,4">
+            <Button x:Name="AnimButton" AutomationProperties.AutomationId="AnimButton"
+                    AutomationProperties.Name="Toggle animation" Content="Toggle animation"
+                    Click="OnToggleAnim" Width="130"/>
+        </StackPanel>
+        <Border BorderBrush="Gray" BorderThickness="1" HorizontalAlignment="Left">
+            <local:PixelCanvas x:Name="Canvas"/>
+        </Border>
+    </StackPanel>
+</Window>

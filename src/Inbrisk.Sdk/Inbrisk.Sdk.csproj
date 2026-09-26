@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Inbrisk.Core\Inbrisk.Core.csproj" />
+    <ProjectReference Include="..\Inbrisk.Runtime\Inbrisk.Runtime.csproj" />
+    <ProjectReference Include="..\Inbrisk.Platform.Windows\Inbrisk.Platform.Windows.csproj" />
+  </ItemGroup>
+
+</Project>

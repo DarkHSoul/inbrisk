@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- WinExe + AttachConsole: double-click opens the setup app window
+         (no console flash); CLI commands attach to the parent console so
+         terminal usage and MCP stdio keep working unchanged. -->
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\inbrisk.ico</ApplicationIcon>
+    <AssemblyName>inbrisk</AssemblyName>
+    <Version>1.0.0</Version>
+    <!-- provenance: stamp UTC time + git commit into assembly metadata so
+         doctor/status can prove which build is installed -->
+    <BuildTimestamp>$([System.DateTime]::UtcNow.ToString("o"))</BuildTimestamp>
+    <BuildCommit>$([System.String]::Copy('$(SourceRevisionId)').Trim())</BuildCommit>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BuildTimestamp</_Parameter1>
+      <_Parameter2>$(BuildTimestamp)</_Parameter2>
+    </AssemblyAttribute>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BuildCommit</_Parameter1>
+      <_Parameter2>$(BuildCommit)</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Inbrisk.Sdk\Inbrisk.Sdk.csproj" />
+    <ProjectReference Include="..\Inbrisk.Mcp\Inbrisk.Mcp.csproj" />
+    <ProjectReference Include="..\Inbrisk.Setup\Inbrisk.Setup.csproj" />
+  </ItemGroup>
+
+</Project>
