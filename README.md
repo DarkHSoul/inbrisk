@@ -43,7 +43,7 @@ inbrisk uninstall      # removes Inbrisk entries, then the binaries
 {
   "mcpServers": {
     "inbrisk": {
-      "command": "C:\\Users\\<you>\\AppData\\Local\\Programs\\Inbrisk\\inbrisk.exe",
+      "command": "%LOCALAPPDATA%\\Programs\\Inbrisk\\inbrisk.exe",
       "args": ["mcp"]
     }
   }
