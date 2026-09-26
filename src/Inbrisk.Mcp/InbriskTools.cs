@@ -1337,14 +1337,16 @@ public sealed class InbriskTools
         "sub-second, no coordinate guessing). Element is scrolled into view " +
         "first. Prefer this over computer_click for anything inside a web page.")]
     public Task<CallToolResult> BrowserClick(
-        [Description("CSS selector, e.g. \"#search-btn\", \"button[name='q']\"")] string selector,
+        [Description("CSS selector, e.g. \"#search-btn\", \"button[name='q']\" — omit when using uid")] string? selector = null,
+        [Description("element uid from browser_snapshot — the reliable path: no selector guessing")] int? uid = null,
         [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
         [Description("CDP port — default 9222")] int? port = null,
         CancellationToken ct = default)
         => BrowserCall("click", new Dictionary<string, object?>
         {
             ["port"] = port ?? 9222,
-            ["selector"] = selector,
+            ["selector"] = selector ?? "",
+            ["uid"] = uid,
             ["tabId"] = tabId,
         }, ct);
 
@@ -1418,6 +1420,49 @@ public sealed class InbriskTools
         [Description("CDP port — default 9222")] int? port = null,
         CancellationToken ct = default)
         => BrowserCall("screenshot", new Dictionary<string, object?>
+        {
+            ["port"] = port ?? 9222,
+            ["tabId"] = tabId,
+        }, ct);
+
+    [McpServerTool(Name = "browser_capture"), Description(
+        "ONE-CALL DevTools-style inspection of the debug browser page: reloads " +
+        "(or navigates) while collecting ALL network requests (count, per-type " +
+        "breakdown, largest transfers), console messages and exceptions, then " +
+        "returns runtime vitals (title/href/DOM+link+script counts, resource " +
+        "count, render-blocking count, TTFB/DCL/load, CLS, LCP when available). " +
+        "Use this instead of hand-rolling CDP scripts for 'analyze network/" +
+        "console/performance of this page' tasks.")]
+    public Task<CallToolResult> BrowserCapture(
+        [Description("optional URL to navigate to first; otherwise reloads the tab")] string? url = null,
+        [Description("reload the page during capture — default true, ignored when url is set")] bool reload = true,
+        [Description("bypass HTTP cache on reload — default true")] bool ignoreCache = true,
+        [Description("how long to collect events in ms — default 6000, clamped 500..60000")] int? durationMs = null,
+        [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
+        [Description("CDP port — default 9222")] int? port = null,
+        CancellationToken ct = default)
+        => BrowserCall("capture", new Dictionary<string, object?>
+        {
+            ["port"] = port ?? 9222,
+            ["url"] = url ?? "",
+            ["reload"] = reload,
+            ["ignoreCache"] = ignoreCache,
+            ["durationMs"] = durationMs,
+            ["tabId"] = tabId,
+        }, ct);
+
+    [McpServerTool(Name = "browser_snapshot"), Description(
+        "Take an accessibility-tree snapshot of the debug-browser page (like " +
+        "chrome-devtools-mcp take_snapshot): returns elements as " +
+        "uid=N role \"name\" — pass uid to browser_click(uid=..) for reliable " +
+        "interaction without CSS-selector guessing. Snapshot instead of " +
+        "screenshot whenever text/structure is enough. Uids reset on " +
+        "navigation — re-snapshot after page changes.")]
+    public Task<CallToolResult> BrowserSnapshot(
+        [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
+        [Description("CDP port — default 9222")] int? port = null,
+        CancellationToken ct = default)
+        => BrowserCall("snapshot", new Dictionary<string, object?>
         {
             ["port"] = port ?? 9222,
             ["tabId"] = tabId,

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Json;
 using System.Net.WebSockets;
@@ -22,7 +23,8 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter
     public IReadOnlyList<string> SupportedActions { get; } = new[]
     {
         "navigate", "click", "type", "evaluate", "get_content", "get_text", "get_html",
-        "list_tabs", "new_tab", "close_tab", "activate_tab", "screenshot", "status"
+        "list_tabs", "new_tab", "close_tab", "activate_tab", "screenshot", "status",
+        "capture", "snapshot"
     };
 
     private static readonly HashSet<string> ChromiumProcesses = new(StringComparer.OrdinalIgnoreCase)
@@ -50,7 +52,7 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter
         return act is "navigate" or "click" or "type" or "fill" or "evaluate"
             or "get_content" or "get_text" or "get_html"
             or "list_tabs" or "get_tabs" or "new_tab" or "close_tab" or "activate_tab"
-            or "screenshot" or "status";
+            or "screenshot" or "status" or "capture" or "snapshot";
     }
 
     public async Task<AdapterResult> ExecuteAsync(
@@ -282,8 +284,44 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter
                 case "click":
                 {
                     var selector = GetArgString(args, "selector", "");
+                    var uidStr = GetArgString(args, "uid", "");
+                    if (!string.IsNullOrWhiteSpace(uidStr) && int.TryParse(uidStr, out var uid))
+                    {
+                        var uidTab = await ResolveActivePageTabAsync(baseUrl, args, ct);
+                        if (uidTab?.WebSocketUrl == null)
+                            return new AdapterResult(false, "ChromeDevTools.Click", "no attachable page target found", Error: ErrorCode.NotFound);
+
+                        if (!SnapshotCache.TryGetValue(uidTab.Id, out var nodes) ||
+                            nodes.FirstOrDefault(n => n.Uid == uid) is not { } node)
+                            return new AdapterResult(false, "ChromeDevTools.Click",
+                                $"uid={uid} unknown or stale — run browser_snapshot first (uids are per-tab and reset on navigation)",
+                                Error: ErrorCode.NotFound);
+
+                        var box = await SendCdpCommandAsync(uidTab.WebSocketUrl, "DOM.getBoxModel",
+                            new { backendNodeId = node.BackendNodeId }, ct);
+                        var quad = box?["result"]?["model"]?["content"] as JsonArray;
+                        if (quad == null || quad.Count < 8)
+                            return new AdapterResult(false, "ChromeDevTools.Click",
+                                $"uid={uid} ({node.Role} '{node.Name}') has no box model — re-run browser_snapshot",
+                                Error: ErrorCode.NotFound);
+
+                        var cx = (quad[0]!.GetValue<double>() + quad[2]!.GetValue<double>() + quad[4]!.GetValue<double>() + quad[6]!.GetValue<double>()) / 4;
+                        var cy = (quad[1]!.GetValue<double>() + quad[3]!.GetValue<double>() + quad[5]!.GetValue<double>() + quad[7]!.GetValue<double>()) / 4;
+                        await SendCdpCommandAsync(uidTab.WebSocketUrl, "Input.dispatchMouseEvent",
+                            new { type = "mousePressed", x = cx, y = cy, button = "left", clickCount = 1 }, ct);
+                        await SendCdpCommandAsync(uidTab.WebSocketUrl, "Input.dispatchMouseEvent",
+                            new { type = "mouseReleased", x = cx, y = cy, button = "left", clickCount = 1 }, ct);
+                        return new AdapterResult(
+                            Success: true,
+                            Method: "ChromeDevTools.Click",
+                            Detail: $"Clicked uid={uid} ({node.Role} '{node.Name}') at ({Math.Round(cx)},{Math.Round(cy)})",
+                            Data: new Dictionary<string, object?>
+                            {
+                                ["uid"] = uid, ["role"] = node.Role, ["name"] = node.Name, ["tabId"] = uidTab.Id
+                            });
+                    }
                     if (string.IsNullOrWhiteSpace(selector))
-                        return new AdapterResult(false, "ChromeDevTools.Click", "selector argument is required", Error: ErrorCode.Unsupported);
+                        return new AdapterResult(false, "ChromeDevTools.Click", "selector or uid argument is required", Error: ErrorCode.Unsupported);
 
                     var targetTab = await ResolveActivePageTabAsync(baseUrl, args, ct);
                     if (targetTab?.WebSocketUrl == null)
@@ -436,6 +474,52 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter
                             ["format"] = "png",
                             ["tabId"] = targetTab.Id,
                             ["base64Length"] = b64?.Length ?? 0
+                        });
+                }
+
+                case "capture":
+                {
+                    var targetTab = await ResolveActivePageTabAsync(baseUrl, args, ct);
+                    if (targetTab?.WebSocketUrl == null)
+                        return new AdapterResult(false, "ChromeDevTools.Capture", "no attachable page target found", Error: ErrorCode.NotFound);
+
+                    var durationMs = int.TryParse(GetArgString(args, "durationMs", GetArgString(args, "timeoutMs", "6000")), out var dm) ? dm : 6000;
+                    var navUrl = GetArgString(args, "url", "");
+                    var reload = !(args?.TryGetValue("reload", out var rv) ?? false) || rv is not (false or "false" or "False");
+                    var ignoreCache = !(args?.TryGetValue("ignoreCache", out var ic) ?? false) || ic is not (false or "false" or "False");
+                    var cap = await CaptureAsync(targetTab.WebSocketUrl, navUrl, reload, ignoreCache, durationMs, ct);
+                    var consoleObj = cap.TryGetValue("console", out var co) && co is Dictionary<string, object?> cd
+                        ? cd : new Dictionary<string, object?>();
+                    var errors = consoleObj.TryGetValue("errors", out var e2) ? e2 : 0;
+                    var warnings = consoleObj.TryGetValue("warnings", out var w2) ? w2 : 0;
+                    var netObj = cap["network"] as Dictionary<string, object?>;
+                    var totalReq = netObj?["summary"] is Dictionary<string, object?> s && s.TryGetValue("total", out var t) ? t : 0;
+                    return new AdapterResult(
+                        Success: true,
+                        Method: "ChromeDevTools.Capture",
+                        Detail: $"Captured {totalReq} requests ({errors} console errors, {warnings} warnings) on '{targetTab.Title}'",
+                        Data: cap);
+                }
+
+                case "snapshot":
+                {
+                    var targetTab = await ResolveActivePageTabAsync(baseUrl, args, ct);
+                    if (targetTab?.WebSocketUrl == null)
+                        return new AdapterResult(false, "ChromeDevTools.Snapshot", "no attachable page target found", Error: ErrorCode.NotFound);
+
+                    var snap = await SnapshotAsync(targetTab, args, ct);
+                    return new AdapterResult(
+                        Success: true,
+                        Method: "ChromeDevTools.Snapshot",
+                        Detail: $"Snapshot of '{targetTab.Title}': {snap.Count} a11y nodes (uids usable in browser_click/browser_type via uid=N)",
+                        Data: new Dictionary<string, object?>
+                        {
+                            ["tabId"] = targetTab.Id,
+                            ["nodeCount"] = snap.Count,
+                            ["nodes"] = snap.Select(n => (object)new Dictionary<string, object?>
+                            {
+                                ["uid"] = n.Uid, ["role"] = n.Role, ["name"] = n.Name
+                            }).ToList()
                         });
                 }
 
@@ -597,5 +681,284 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter
 
         var resJson = Encoding.UTF8.GetString(ms.ToArray());
         return JsonNode.Parse(resJson);
+    }
+
+    private sealed record SnapNode(int Uid, string Role, string Name, long BackendNodeId);
+
+    private sealed class RequestRec
+    {
+        public string Type = "Other"; public string Url = ""; public int Status;
+        public double StartMs; public double EndMs; public double Bytes;
+        public bool FromCache; public bool FromServiceWorker;
+    }
+
+    // uid -> a11y node cache, keyed by tabId. Rebuilt on every snapshot call;
+    // stale after navigation — callers get a clear error and re-snapshot.
+    private static readonly ConcurrentDictionary<string, List<SnapNode>> SnapshotCache = new();
+
+    /// <summary>
+    /// A11y-tree snapshot via Accessibility.getFullAXTree. Assigns stable uids
+    /// (per tab, reset on each snapshot) and remembers backendDOMNodeId so
+    /// click can dispatch real input without CSS-selector guessing.
+    /// </summary>
+    private static async Task<List<SnapNode>> SnapshotAsync(
+        TabInfo tab, IReadOnlyDictionary<string, object?>? args, CancellationToken ct)
+    {
+        var res = await SendCdpCommandAsync(tab.WebSocketUrl!, "Accessibility.getFullAXTree", null, ct);
+        var nodes = res?["result"]?["nodes"] as JsonArray ?? new JsonArray();
+
+        var interesting = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "link", "button", "textbox", "searchbox", "combobox", "checkbox", "radio",
+            "menuitem", "tab", "option", "switch", "slider", "heading", "img",
+            "listbox", "treeitem", "row", "cell", "navigation", "main", "form"
+        };
+
+        var snap = new List<SnapNode>();
+        foreach (var n in nodes)
+        {
+            var role = n?["role"]?["value"]?.ToString() ?? "";
+            var name = n?["name"]?["value"]?.ToString() ?? "";
+            var ignored = n?["ignored"]?.GetValue<bool>() ?? false;
+            var bid = n?["backendDOMNodeId"]?.GetValue<long>() ?? 0;
+            if (ignored || bid == 0 || !interesting.Contains(role)) continue;
+            if (name.Length == 0 && role is not ("img" or "heading")) continue;
+            snap.Add(new SnapNode(snap.Count + 1, role, name.Length > 80 ? name[..80] : name, bid));
+            if (snap.Count >= 400) break;
+        }
+
+        SnapshotCache[tab.Id] = snap;
+        return snap;
+    }
+
+    /// <summary>
+    /// ONE-CALL DevTools-style diagnostics: persistent page WebSocket with
+    /// Network/Runtime/Log enabled, vitals observers injected BEFORE the reload
+    /// via Page.addScriptToEvaluateOnNewDocument (post-load buffered observers
+    /// miss LCP entirely), then structured JSON: network summary/byType/
+    /// largest/failed, console errors+warnings with source/stack, exceptions,
+    /// navigation timing, Web Vitals, render-blocking list.
+    /// </summary>
+    private static async Task<Dictionary<string, object?>> CaptureAsync(
+        string wsUrl, string navUrl, bool reload, bool ignoreCache, int durationMs, CancellationToken ct)
+    {
+        using var ws = new ClientWebSocket();
+        using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        connectCts.CancelAfter(TimeSpan.FromSeconds(5));
+        await ws.ConnectAsync(new Uri(wsUrl), connectCts.Token);
+
+        var requests = new Dictionary<string, RequestRec>();
+        var failed = new List<object>();
+        var console = new List<Dictionary<string, object?>>();
+        var exceptions = new List<object>();
+        var pending = new Dictionary<int, TaskCompletionSource<JsonNode?>>();
+        var nextId = 1;
+
+        Task<JsonNode?> Cmd(string method, object? p)
+        {
+            var id = nextId++;
+            var tcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            pending[id] = tcs;
+            var payload = JsonSerializer.SerializeToUtf8Bytes(new { id, method, @params = p });
+            ws.SendAsync(payload, WebSocketMessageType.Text, true, ct).Wait(ct);
+            return tcs.Task;
+        }
+
+        async Task PumpAsync()
+        {
+            var buf = new byte[256 * 1024];
+            var ms = new MemoryStream();
+            while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
+            {
+                WebSocketReceiveResult res;
+                try { res = await ws.ReceiveAsync(buf, ct); }
+                catch { return; }
+                ms.Write(buf, 0, res.Count);
+                if (!res.EndOfMessage) continue;
+                JsonNode? node;
+                try { node = JsonNode.Parse(ms.ToArray()); }
+                catch { ms.SetLength(0); continue; }
+                ms.SetLength(0);
+                if (node == null) continue;
+
+                if (node["id"] is JsonValue idv && idv.TryGetValue<int>(out var rid) && pending.Remove(rid, out var tcs))
+                {
+                    tcs.TrySetResult(node["result"]);
+                    continue;
+                }
+
+                var method = node["method"]?.ToString();
+                var prm = node["params"];
+                if (prm == null) continue;
+                var reqId = prm["requestId"]?.ToString();
+                switch (method)
+                {
+                    case "Network.requestWillBeSent" when reqId != null:
+                        requests[reqId] = new RequestRec
+                        {
+                            Url = prm["request"]?["url"]?.ToString() ?? "",
+                            StartMs = prm["timestamp"]?.GetValue<double>() ?? 0
+                        };
+                        break;
+                    case "Network.responseReceived" when reqId != null && requests.TryGetValue(reqId, out var rr):
+                        var resp = prm["response"];
+                        rr.Type = prm["type"]?.ToString() ?? rr.Type;
+                        rr.Status = resp?["status"]?.GetValue<int>() ?? 0;
+                        rr.FromCache = resp?["fromDiskCache"]?.GetValue<bool>() ?? false;
+                        rr.FromServiceWorker = resp?["fromServiceWorker"]?.GetValue<bool>() ?? false;
+                        if (rr.Status >= 400)
+                            failed.Add(new Dictionary<string, object?>
+                            {
+                                ["url"] = rr.Url.Length > 110 ? rr.Url[..110] : rr.Url,
+                                ["status"] = rr.Status, ["type"] = rr.Type
+                            });
+                        break;
+                    case "Network.loadingFinished" when reqId != null && requests.TryGetValue(reqId, out var rf):
+                        rf.EndMs = prm["timestamp"]?.GetValue<double>() ?? 0;
+                        rf.Bytes = prm["encodedDataLength"]?.GetValue<double>() ?? 0;
+                        break;
+                    case "Network.loadingFailed" when reqId != null:
+                        failed.Add(new Dictionary<string, object?>
+                        {
+                            ["url"] = requests.TryGetValue(reqId, out var rfx) ? rfx.Url : "",
+                            ["errorText"] = prm["errorText"]?.ToString(),
+                            ["blockedReason"] = prm["blockedReason"]?.ToString(),
+                            ["canceled"] = prm["canceled"]?.GetValue<bool>() ?? false
+                        });
+                        break;
+                    case "Runtime.consoleAPICalled":
+                        var argsArr = prm["args"] as JsonArray;
+                        var stack = prm["stackTrace"]?["callFrames"] as JsonArray;
+                        console.Add(new Dictionary<string, object?>
+                        {
+                            ["level"] = prm["type"]?.ToString(),
+                            ["text"] = argsArr == null ? "" : string.Join(' ', argsArr.Select(a => a?["value"]?.ToString() ?? a?["description"]?.ToString())),
+                            ["url"] = prm["url"]?.ToString() ?? stack?.FirstOrDefault()?["url"]?.ToString(),
+                            ["line"] = prm["lineNumber"]?.GetValue<int>() ?? stack?.FirstOrDefault()?["lineNumber"]?.GetValue<int>()
+                        });
+                        break;
+                    case "Runtime.exceptionThrown":
+                        var det = prm["exceptionDetails"];
+                        exceptions.Add(new Dictionary<string, object?>
+                        {
+                            ["text"] = det?["text"]?.ToString() ?? det?["exception"]?["description"]?.ToString() ?? "exception",
+                            ["url"] = det?["url"]?.ToString(),
+                            ["line"] = det?["lineNumber"]?.GetValue<int>(),
+                            ["column"] = det?["columnNumber"]?.GetValue<int>()
+                        });
+                        break;
+                    case "Log.entryAdded":
+                        var e = prm["entry"];
+                        console.Add(new Dictionary<string, object?>
+                        {
+                            ["level"] = e?["level"]?.ToString(),
+                            ["source"] = e?["source"]?.ToString(),
+                            ["text"] = e?["text"]?.ToString(),
+                            ["url"] = e?["url"]?.ToString(),
+                            ["line"] = e?["lineNumber"]?.GetValue<int>()
+                        });
+                        break;
+                }
+            }
+        }
+
+        // Vitals observers installed BEFORE the navigation so LCP/paint entries
+        // are recorded from document start, not buffered-read after the fact.
+        const string vitalsInject = """
+            window.__inbriskVitals = { lcp: null, cls: 0, inp: null, paint: {} };
+            try { new PerformanceObserver(l => { const e = l.getEntries().at(-1); if (e) __inbriskVitals.lcp = Math.round(e.startTime); })
+                  .observe({ type: 'largest-contentful-paint', buffered: true }); } catch (_) {}
+            try { new PerformanceObserver(l => l.getEntries().forEach(e => { if (!e.hadRecentInput) __inbriskVitals.cls += e.value; }))
+                  .observe({ type: 'layout-shift', buffered: true }); } catch (_) {}
+            try { new PerformanceObserver(l => l.getEntries().forEach(e => __inbriskVitals.paint[e.name] = Math.round(e.startTime)))
+                  .observe({ type: 'paint', buffered: true }); } catch (_) {}
+            try { new PerformanceObserver(l => l.getEntries().forEach(e => { const d = e.duration || 0; if (e.interactionId && d > (__inbriskVitals.inp || 0)) __inbriskVitals.inp = Math.round(d); }))
+                  .observe({ type: 'event', durationThreshold: 16, buffered: true }); } catch (_) {}
+            """;
+
+        var pump = PumpAsync();
+        await Cmd("Network.enable", null);
+        await Cmd("Runtime.enable", null);
+        await Cmd("Log.enable", null);
+        await Cmd("Page.enable", null);
+        await Cmd("Page.addScriptToEvaluateOnNewDocument", new { source = vitalsInject });
+
+        if (navUrl.Length > 0) await Cmd("Page.navigate", new { url = navUrl });
+        else if (reload) await Cmd("Page.reload", new { ignoreCache });
+
+        await Task.Delay(Math.Clamp(durationMs, 500, 60_000), ct);
+
+        const string finalJs = """
+            JSON.stringify((() => {
+              const nav = performance.getEntriesByType('navigation')[0] || {};
+              const res = performance.getEntriesByType('resource');
+              return {
+                title: document.title, href: location.href, readyState: document.readyState,
+                domCount: document.querySelectorAll('*').length,
+                links: document.querySelectorAll('a').length,
+                scripts: document.querySelectorAll('script').length,
+                timing: {
+                  ttfb: Math.round(nav.responseStart || 0),
+                  domContentLoaded: Math.round(nav.domContentLoadedEventEnd || 0),
+                  load: Math.round(nav.loadEventEnd || 0)
+                },
+                vitals: window.__inbriskVitals || null,
+                renderBlocking: res.filter(r => r.renderBlockingStatus === 'blocking')
+                                   .map(r => r.name.split('/').pop()),
+                resourceCount: res.length,
+                transferKB: Math.round(res.reduce((s, r) => s + (r.transferSize || 0), 0) / 1024)
+              };
+            })())
+            """;
+        var evalRes = await Cmd("Runtime.evaluate", new { expression = finalJs, returnByValue = true, awaitPromise = true });
+        var evalJson = evalRes?["result"]?["value"]?.ToString();
+        JsonNode? page = null;
+        try { if (evalJson != null) page = JsonNode.Parse(evalJson); } catch { }
+
+        var byType = requests.Values.GroupBy(r => r.Type).ToDictionary(g => g.Key, g => g.Count());
+        var biggest = requests.Values
+            .OrderByDescending(r => r.Bytes).Take(6)
+            .Select(r => (object)new Dictionary<string, object?>
+            {
+                ["kb"] = Math.Round(r.Bytes / 1024), ["type"] = r.Type,
+                ["durationMs"] = Math.Round((r.EndMs - r.StartMs) * 1000),
+                ["fromCache"] = r.FromCache, ["fromServiceWorker"] = r.FromServiceWorker,
+                ["url"] = r.Url.Length > 110 ? r.Url[..110] : r.Url
+            }).ToList();
+
+        var errors = console.Count(c => c["level"]?.ToString() == "error");
+        var warnings = console.Count(c => c["level"]?.ToString() is "warning" or "warn");
+
+        return new Dictionary<string, object?>
+        {
+            ["page"] = page is JsonObject po ? new Dictionary<string, object?>
+            {
+                ["title"] = po["title"]?.ToString(), ["href"] = po["href"]?.ToString(),
+                ["readyState"] = po["readyState"]?.ToString(),
+                ["domCount"] = po["domCount"], ["links"] = po["links"], ["scripts"] = po["scripts"]
+            } : null,
+            ["network"] = new Dictionary<string, object?>
+            {
+                ["summary"] = new Dictionary<string, object?>
+                {
+                    ["total"] = requests.Count,
+                    ["transferKB"] = page?["transferKB"],
+                    ["cached"] = requests.Values.Count(r => r.FromCache),
+                    ["serviceWorker"] = requests.Values.Count(r => r.FromServiceWorker)
+                },
+                ["byType"] = byType,
+                ["largest"] = biggest,
+                ["failed"] = failed
+            },
+            ["console"] = new Dictionary<string, object?>
+            {
+                ["errors"] = errors, ["warnings"] = warnings,
+                ["entries"] = console.Take(50).ToList()
+            },
+            ["runtime"] = new Dictionary<string, object?> { ["exceptions"] = exceptions },
+            ["timing"] = page?["timing"],
+            ["vitals"] = page?["vitals"],
+            ["renderBlocking"] = page?["renderBlocking"]
+        };
     }
 }
