@@ -357,6 +357,7 @@ public sealed class InbriskTools
         [Description("spawn a new instance instead of reusing a running window — default false")] bool? newInstance = null,
         [Description("window (default) | process | none")] string? waitFor = null,
         [Description("readiness timeout ms — default 10000")] int? timeoutMs = null,
+        [Description("optional remote debugging port for Chrome DevTools Protocol / CDP (e.g. 9222)")] int? debugPort = null,
         CancellationToken ct = default)
     {
         var epoch = _s.Control.ActionToken();
@@ -386,7 +387,7 @@ public sealed class InbriskTools
         {
             r = _s.Rt.Launch(new LaunchSpec(app ?? search, executable, path,
                 aumid, uri, arguments, newInstance ?? false,
-                waitFor ?? "window", timeoutMs ?? 10000), linked.Token);
+                waitFor ?? "window", timeoutMs ?? 10000, debugPort), linked.Token);
         }
         catch (OperationCanceledException)
         {
@@ -1212,11 +1213,13 @@ public sealed class InbriskTools
     }
 
     [McpServerTool(Name = "computer_adapter"), Description(
-        "Direct specialist application adapter execution (e.g. media controls for Spotify/VLC, " +
+        "Direct specialist application adapter execution (for browser work prefer the dedicated browser_* tools — " +
+        "browser_browse, browser_click, browser_type, browser_evaluate, browser_content, browser_tabs — " +
+        "the one-call self-healing path). Chrome DevTools Protocol / CDP for DOM, script, tabs; media controls for Spotify/VLC; " +
         "specialist app APIs, CLI tools). Bypasses coordinate clicking and executes semantic commands in <5ms.")]
     public async Task<CallToolResult> AdapterExecute(
-        [Description("action to execute, e.g. play, pause, next, previous, volume_up, volume_down, mute, read_state, save")] string action,
-        [Description("optional preferred adapter ID: media | testapp")] string? adapter = null,
+        [Description("action to execute, e.g. navigate, click, type, evaluate, get_content, list_tabs, new_tab, close_tab, play, pause, next, volume_up, read_state")] string action,
+        [Description("optional preferred adapter ID: chrome_devtools | media | testapp")] string? adapter = null,
         [Description("optional target application specification")] TargetSpec? target = null,
         [Description("optional arguments payload for the adapter")] Dictionary<string, object?>? args = null,
         CancellationToken ct = default)
@@ -1254,6 +1257,170 @@ public sealed class InbriskTools
             durationMs = sw.ElapsedMilliseconds
         });
     }
+
+    // ---------------- browser_* — first-class Chrome/CDP tools ----------------
+    // One-call, self-healing paths over the chrome_devtools adapter: no
+    // computer_launch needed — a dead CDP port auto-spawns a debug browser.
+
+    /// <summary>Shared dispatch for the browser_* family — every call goes
+    /// through the emergency-stop token and the chrome_devtools adapter.</summary>
+    private async Task<CallToolResult> BrowserCall(
+        string action, Dictionary<string, object?> args, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var epoch = _s.Control.ActionToken();
+        if (epoch == null)
+            return Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            ct, _s.SessionCts.Token, epoch.Value);
+
+        var registry = _s?.Adapters ?? new Inbrisk.Runtime.Adapters.ApplicationAdapterRegistry();
+        (bool handled, Inbrisk.Core.AdapterResult? res) = await registry.TryExecuteAsync(
+            action: action,
+            target: null,
+            args: args,
+            processName: "chrome",
+            hwnd: null,
+            preferredAdapterId: "chrome_devtools",
+            ct: linked.Token);
+
+        if (!handled || res == null)
+            return Error(OutcomeKind.Failed, "chrome_devtools adapter unavailable", sw);
+        if (!res.Success)
+            return Error(res.Error == ErrorCode.NotFound
+                    ? OutcomeKind.TargetNotFound : OutcomeKind.Failed,
+                res.Detail ?? $"browser {action} failed", sw);
+
+        return Json(new
+        {
+            success = true,
+            method = res.Method,
+            detail = res.Detail,
+            data = res.Data,
+            durationMs = sw.ElapsedMilliseconds
+        });
+    }
+
+    [McpServerTool(Name = "browser_browse"), Description(
+        "ONE-CALL browser navigation — ALWAYS prefer this for \"open/navigate " +
+        "to a page in Chrome\" requests instead of chaining computer_launch + " +
+        "computer_adapter. Attaches to a debug-enabled Chromium browser on the " +
+        "CDP port (default 9222); if none is reachable it auto-spawns one " +
+        "with its own profile — no separate launch step, no setup. Bare hosts " +
+        "like \"google.com\" get https:// automatically. Returns the live tab " +
+        "(tabId/url/title); pass tabId to the other browser_* tools to pin " +
+        "the same tab.")]
+    public Task<CallToolResult> BrowserBrowse(
+        [Description("URL to open — \"google.com\" becomes https://google.com")] string url,
+        [Description("open in a new tab instead of navigating the active tab")] bool newTab = false,
+        [Description("CDP port — default 9222")] int? port = null,
+        [Description("pin a specific tab from browser_tabs")] string? tabId = null,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(url))
+            return Task.FromResult(Error(OutcomeKind.Malformed, "url is required"));
+        if (!url.Contains("://", StringComparison.Ordinal))
+            url = "https://" + url.Trim();
+
+        var args = new Dictionary<string, object?>
+        {
+            ["port"] = port ?? 9222,
+            ["url"] = url,
+        };
+        if (tabId != null) args["tabId"] = tabId;
+        return BrowserCall(newTab ? "new_tab" : "navigate", args, ct);
+    }
+
+    [McpServerTool(Name = "browser_click"), Description(
+        "Click a DOM element by CSS selector in the debug browser (CDP, " +
+        "sub-second, no coordinate guessing). Element is scrolled into view " +
+        "first. Prefer this over computer_click for anything inside a web page.")]
+    public Task<CallToolResult> BrowserClick(
+        [Description("CSS selector, e.g. \"#search-btn\", \"button[name='q']\"")] string selector,
+        [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
+        [Description("CDP port — default 9222")] int? port = null,
+        CancellationToken ct = default)
+        => BrowserCall("click", new Dictionary<string, object?>
+        {
+            ["port"] = port ?? 9222,
+            ["selector"] = selector,
+            ["tabId"] = tabId,
+        }, ct);
+
+    [McpServerTool(Name = "browser_type"), Description(
+        "Fill an input/textarea by CSS selector in the debug browser — sets " +
+        "value and fires input+change events (CDP, no keystrokes). Prefer this " +
+        "over computer_type for web forms.")]
+    public Task<CallToolResult> BrowserType(
+        [Description("CSS selector of the input/textarea")] string selector,
+        [Description("text to fill in")] string text,
+        [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
+        [Description("CDP port — default 9222")] int? port = null,
+        CancellationToken ct = default)
+        => BrowserCall("type", new Dictionary<string, object?>
+        {
+            ["port"] = port ?? 9222,
+            ["selector"] = selector,
+            ["text"] = text,
+            ["tabId"] = tabId,
+        }, ct);
+
+    [McpServerTool(Name = "browser_evaluate"), Description(
+        "Run JavaScript in the active page of the debug browser and return " +
+        "the result (CDP Runtime.evaluate, awaitPromise + returnByValue). " +
+        "The escape hatch for anything the other browser_* tools don't cover.")]
+    public Task<CallToolResult> BrowserEvaluate(
+        [Description("JavaScript expression to evaluate")] string expression,
+        [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
+        [Description("CDP port — default 9222")] int? port = null,
+        CancellationToken ct = default)
+        => BrowserCall("evaluate", new Dictionary<string, object?>
+        {
+            ["port"] = port ?? 9222,
+            ["expression"] = expression,
+            ["tabId"] = tabId,
+        }, ct);
+
+    [McpServerTool(Name = "browser_content"), Description(
+        "Get the page's text/HTML (optionally scoped to a CSS selector) from " +
+        "the debug browser — fast DOM read over CDP, no screenshots or UIA.")]
+    public Task<CallToolResult> BrowserContent(
+        [Description("optional CSS selector to scope extraction")] string? selector = null,
+        [Description("text (default) | html")] string? format = null,
+        [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
+        [Description("CDP port — default 9222")] int? port = null,
+        CancellationToken ct = default)
+        => BrowserCall(format == "html" ? "get_html" : "get_text",
+            new Dictionary<string, object?>
+            {
+                ["port"] = port ?? 9222,
+                ["selector"] = selector,
+                ["tabId"] = tabId,
+            }, ct);
+
+    [McpServerTool(Name = "browser_tabs"), Description(
+        "List tabs/targets of the debug browser (self-heals like the other " +
+        "browser_* tools). Returns tabId values usable in browser_browse, " +
+        "browser_click, browser_type, browser_evaluate, browser_content.")]
+    public Task<CallToolResult> BrowserTabs(
+        [Description("CDP port — default 9222")] int? port = null,
+        CancellationToken ct = default)
+        => BrowserCall("list_tabs", new Dictionary<string, object?>
+        {
+            ["port"] = port ?? 9222,
+        }, ct);
+
+    [McpServerTool(Name = "browser_screenshot"), Description(
+        "Capture the active page of the debug browser as PNG (base64) via CDP.")]
+    public Task<CallToolResult> BrowserScreenshot(
+        [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
+        [Description("CDP port — default 9222")] int? port = null,
+        CancellationToken ct = default)
+        => BrowserCall("screenshot", new Dictionary<string, object?>
+        {
+            ["port"] = port ?? 9222,
+            ["tabId"] = tabId,
+        }, ct);
 
     [McpServerTool(Name = "computer_list_adapters"), Description(
         "List all active specialist application adapters and their supported semantic actions.")]
@@ -2194,6 +2361,7 @@ public sealed class InbriskTools
         if (s.Arguments is { Length: > 0 }) set.Add("arguments");
         if (s.NewInstance == true) set.Add("newInstance");
         if (s.WaitFor != null) set.Add("waitFor");
+        if (s.DebugPort != null) set.Add("debugPort");
         if (s.Where != null) set.Add("where");
         if (s.Steps is { Length: > 0 }) set.Add("steps");
         if (s.MaxItems != null) set.Add("maxItems");
@@ -2248,7 +2416,7 @@ public sealed class InbriskTools
             "wait_for_change" or "wait_for_stable" => ["ms"],
             "launch" => ["target", "text", "value", "as", "ms", "app",
                 "search", "executable", "path", "aumid", "uri", "arguments",
-                "newInstance", "waitFor"],
+                "newInstance", "waitFor", "debugPort"],
             _ => null,
         };
         if (allowed == null)
@@ -2990,7 +3158,7 @@ public sealed class InbriskTools
         }
         return new LaunchSpec(app, s.Executable, s.Path, s.Aumid, s.Uri,
             s.Arguments, s.NewInstance ?? false, s.WaitFor ?? "window",
-            s.Timeout ?? s.Ms ?? 10000);
+            s.Timeout ?? s.Ms ?? 10000, s.DebugPort);
     }
 
     /// <summary>wait_for scope: derive the window/process subtree to watch
@@ -3622,17 +3790,29 @@ public sealed class InbriskTools
         => Act(new AgentAction(AgentActionKind.Key, Key: key, Count: count), ct);
 
     [McpServerTool(Name = "computer_hotkey"), Description(
-        "Press a key combination — key=\"s\" modifiers=[\"ctrl\"] sends " +
-        "Ctrl+S to the FOREGROUND window. Focus the target window first " +
-        "(computer_focus_window) — SendInput cannot route keys to a " +
-        "background window. In computer_run prefer keys:\"ctrl+s\" " +
-        "shorthand or key+modifiers.")]
+        "Press a key combination — key=\"s\" modifiers=[\"ctrl\"] or the " +
+        "shorthand keys=\"ctrl+s\" sends Ctrl+S to the FOREGROUND window. " +
+        "Focus the target window first (computer_focus_window) — SendInput " +
+        "cannot route keys to a background window.")]
     public Task<CallToolResult> Hotkey(
-        [Description("key name")] string key,
+        [Description("key name")] string? key = null,
         [Description("modifier names: ctrl,shift,alt,win")] string[]? modifiers = null,
+        [Description("combo shorthand like \"ctrl+s\" — alternative to key+modifiers")] string? keys = null,
         CancellationToken ct = default)
-        => Act(new AgentAction(AgentActionKind.Hotkey, Key: key,
+    {
+        if (key == null && keys is { } combo)
+        {
+            var parts = combo.Split(['+', ',', ' '],
+                StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            key = parts.LastOrDefault();
+            modifiers ??= parts.Take(parts.Length - 1).ToArray();
+        }
+        if (key == null)
+            return Task.FromResult(Error(OutcomeKind.Malformed,
+                "hotkey requires key+modifiers, or keys shorthand like \"ctrl+s\""));
+        return Act(new AgentAction(AgentActionKind.Hotkey, Key: key,
             Modifiers: modifiers), ct);
+    }
 
     [McpServerTool(Name = "computer_scroll"), Description(
         "Scroll the mouse wheel — at an elementId, a semantic target, an " +
@@ -3727,6 +3907,7 @@ public sealed class InbriskTools
         [Description("minimum number of matching elements")] int? minCount = null,
         [Description("abort wait immediately if an unexpected modal dialog or error appears (default true)")] bool stopOnDialog = true,
         [Description("timeout ms (default 5000)")] int ms = 5000,
+        [Description("alias of ms — models often write timeoutMs")] int? timeoutMs = null,
         CancellationToken ct = default)
     {
         var targetQuery = query ?? target?.Name ?? target?.NameContains;
@@ -3739,7 +3920,7 @@ public sealed class InbriskTools
             Gone: gone,
             Count: minCount,
             StopOnUnexpectedDialog: stopOnDialog,
-            Ms: ms), ct);
+            Ms: timeoutMs ?? ms), ct);
     }
 
     [McpServerTool(Name = "computer_wait_for_change"), Description(
@@ -3849,8 +4030,10 @@ public sealed class InbriskTools
     // ------------------------------------------------------------ Application Lifecycle
 
     [McpServerTool(Name = "computer_app_status"), Description(
-        "Read-only application lifecycle status: version, active MCP sessions, emergency state, " +
-        "UI processes, and install mode.")]
+        "Read-only status of the Inbrisk SERVER itself (this tool takes no " +
+        "target — it does NOT report on user apps like notepad): version, " +
+        "active MCP sessions, emergency state, UI processes, install mode. " +
+        "For user apps use computer_windows or computer_apps.")]
     public CallToolResult AppStatus(CancellationToken ct = default)
     {
         var status = new
@@ -3870,8 +4053,9 @@ public sealed class InbriskTools
     }
 
     [McpServerTool(Name = "computer_app_restart"), Description(
-        "Safely restart Inbrisk. WARNING: This operation intentionally terminates the current " +
-        "MCP session. The MCP host may need to reconnect or respawn Inbrisk.")]
+        "Restart the Inbrisk SERVER itself — not a user application. " +
+        "WARNING: intentionally terminates the current MCP session; the " +
+        "MCP host may need to reconnect or respawn Inbrisk.")]
     public CallToolResult AppRestart(CancellationToken ct = default)
     {
         Task.Run(async () =>
@@ -3894,7 +4078,10 @@ public sealed class InbriskTools
     }
 
     [McpServerTool(Name = "computer_app_shutdown"), Description(
-        "Gracefully shut down Inbrisk and terminate the MCP server.")]
+        "Gracefully shut down the Inbrisk SERVER and terminate this MCP " +
+        "session — this does NOT close user applications. To close a user " +
+        "app's window, invoke its Close control or send alt+F4 via " +
+        "computer_hotkey while it's focused.")]
     public CallToolResult AppShutdown(CancellationToken ct = default)
     {
         Task.Run(async () =>
@@ -4100,6 +4287,7 @@ public sealed class InbriskTools
         [Description("launch: structured arguments — each element one verbatim argument; never a command line")] string[]? Arguments = null,
         [Description("launch: force a new instance instead of reusing a running window — default false")] bool? NewInstance = null,
         [Description("launch readiness: window (default — usable top-level window+UIA) | process | none")] string? WaitFor = null,
+        [Description("launch: optional remote debugging port for Chrome DevTools Protocol / CDP (e.g. 9222)")] int? DebugPort = null,
         [Description("scan/for_each: filter criteria for matching items (startsWith, contains, role, etc.)")] ItemFilter? Where = null,
         [Description("scan/for_each: sub-steps executed for each matching item (binds $item or $as)")] RunStep[]? Steps = null,
         [Description("scan/for_each: maximum items to process (default 20, max 200)")] int? MaxItems = null,
@@ -4344,10 +4532,20 @@ public sealed class InbriskTools
     {
         var targetDesc = target.Summary();
         var fg = _s?.Rt?.ForegroundWindow();
+        // When the caller scoped the target to a process, every diagnosis
+        // below must look at that process's window — otherwise we report
+        // ambient foreground facts (and close matches) from an unrelated
+        // window, which actively misleads the model.
+        var procWin = target.Process == null ? null
+            : _s?.Rt?.Windows().FirstOrDefault(w =>
+                (w.ProcessName ?? "").Contains(target.Process,
+                    StringComparison.OrdinalIgnoreCase));
         var scopeDesc = target.Hwnd != null ? $"Window 0x{ParseHwnd(target.Hwnd):X}"
             : target.Window != null ? $"Window titled '{target.Window}'"
+            : procWin != null ? $"Process '{target.Process}' window '{procWin.Title}' (0x{procWin.Hwnd:X})"
             : fg != null ? $"Foreground window '{fg.Title}' (0x{fg.Hwnd:X})"
             : "Desktop";
+        var scopeWin = procWin ?? fg;
 
         if (relErr != null)
         {
@@ -4402,8 +4600,8 @@ public sealed class InbriskTools
                 SuggestedAction: suggested);
         }
 
-        // Check if the foreground application is unresponsive
-        if (fg?.Pid is { } pid)
+        // Check if the scoped application is unresponsive
+        if (scopeWin?.Pid is { } pid)
         {
             try
             {
@@ -4412,7 +4610,7 @@ public sealed class InbriskTools
                 {
                     return new TargetDiagnosis(
                         Reason: "AppNotResponding",
-                        Summary: $"Target application '{fg.ProcessName}' (PID {pid}) is not responding to Windows messages",
+                        Summary: $"Target application '{scopeWin.ProcessName}' (PID {pid}) is not responding to Windows messages",
                         SearchedScope: scopeDesc,
                         SuggestedAction: "wait for application to finish its busy state before retrying");
                 }
@@ -4421,11 +4619,11 @@ public sealed class InbriskTools
         }
 
         // Check if a modal dialog appeared and is blocking the target window
-        if (fg != null && (fg.Title.Contains("Dialog", StringComparison.OrdinalIgnoreCase) || LooksLikeDialog(fg.Hwnd)))
+        if (scopeWin != null && (scopeWin.Title.Contains("Dialog", StringComparison.OrdinalIgnoreCase) || LooksLikeDialog(scopeWin.Hwnd)))
         {
             return new TargetDiagnosis(
                 Reason: "ModalDialogBlocking",
-                Summary: $"Foreground window is modal dialog '{fg.Title}' (0x{fg.Hwnd:X}) which may be blocking the target window",
+                Summary: $"Scoped window is modal dialog '{scopeWin.Title}' (0x{scopeWin.Hwnd:X}) which may be blocking the target",
                 SearchedScope: scopeDesc,
                 SuggestedAction: "dismiss or inspect the modal dialog elements first");
         }
@@ -4437,6 +4635,8 @@ public sealed class InbriskTools
             try
             {
                 var offscreenSpec = new FindSpec(
+                    Hwnd: target.Hwnd != null ? ParseHwnd(target.Hwnd) : procWin?.Hwnd,
+                    Pid: procWin?.Pid,
                     Role: target.Role != null && Enum.TryParse<Inbrisk.Core.Role>(target.Role, true, out var r) ? r : null,
                     Name: targetName,
                     IncludeOffscreen: true,
@@ -4472,8 +4672,10 @@ public sealed class InbriskTools
                 SuggestedAction: sug.NavigationHint);
         }
 
-        // Check for close matches / typos in the active window
-        var closeMatches = FindCloseMatches(target, target.Hwnd != null ? ParseHwnd(target.Hwnd) : fg?.Hwnd);
+        // Check for close matches / typos inside the searched scope —
+        // the target's own process window when scoped, else foreground.
+        var closeMatches = FindCloseMatches(target,
+            target.Hwnd != null ? ParseHwnd(target.Hwnd) : procWin?.Hwnd ?? fg?.Hwnd);
         if (closeMatches.Count > 0)
         {
             return new TargetDiagnosis(

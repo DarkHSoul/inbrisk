@@ -76,6 +76,13 @@ public sealed class AppService : IAppService
             return Fail("Malformed",
                 "arguments only apply to executable launches (app/executable/path)", total);
 
+        // A requested CDP port that is ALREADY live means a debug-enabled
+        // browser is running — instance reuse is safe. When the port is
+        // dead, the running browser cannot serve DevTools, so reuse checks
+        // below stay disabled and we spawn a dedicated debug instance.
+        var debugReady = spec.DebugPort.HasValue &&
+            DebugPortReachable(spec.DebugPort.Value);
+
         // ---- explicit identifiers resolve directly ----
         var resolved = ResolveDirect(spec, out var directErr);
         if (directErr != null)
@@ -103,7 +110,7 @@ public sealed class AppService : IAppService
                     "not a shell; use executable UI applications", total);
 
             // ---- friendly name → existing instance first ----
-            if (!spec.NewInstance &&
+            if (!spec.NewInstance && (!spec.DebugPort.HasValue || debugReady) &&
                 FindRunning(spec.App, null) is { } existing)
                 return Done(LaunchMethod.ExistingInstance, spec.App,
                     existing.ProcessName, existing.Pid, existing.Hwnd,
@@ -149,7 +156,8 @@ public sealed class AppService : IAppService
         // titleMatch stays loose only for friendly names — an explicit
         // exe/path/aumid must match by PROCESS, so "Qwen - BRO3d" can
         // never pose as the app behind BRO3d.uproject
-        if (!spec.NewInstance && chosen.Method != LaunchMethod.Protocol &&
+        if (!spec.NewInstance && (!spec.DebugPort.HasValue || debugReady) &&
+            chosen.Method != LaunchMethod.Protocol &&
             FindRunning(chosen.DisplayName, chosen.ExeHints,
                 titleMatch: spec.App != null) is { } running)
             return Done(LaunchMethod.ExistingInstance, chosen.DisplayName,
@@ -161,7 +169,18 @@ public sealed class AppService : IAppService
         int? spawnedPid;
         try
         {
-            spawnedPid = (Spawner ?? SpawnReal)(chosen, spec.Arguments);
+            var effectiveArgs = spec.Arguments != null ? new List<string>(spec.Arguments) : new List<string>();
+            if (spec.DebugPort.HasValue)
+            {
+                effectiveArgs.Add($"--remote-debugging-port={spec.DebugPort.Value}");
+                effectiveArgs.Add("--remote-allow-origins=*");
+                effectiveArgs.Add("--no-first-run");
+                effectiveArgs.Add("--no-default-browser-check");
+                effectiveArgs.Add("--profile-directory=Default");
+                var profileDir = Path.Combine(Path.GetTempPath(), $"inbrisk_debug_profile_{spec.DebugPort.Value}");
+                effectiveArgs.Add($"--user-data-dir={profileDir}");
+            }
+            spawnedPid = (Spawner ?? SpawnReal)(chosen, effectiveArgs.Count > 0 ? effectiveArgs : null);
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception e)
@@ -922,8 +941,9 @@ public sealed class AppService : IAppService
         var named = wins.Where(w =>
         {
             var pn = NormProc(w.ProcessName);
-            return pn == spawnedName || hints.Contains(pn) ||
-                   (pn.Length > 0 && Norm(w.Title).Contains(norm));
+            if (spawnedName != null && pn == spawnedName) return true;
+            if (hints.Count > 0 && hints.Contains(pn)) return true;
+            return hints.Count == 0 && spawnedName == null && pn.Length > 0 && Norm(w.Title).Contains(norm);
         }).ToList();
         return BestWindow(named);
     }
@@ -954,6 +974,19 @@ public sealed class AppService : IAppService
         }
         catch { }
         return false;
+    }
+
+    private static bool DebugPortReachable(int port)
+    {
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromMilliseconds(800) };
+            using var resp = http
+                .GetAsync($"http://127.0.0.1:{port}/json/version")
+                .GetAwaiter().GetResult();
+            return resp.IsSuccessStatusCode;
+        }
+        catch { return false; }
     }
 
     private static LaunchReadiness? ParseReadiness(string? waitFor)

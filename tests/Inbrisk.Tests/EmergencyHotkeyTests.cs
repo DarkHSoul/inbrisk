@@ -158,8 +158,12 @@ public sealed class EmergencyHotkeyTests
             Assert.True(sneak.IsError);
             Assert.Contains("PolicyDenied", TextOf(sneak));
             var tools = await client.ListToolsAsync();
+            // computer_resume_run resumes PAUSED plans — it can never clear
+            // an emergency stop, so it's legitimately present; what must not
+            // exist is any tool that lifts the emergency state itself
             Assert.DoesNotContain(tools, t =>
-                t.Name.Contains("resume", StringComparison.OrdinalIgnoreCase));
+                t.Name.Contains("resume", StringComparison.OrdinalIgnoreCase) &&
+                t.Name != "computer_resume_run");
 
             // a NEW server process (fresh session) still sees the stop
             await client.DisposeAsync();

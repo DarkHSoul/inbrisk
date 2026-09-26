@@ -18,6 +18,10 @@ public sealed class ApplicationAdapterRegistry
         {
             Register(new WindowsMediaAdapter());
             Register(new TestAppAdapter());
+            var chrome = new ChromeDevToolsAdapter();
+            Register(chrome);
+            _adapters["cdp"] = chrome;
+            _adapters["chrome"] = chrome;
         }
     }
 
@@ -32,21 +36,24 @@ public sealed class ApplicationAdapterRegistry
     public IApplicationAdapter? GetAdapter(string adapterId)
         => _adapters.TryGetValue(adapterId, out var a) ? a : null;
 
-    public IReadOnlyList<IApplicationAdapter> GetAllAdapters() => _adapters.Values.ToList();
+    public IReadOnlyList<IApplicationAdapter> GetAllAdapters() => _adapters.Values.DistinctBy(a => a.AdapterId).ToList();
 
     public IReadOnlyList<AdapterCapability> GetCapabilities()
     {
-        return _adapters.Values.Select(a => new AdapterCapability(
-            AdapterId: a.AdapterId,
-            DisplayName: a.DisplayName,
-            SupportedActions: a.SupportedActions,
-            IsActive: true
-        )).ToList();
+        return _adapters.Values
+            .DistinctBy(a => a.AdapterId)
+            .Select(a => new AdapterCapability(
+                AdapterId: a.AdapterId,
+                DisplayName: a.DisplayName,
+                SupportedActions: a.SupportedActions,
+                IsActive: true
+            )).ToList();
     }
 
     public IReadOnlyList<IApplicationAdapter> FindApplicable(string? processName, long? hwnd)
     {
         return _adapters.Values
+            .DistinctBy(a => a.AdapterId)
             .Where(a => a.IsApplicable(processName, hwnd))
             .ToList();
     }

@@ -96,7 +96,11 @@ public sealed class AutoVerifier
         if (post != null)
             return Verified("ValueReadback", expected, (string?)post.Props.GetValueOrDefault("value"));
         var last = ReRead(el);
-        if (last == null) return Verified("ElementGone", detail: "element no longer present");
+        // Element gone proves nothing about the value write — it can mean
+        // the write was committed and the dialog closed, but it can just as
+        // well mean the provider re-created the peer (identity churn), which
+        // is exactly the silent-failure case. Honest outcome: Unverified.
+        if (last == null) return null;
         var actual = (string?)last.Props.GetValueOrDefault("value");
         return Failed($"value readback mismatch: expected \"{expected}\", got \"{actual}\"",
             new VerifyEvidence("ValueReadback", expected, actual));
@@ -113,7 +117,9 @@ public sealed class AutoVerifier
             return Verified("PropertyChanged", before,
                 (string?)post.Props.GetValueOrDefault("toggleState"), "toggleState");
         var last = ReRead(el);
-        if (last == null) return Verified("ElementGone", detail: "element no longer present");
+        // same honesty rule as VerifyValue: a vanished element does not
+        // prove the toggle flipped — identity churn reads identically.
+        if (last == null) return null;
         if (last.Props.GetValueOrDefault("toggleState") is not string after)
             return null; // pattern gone → can't judge
         return Failed($"toggleState unchanged (still {after})",
@@ -130,7 +136,7 @@ public sealed class AutoVerifier
                 pre.Element!.Props.GetValueOrDefault("selected")?.ToString(),
                 "true", "selected");
         var last = ReRead(el);
-        if (last == null) return Verified("ElementGone", detail: "element no longer present");
+        if (last == null) return null;
         if (last.Props.GetValueOrDefault("selected") is not bool sel) return null;
         return Failed($"selected still {sel}",
             new VerifyEvidence("PropertyChanged", "true", sel.ToString().ToLower(), "selected"));

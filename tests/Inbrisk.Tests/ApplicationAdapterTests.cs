@@ -206,4 +206,179 @@ public class ApplicationAdapterTests
         Assert.True(doc.RootElement.GetProperty("success").GetBoolean());
         Assert.Equal("WindowsMedia.Mute", doc.RootElement.GetProperty("method").GetString());
     }
+
+    [Fact]
+    public void ChromeDevToolsAdapter_MetadataAndApplicability()
+    {
+        var adapter = new ChromeDevToolsAdapter();
+        Assert.Equal("chrome_devtools", adapter.AdapterId);
+        Assert.Contains("Chrome DevTools", adapter.DisplayName);
+        Assert.Contains("navigate", adapter.SupportedActions);
+        Assert.Contains("click", adapter.SupportedActions);
+        Assert.Contains("type", adapter.SupportedActions);
+        Assert.Contains("evaluate", adapter.SupportedActions);
+        Assert.Contains("get_content", adapter.SupportedActions);
+        Assert.Contains("list_tabs", adapter.SupportedActions);
+        Assert.Contains("new_tab", adapter.SupportedActions);
+        Assert.Contains("close_tab", adapter.SupportedActions);
+        Assert.Contains("status", adapter.SupportedActions);
+
+        // Applicable to Chromium family
+        Assert.True(adapter.IsApplicable("chrome", 100));
+        Assert.True(adapter.IsApplicable("chrome.exe", 100));
+        Assert.True(adapter.IsApplicable("msedge", 200));
+        Assert.True(adapter.IsApplicable("brave", 300));
+        Assert.False(adapter.IsApplicable("notepad", 400));
+        Assert.False(adapter.IsApplicable(null, null));
+
+        // Can handle CDP actions
+        Assert.True(adapter.CanHandle("navigate", null, null));
+        Assert.True(adapter.CanHandle("click", null, null));
+        Assert.True(adapter.CanHandle("type", null, null));
+        Assert.True(adapter.CanHandle("evaluate", null, null));
+        Assert.True(adapter.CanHandle("get_content", null, null));
+        Assert.False(adapter.CanHandle("unknown_cdp_action", null, null));
+    }
+
+    [Fact]
+    public async Task ChromeDevToolsAdapter_UnreachablePort_ReturnsHelpfulGuidance()
+    {
+        var adapter = new ChromeDevToolsAdapter();
+        // autoLaunch:false disables the self-heal spawn so the guidance path
+        // is deterministic even on machines where a debug browser could start
+        var res = await adapter.ExecuteAsync("status", null, new Dictionary<string, object?> { ["port"] = 63892, ["autoLaunch"] = false });
+        Assert.False(res.Success);
+        Assert.Equal("ChromeDevTools.Connect", res.Method);
+        Assert.Contains("63892", res.Detail);
+        Assert.Contains("computer_launch", res.Detail);
+        Assert.Contains("debugPort", res.Detail);
+    }
+
+    [Fact]
+    public async Task ListAdapters_IncludesChromeDevTools()
+    {
+        var tools = CreateToolsWithoutRuntime();
+        var result = await tools.ListAdapters();
+
+        Assert.False(result.IsError);
+        var text = ((TextContentBlock)result.Content[0]).Text;
+        Assert.Contains("[chrome_devtools] Chrome DevTools / CDP Specialist Adapter", text);
+    }
+
+    [Fact]
+    public void LaunchStep_WithDebugPort_ValidatesSuccessfully()
+    {
+        var step = new InbriskTools.RunStep(
+            Action: "launch",
+            App: "chrome",
+            DebugPort: 9222);
+
+        var method = typeof(InbriskTools).GetMethod("ValidateStep",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        var err = (string?)method!.Invoke(null, new object[] { step });
+        Assert.Null(err);
+    }
+
+    [Fact]
+    public async Task ChromeDevToolsAdapter_LiveChrome_Integration()
+    {
+        var chromePath = @"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        if (!File.Exists(chromePath))
+            chromePath = @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe";
+
+        if (!File.Exists(chromePath)) return;
+
+        var port = 9222;
+        var profileDir = Path.Combine(Path.GetTempPath(), $"inbrisk_test_chrome_{port}");
+        var psi = new ProcessStartInfo(chromePath)
+        {
+            UseShellExecute = true
+        };
+        psi.ArgumentList.Add($"--remote-debugging-port={port}");
+        psi.ArgumentList.Add("--remote-allow-origins=*");
+        psi.ArgumentList.Add($"--user-data-dir={profileDir}");
+        psi.ArgumentList.Add("about:blank");
+
+        var proc = Process.Start(psi);
+        Assert.NotNull(proc);
+
+        try
+        {
+            var adapter = new ChromeDevToolsAdapter();
+            AdapterResult? status = null;
+
+            // Wait up to 6 seconds for Chrome DevTools endpoint to become ready
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 6000)
+            {
+                status = await adapter.ExecuteAsync("status", null, new Dictionary<string, object?> { ["port"] = port });
+                if (status.Success) break;
+                await Task.Delay(300);
+            }
+
+            Assert.NotNull(status);
+            Assert.True(status.Success, $"Status failed: {status.Detail}");
+            Assert.Equal("ChromeDevTools.Status", status.Method);
+
+            // 1. Open new tab with example.com
+            var newTab = await adapter.ExecuteAsync("new_tab", null, new Dictionary<string, object?>
+            {
+                ["port"] = port,
+                ["url"] = "https://example.com"
+            });
+            Assert.True(newTab.Success, $"New tab failed: {newTab.Detail}");
+            var tabId = newTab.Data?["tabId"]?.ToString();
+            Assert.NotNull(tabId);
+
+            // Wait for navigation and document load
+            await Task.Delay(1500);
+
+            // 2. Evaluate JavaScript
+            var eval = await adapter.ExecuteAsync("evaluate", null, new Dictionary<string, object?>
+            {
+                ["port"] = port,
+                ["tabId"] = tabId,
+                ["expression"] = "document.title"
+            });
+            Assert.True(eval.Success, $"Evaluate failed: {eval.Detail}");
+            Assert.Contains("Example Domain", eval.Data?["result"]?.ToString() ?? "");
+
+            // 3. Get content
+            var content = await adapter.ExecuteAsync("get_content", null, new Dictionary<string, object?>
+            {
+                ["port"] = port,
+                ["tabId"] = tabId,
+                ["selector"] = "h1"
+            });
+            Assert.True(content.Success, $"Get content failed: {content.Detail}");
+
+            // 4. Close tab
+            var close = await adapter.ExecuteAsync("close_tab", null, new Dictionary<string, object?>
+            {
+                ["port"] = port,
+                ["tabId"] = tabId
+            });
+            Assert.True(close.Success);
+        }
+        finally
+        {
+            try
+            {
+                foreach (var p in Process.GetProcessesByName("chrome"))
+                {
+                    try
+                    {
+                        var line = p.MainModule?.FileName;
+                        if (line != null && line.Equals(chromePath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            // keep user's other chrome intact, kill test chrome if needed
+                        }
+                    }
+                    catch { }
+                }
+                proc?.Kill(entireProcessTree: true);
+            }
+            catch { }
+        }
+    }
 }

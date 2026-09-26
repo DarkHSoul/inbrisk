@@ -101,10 +101,12 @@ public static class InbriskResources
             actions = new Dictionary<string, object>
             {
                 ["launch"] = new { fields = "app|search|executable|path|" +
-                    "aumid|uri, arguments[], newInstance, waitFor, as, " +
+                    "aumid|uri, arguments[], newInstance, waitFor, debugPort, as, " +
                     "timeout|ms", note =
-                    "same pipeline as computer_launch; as binds the app's " +
+                    "same pipeline as computer_launch; debugPort enables Chrome DevTools Protocol; as binds the app's " +
                     "top-level hwnd for within:/wait_for scoping" },
+                ["adapter"] = new { fields = "action, adapter, target, args", note =
+                    "direct specialist adapter execution: chrome_devtools (navigate, click, type, evaluate, get_content, list_tabs, new_tab, close_tab) | media (play, pause, next, volume) | testapp" },
                 ["find"] = new { fields = "target|elementId, as, select, index, orderBy", note = "binds result to $as; reports matchCount" },
                 ["assert"] = new { fields = "elementId|target + contains|notContains|exact|state|enabled|value (+ select/index/orderBy)", note = "retry covers async UI flips" },
                 ["checkpoint"] = new { fields = "note", note = "pauses run, returns delta — resume via same runId" },
@@ -158,6 +160,7 @@ public static class InbriskResources
                     "via the registered file association",
                 "aumid — packaged-app id (PackageFamilyName!AppId)",
                 "uri — registered protocol (\"spotify:\")",
+                "debugPort — optional remote debugging port for Chrome/Chromium DevTools Protocol (CDP, e.g. 9222)",
             },
             resolution = "deterministic pipeline: existing top-level window " +
                 "→ Start Menu shortcuts → App Paths → packaged/Store apps " +
@@ -240,7 +243,14 @@ public static class InbriskResources
             "settings.json outputDetail",
         tools =
             "computer_apps(name:required for search, kind, detail) — search launchable apps | " +
-            "computer_launch(app|search|executable|path|aumid|uri) | " +
+            "browser_browse(url, newTab?, port?, tabId?) — one-call Chrome " +
+            "navigation (self-heals: auto-spawns a debuggable browser if " +
+            "none is up; prefer it over launch+adapter for 'go to page') — " +
+            "siblings: browser_click, browser_type, browser_evaluate, " +
+            "browser_content, browser_tabs, browser_screenshot | " +
+            "computer_launch(app|search|executable|path|aumid|uri|debugPort) | " +
+            "computer_adapter(action, adapter:chrome_devtools|media|testapp, target, args) | " +
+            "computer_list_adapters | " +
             "computer_find(target fields, limit, detail) | " +
             "computer_observe(mode, hwnd, detail, maxElements) | " +
             "computer_windows | computer_inspect(hwnd|elementId, detail) | " +
@@ -255,7 +265,8 @@ public static class InbriskResources
         runStepActions =
             "launch|find|assert|checkpoint|focus|focus_window|click|rightclick|" +
             "doubleclick|invoke|toggle|select|hover|set_value|type|key|hotkey|" +
-            "scroll|drag|wait|wait_for|wait_for_change|wait_for_stable",
+            "scroll|drag|wait|wait_for|wait_for_change|wait_for_stable|adapter",
+        specialistAdapters = "chrome_devtools (CDP DOM/JS/tabs) | media (Spotify/VLC) | testapp",
         runBindings =
             "find{as:\"x\"}/launch{as:\"x\"} → later steps use " +
             "elementId:\"$x\" or target:{within:\"$x\"}",
