@@ -196,16 +196,56 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter
                         return new AdapterResult(false, "ChromeDevTools.Navigate", "no attachable page target found", Error: ErrorCode.NotFound);
 
                     var cdpResult = await SendCdpCommandAsync(targetTab.WebSocketUrl, "Page.navigate", new { url = url }, ct);
+
+                    // includeContent (default on): give the caller the page
+                    // text in the SAME call — "go read X" becomes one tool
+                    // call instead of navigate + get_content. Bounded to
+                    // keep token cost predictable; poll briefly for load.
+                    object? pageText = null;
+                    if (args?.TryGetValue("includeContent", out var ic) != true ||
+                        ic is not (false or "false" or "False"))
+                    {
+                        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(8);
+                        while (DateTime.UtcNow < deadline)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            try
+                            {
+                                var eval = await SendCdpCommandAsync(targetTab.WebSocketUrl,
+                                    "Runtime.evaluate", new
+                                    {
+                                        expression = "document.readyState === 'complete' " +
+                                            "? (document.body ? document.body.innerText.slice(0,4000) : '') : null",
+                                        returnByValue = true
+                                    }, ct);
+                                var node = eval?["result"]?["result"]?["value"];
+                                if (node != null)
+                                {
+                                    var s = node.ToString();
+                                    if (s.Length > 0 || url.StartsWith("about:"))
+                                    { pageText = s; break; }
+                                }
+                            }
+                            catch (OperationCanceledException) { throw; }
+                            catch { }
+                            await Task.Delay(250, ct);
+                        }
+                    }
+
+                    var txt = pageText as string;
+                    var data = new Dictionary<string, object?>
+                    {
+                        ["url"] = url,
+                        ["tabId"] = targetTab.Id,
+                        ["frameId"] = cdpResult?["result"]?["frameId"]?.ToString()
+                    };
+                    if (txt != null) data["text"] = txt;
                     return new AdapterResult(
                         Success: true,
                         Method: "ChromeDevTools.Navigate",
-                        Detail: $"Navigated tab '{targetTab.Title}' to {url}",
-                        Data: new Dictionary<string, object?>
-                        {
-                            ["url"] = url,
-                            ["tabId"] = targetTab.Id,
-                            ["frameId"] = cdpResult?["result"]?["frameId"]?.ToString()
-                        });
+                        Detail: $"Navigated tab '{targetTab.Title}' to {url}" +
+                            (txt is { Length: > 0 } ? " — page text included" : ""),
+                        Data: data);
                 }
 
                 case "evaluate":

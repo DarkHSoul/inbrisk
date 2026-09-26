@@ -1308,16 +1308,17 @@ public sealed class InbriskTools
         "CDP port (default 9222); if none is reachable it auto-spawns one " +
         "with its own profile — no separate launch step, no setup. Bare hosts " +
         "like \"google.com\" get https:// automatically. Returns the live tab " +
-        "(tabId/url/title); pass tabId to the other browser_* tools to pin " +
-        "the same tab.")]
+        "(tabId/url/title) AND the page's text content — a \"go read X\" task " +
+        "is ONE call, no browser_content follow-up needed (pass " +
+        "includeContent via args to skip). Pass tabId to the other browser_* " +
+        "tools to pin the same tab.")]
     public Task<CallToolResult> BrowserBrowse(
         [Description("URL to open — \"google.com\" becomes https://google.com")] string url,
         [Description("open in a new tab instead of navigating the active tab")] bool newTab = false,
         [Description("CDP port — default 9222")] int? port = null,
         [Description("pin a specific tab from browser_tabs")] string? tabId = null,
         CancellationToken ct = default)
-    {
-        if (string.IsNullOrWhiteSpace(url))
+    {        if (string.IsNullOrWhiteSpace(url))
             return Task.FromResult(Error(OutcomeKind.Malformed, "url is required"));
         if (!url.Contains("://", StringComparison.Ordinal))
             url = "https://" + url.Trim();

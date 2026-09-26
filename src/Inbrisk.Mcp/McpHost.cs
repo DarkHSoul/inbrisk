@@ -91,7 +91,10 @@ public static class McpHost
                     "this handshake, the tool schemas, and one optional " +
                     "computer_capabilities call. When the user asks for an " +
                     "action, call the tool right away — observing after " +
-                    "acting beats researching before acting. Prefer " +
+                    "acting beats researching before acting. Do NOT call " +
+                    "tools/list — the tool list is already in your context; " +
+                    "call it only if the schema reference is missing. " +
+                    "Prefer " +
                     "elementIds and " +
                     "semantic targets over coordinates; use image points only " +
                     "for pixel-only targets; re-observe after Stale/" +
