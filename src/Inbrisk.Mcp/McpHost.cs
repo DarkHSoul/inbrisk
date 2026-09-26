@@ -83,7 +83,16 @@ public static class McpHost
                 o.ServerInfo = new Implementation
                     { Name = "inbrisk", Version = version };
                 o.ServerInstructions =
-                    "Windows desktop eyes and hands. Prefer elementIds and " +
+                    "Windows desktop eyes and hands. ACT IMMEDIATELY: these " +
+                    "tools are self-contained — do NOT explore the project, " +
+                    "filesystem, git history, or docs to 'understand' " +
+                    "Inbrisk before acting, and never use shell/PowerShell " +
+                    "just to learn the interface. Everything you need is in " +
+                    "this handshake, the tool schemas, and one optional " +
+                    "computer_capabilities call. When the user asks for an " +
+                    "action, call the tool right away — observing after " +
+                    "acting beats researching before acting. Prefer " +
+                    "elementIds and " +
                     "semantic targets over coordinates; use image points only " +
                     "for pixel-only targets; re-observe after Stale/" +
                     "StaleFrame results. When beginning a conversation in " +
