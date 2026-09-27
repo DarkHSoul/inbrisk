@@ -122,10 +122,18 @@ public static class McpHost
                     "element uids for browser_click(uid) — no selector " +
                     "guessing — and browser_capture returns network/" +
                     "console/vitals in one call; never hand-roll CDP " +
-                    "scripts for that. When a task is finished, clean up " +
-                    "windows you opened: computer_close_window posts a " +
-                    "graceful WM_CLOSE (hwnd, process, or title). For " +
-                    "multi-step deterministic UI work, " +
+                    "scripts for that. " +
+                    "APPLICATION LIFECYCLE POLICY: " +
+                    "1. Never close, minimize, or alter applications that were already open before the task started (ownership: user). " +
+                    "2. Applications opened by you (ownership: agent) may be closed when no longer required and there is no unsaved user data. " +
+                    "3. Prefer graceful close (computer_close_window). Never force-kill. " +
+                    "4. Do NOT close the agent host/terminal, IDE, Colab browser, or protected apps. Inbrisk blocks these attempts. " +
+                    "5. After closing an application, notify the user: 'Closed <app> — no longer needed for this task.' " +
+                    "6. 'When in doubt, leave it open.' Leaving an application open has minor cost; closing a user's running app causes irreversible data loss. " +
+                    "POPUP & MODAL DIALOGS: Applications often open modal error boxes, confirmation dialogs, or wizards that disable their parent window. " +
+                    "If a window seems unresponsive, check computer_windows or computer_observe for [MODAL/DIALOG] or [BLOCKED by modal] tags, or inspect the window — " +
+                    "Inbrisk surfaces [MODAL-POPUP-ACTIVE] and inspects the modal dialog controls directly so you can dismiss or handle it first. " +
+                    "For multi-step deterministic UI work, " +
                     "prefer computer_run over issuing many individual " +
                     "computer tools. Use individual tools for exploration or " +
                     "when the next action depends on information not yet " +

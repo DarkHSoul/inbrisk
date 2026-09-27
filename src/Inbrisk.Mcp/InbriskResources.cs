@@ -46,6 +46,15 @@ public static class InbriskResources
         coordinateSpace = "image-space (per-frame; always pass frameId + observationId)",
         confirmation = "the client's explicit tool call is the confirmation; " +
             "Deny-classified targets (elevated, password, kill-switch) still refuse",
+        lifecyclePolicy = new
+        {
+            rule1 = "Never close, minimize, or alter applications that were already open before the task started (ownership: user).",
+            rule2 = "Applications opened by the agent (ownership: agent) may be closed when no longer required and there is no unsaved user data.",
+            rule3 = "Prefer graceful close (computer_close_window). Never force-kill.",
+            rule4 = "Do not close the agent host, terminal, IDE, Colab browser, or protected apps.",
+            rule5 = "After closing an application, notify the user: 'Closed <app> — no longer needed for this task.'",
+            rule6 = "When in doubt, leave it open. Cost of leaving open is minimal; cost of closing user apps causes data loss.",
+        },
 
         // ---------------- semantic target spec ----------------
         targetSpec = new
@@ -206,6 +215,12 @@ public static class InbriskResources
             "CaptureUnavailable", "InputRejected", "Malformed",
             "Unverified", "NoProgress", "EmergencyStopped",
         },
+        hostEnvironment = new
+        {
+            note = "AI Environment Awareness: Identify and preserve your hosting infrastructure.",
+            rules = "Never close, hide, or terminate the hosting terminal (Windows Terminal, cmd, powershell, Qwen, Claude), parent IDE (VS Code, Antigravity, Cursor), or browser tabs running Google Colab / Jupyter notebooks powering your backend. computer_close_window protects these windows and will reject closures.",
+            modalsAndDialogs = "Windows applications and the OS open modal dialogs and modern system flyouts (error messages, confirmation prompts, Share/Paylaş flyouts, setup wizards) that block background windows. Inbrisk surfaces [MODAL-OR-POPUP-ACTIVE], [MODAL/DIALOG], and [BLOCKED by popup/dialog] in inspect, windows, and observe tools. Dismiss or interact with the dialog/flyout first (e.g. computer_hotkey with key:'Escape' or click its controls)."
+        },
         usage = new[]
         {
             "to interact with an app that may not be running, use " +
@@ -220,6 +235,8 @@ public static class InbriskResources
             "verified actions return post-state + changes — do not re-observe to confirm",
             "desktop input stuck (dead clicks, phantom modifier) → computer_reset_input " +
                 "releases all keys/buttons and can fix input-swallowing windows",
+            "environment awareness: NEVER close or kill your host terminal, IDE, or Colab/Jupyter notebook tabs — only close user application windows that you opened for the task",
+            "system flyouts & modal popups: modern flyouts (e.g. Share/Paylaş, Open with) and dialogs (e.g. Save As, error popups) block desktop and background window input. When an active popup is reported, you must dismiss it (press Escape via computer_hotkey(key: 'Escape') or click its controls) before background interactions will succeed.",
         },
     });
 

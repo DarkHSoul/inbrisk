@@ -109,6 +109,9 @@ internal static class NativeMethods
     [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] internal static extern void SwitchToThisWindow(IntPtr hWnd, bool fUnknown);
+    [DllImport("user32.dll")] internal static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    public const byte VK_MENU = 0x12;
     [DllImport("user32.dll")] internal static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] internal static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
@@ -120,6 +123,39 @@ internal static class NativeMethods
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] internal static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] internal static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
     [DllImport("user32.dll")] internal static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
+    [DllImport("user32.dll")] internal static extern IntPtr GetLastActivePopup(IntPtr hWnd);
+    [DllImport("user32.dll")] internal static extern bool IsWindowEnabled(IntPtr hWnd);
+    [DllImport("user32.dll")] internal static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    public const uint GW_HWNDFIRST = 0;
+    public const uint GW_HWNDLAST = 1;
+    public const uint GW_HWNDNEXT = 2;
+    public const uint GW_HWNDPREV = 3;
+    public const uint GW_OWNER = 4;
+    public const uint GW_CHILD = 5;
+    public const uint GW_ENABLEDPOPUP = 6;
+
+    public const uint TH32CS_SNAPPROCESS = 0x00000002;
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    internal struct PROCESSENTRY32W
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern bool Process32FirstW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    internal static extern bool Process32NextW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
 
     public const int GWL_EXSTYLE = -20;
     public const int WS_EX_TRANSPARENT = 0x00000020;

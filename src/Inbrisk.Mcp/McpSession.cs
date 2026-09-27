@@ -33,7 +33,17 @@ public sealed class McpSession : IDisposable
     public Dictionary<long, long> FrameObservations { get; } = new();
     public AgentObservation? LastObservation { get; private set; }
     public StepOutcome? PrevOutcome { get; set; }
-    public long? ScopeHwnd { get; set; }
+    private long? _scopeHwnd;
+    public long? ScopeHwnd
+    {
+        get
+        {
+            if (_scopeHwnd.HasValue && Rt?.WindowService?.GetWindow(_scopeHwnd.Value) == null)
+                _scopeHwnd = null;
+            return _scopeHwnd;
+        }
+        set => _scopeHwnd = value;
+    }
     /// <summary>Live automation runs — runId → bindings + progress so a
     /// paused/checkpointed plan can be resumed by appending steps.</summary>
     public Dictionary<string, RunState> Runs { get; } = new();
@@ -79,14 +89,32 @@ public sealed class McpSession : IDisposable
     }
 
     /// <summary>Session monitor for wait_for_change/stable — created lazily
-    /// against the current scope window.</summary>
+    /// against the current scope window, with automatic foreground or desktop fallback.</summary>
     public ChangeMonitor MonitorFor(long hwnd)
     {
+        if (hwnd == 0 || Rt?.WindowService?.GetWindow(hwnd) == null)
+        {
+            var fg = Rt.ForegroundWindow()?.Hwnd ?? 0;
+            if (fg != 0 && Rt?.WindowService?.GetWindow(fg) != null)
+                hwnd = fg;
+        }
+
         if (_monitor == null || _scopeHwndForMonitor != hwnd || !_monitor.Session.IsRunning)
         {
             _monitor?.Dispose();
-            _monitor = Rt.Monitor(new CaptureTarget.Window(hwnd));
-            _scopeHwndForMonitor = hwnd;
+            try
+            {
+                var target = (hwnd != 0 && Rt?.WindowService?.GetWindow(hwnd) != null)
+                    ? (CaptureTarget)new CaptureTarget.Window(hwnd)
+                    : (CaptureTarget)new CaptureTarget.FullDesktop();
+                _monitor = Rt.Monitor(target);
+                _scopeHwndForMonitor = hwnd;
+            }
+            catch
+            {
+                _monitor = Rt.Monitor(new CaptureTarget.FullDesktop());
+                _scopeHwndForMonitor = 0;
+            }
         }
         return _monitor;
     }

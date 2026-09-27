@@ -295,6 +295,8 @@ public sealed class AppService : IAppService
         foreach (var dir in StartMenuDirs())
         foreach (var lnk in EnumerateLinks(dir))
         {
+            var (isValid, _) = InspectLnk(lnk);
+            if (!isValid) continue;
             var name = Path.GetFileNameWithoutExtension(lnk);
             Add(name, LaunchMethod.StartMenu, $"app:\"{name}\"", "installed");
         }
@@ -335,7 +337,8 @@ public sealed class AppService : IAppService
             var name = Path.GetFileNameWithoutExtension(lnk);
             var s = Score(Norm(name), norm);
             if (s <= 0) continue;
-            var tgtStem = LnkTargetStem(lnk);
+            var (isValid, tgtStem) = InspectLnk(lnk);
+            if (!isValid) continue; // Skip stale/dead shortcuts to uninstalled apps
             found.Add(new ResolvedApp(LaunchMethod.StartMenu, lnk, name,
                 tgtStem != null ? [name, tgtStem] : [name],
                 s + 5)); // StartMenu beats equal-score PATH noise
@@ -442,11 +445,10 @@ public sealed class AppService : IAppService
             .Take(5).ToList();
     }
 
-    /// <summary>Target executable stem of a .lnk via IShellLinkW — the
-    /// process name the shortcut actually starts (File Explorer.lnk →
-    /// "explorer"). Only resolved for scoring candidates, never for the
-    /// whole Start Menu enumeration.</summary>
-    private static unsafe string? LnkTargetStem(string lnk)
+    /// <summary>Inspects a .lnk via IShellLinkW — checks if target exists
+    /// and resolves the target executable stem (File Explorer.lnk → "explorer").
+    /// Stale/dead shortcuts to uninstalled apps return (false, null).</summary>
+    private static unsafe (bool isValid, string? stem) InspectLnk(string lnk)
     {
         try
         {
@@ -462,18 +464,18 @@ public sealed class AppService : IAppService
             var path = new string(buf).TrimEnd('\0');
             // shell:/folder targets have no exe path — they open in
             // Explorer (File Explorer.lnk is exactly this shape)
-            if (path.Length == 0) return "explorer";
-            if (!File.Exists(path)) return null;
+            if (path.Length == 0) return (true, "explorer");
+            if (!File.Exists(path) && !Directory.Exists(path)) return (false, null);
             if (path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                return Path.GetFileNameWithoutExtension(path);
+                return (true, Path.GetFileNameWithoutExtension(path));
             // .lnk to a document — the window belongs to the registered
             // handler, same resolution as a `path:` launch
             var assoc = AssocExeFor(path);
-            return assoc != null
+            return (true, assoc != null
                 ? Path.GetFileNameWithoutExtension(assoc)
-                : Path.GetFileNameWithoutExtension(path);
+                : Path.GetFileNameWithoutExtension(path));
         }
-        catch { return null; }
+        catch { return (false, null); }
     }
 
     /// <summary>The exe registered to open a document type —
@@ -930,6 +932,15 @@ public sealed class AppService : IAppService
             .Where(w => !w.Bounds.IsEmpty)
             .Select(w => $"{w.ProcessName} \"{w.Title}\" pid={w.Pid}")
             .Take(12);
+
+        var isProcAlive = ProcessAlive(spawnedPid) || ProcessByName(hints, spawnedName);
+        if (isProcAlive && readiness == LaunchReadiness.Window)
+        {
+            return ("Timeout",
+                $"launched '{app.DisplayName}' via {app.Method} (pid={spawnedPid}) and process is actively running, but has no visible top-level window (likely minimized to system tray or running as a background service) within {timeoutMs}ms. For tray/background apps, use waitFor:\"process\" or \"none\". Windows visible: {string.Join(" | ", seen)}",
+                "TimedOut", spawnedPid, null, null, null);
+        }
+
         return ("Timeout",
             $"launched '{app.DisplayName}' via {app.Method} but no " +
             $"{(readiness == LaunchReadiness.Window ? "usable window" : "process")} " +

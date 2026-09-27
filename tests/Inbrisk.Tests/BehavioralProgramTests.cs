@@ -226,7 +226,7 @@ public class BehavioralProgramTests
         using (var doc3 = JsonDocument.Parse(text3))
         {
             Assert.True(doc3.RootElement.TryGetProperty("verificationHint", out var hint3));
-            Assert.Contains("action was dispatched to OS/UIA, but no verifiable state change was observed", hint3.GetString());
+            Assert.Contains("the action WAS dispatched to OS/UIA", hint3.GetString());
         }
     }
 

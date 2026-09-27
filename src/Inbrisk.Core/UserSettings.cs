@@ -42,6 +42,34 @@ public sealed class UserSettings
     /// "slim" compacts the heavy tool results (find/observe/run/capabilities)
     /// for small-context models; any tool call can override with detail.</summary>
     public string? OutputDetail { get; set; }
+    /// <summary>
+    /// Processes protected from AI close/kill/termination actions.
+    /// Immutable to AI; only editable by the human user via settings.
+    /// </summary>
+    public List<string> ProtectedProcesses { get; set; } = new()
+    {
+        "inbrisk.exe",
+        "explorer.exe",
+        "dwm.exe",
+        "code.exe",
+        "chrome.exe",
+        "discord.exe",
+        "obs64.exe",
+        "windowsterminal.exe",
+        "conhost.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd.exe",
+        "antigravity.exe",
+        "cursor.exe",
+        "devenv.exe"
+    };
+
+    /// <summary>
+    /// Protection policy mode: "Deny" (unconditionally reject AI close actions)
+    /// or "Ask" (pause and request human takeover/confirmation). Default: "Deny".
+    /// </summary>
+    public string ProtectionMode { get; set; } = "Deny";
 
     [JsonIgnore]
     public static string SettingsPath => Path.Combine(DataDir, "settings.json");

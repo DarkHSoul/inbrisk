@@ -52,6 +52,7 @@ public sealed class InbriskRuntime : IDisposable
     private readonly ComputerControlActivityService _activity;
     private readonly ScreenIndicatorService _indicator;
     private readonly ActivityHudService _hud;
+    private readonly IProcessProvenanceService _provenance;
     private readonly AppService _apps;
     private readonly List<ChangeMonitor> _monitors = new();
     private readonly RecentEventBuffer _eventBuffer = new();
@@ -61,6 +62,7 @@ public sealed class InbriskRuntime : IDisposable
     private IGroundingBackend? _grounding;
 
     public SafetyPolicy Policy => _policy;
+    public IProcessProvenanceService Provenance => _provenance;
 
     /// <summary>Computer-control activity for the screen indicator —
     /// BeginActivity marks the machine as actively used.</summary>
@@ -87,6 +89,13 @@ public sealed class InbriskRuntime : IDisposable
 
         _uiaDispatch = new UiaDispatcher();
         _windows = new WindowService();
+        _provenance = new ProcessProvenanceService(_windows);
+        try
+        {
+            foreach (var w in _windows.ListWindows())
+                _provenance.RegisterInitial(w.Pid, w.ProcessName ?? "", w.Hwnd);
+        }
+        catch { }
         _integrity = new IntegrityService();
         _input = new SendInputService();
         _capture = new CaptureService(_windows);
@@ -165,6 +174,16 @@ public sealed class InbriskRuntime : IDisposable
     public IReadOnlyList<WindowInfo> Windows() => _windows?.ListWindows() ?? [];
     public WindowInfo? Window(long hwnd) => _windows?.GetWindow(hwnd);
     public WindowInfo? ForegroundWindow() => _windows?.GetForegroundWindow();
+    public IWindowService WindowService => _windows;
+    public WindowInfo? GetModalPopup(long hwnd) => _windows?.GetModalPopup(hwnd);
+    public bool IsWindowEnabled(long hwnd) => _windows?.IsWindowEnabled(hwnd) ?? false;
+    public IReadOnlyList<WindowInfo> FindSystemDialogs() => _windows?.FindSystemDialogs() ?? [];
+    public bool IsWindowProtected(long hwnd, out string? reason)
+    {
+        if (_windows != null) return _windows.IsWindowProtected(hwnd, out reason);
+        reason = null;
+        return false;
+    }
     /// <summary>Graceful window close (WM_CLOSE) — surfaces save prompts.</summary>
     public bool CloseWindow(long hwnd) => _windows?.CloseWindow(hwnd) ?? false;
     public IReadOnlyList<MonitorInfo> Monitors() => _windows?.GetMonitors() ?? [];
@@ -492,6 +511,18 @@ public sealed class InbriskRuntime : IDisposable
                 0, 0, "EmergencyStopped",
                 "computer control stopped by the local emergency hotkey; only the local user can resume");
         var r = _apps.Launch(spec, ct);
+        var spawnedPid = r.Pid;
+        if (spawnedPid.HasValue)
+        {
+            var procName = (r.Hwnd.HasValue ? _windows.GetWindow(r.Hwnd.Value)?.ProcessName : null)
+                ?? r.ResolvedName
+                ?? (r.ResolvedIdentifier != null ? Path.GetFileNameWithoutExtension(r.ResolvedIdentifier) : null)
+                ?? "app";
+            if (r.LaunchState == "AlreadyRunning")
+                _provenance.MarkUsedProcess(spawnedPid.Value);
+            else
+                _provenance.RegisterAgentLaunch(spawnedPid.Value, procName, r.Hwnd, spec.App ?? spec.Executable ?? spec.Path);
+        }
         _executor.NoteMutation(); // a new/changed top-level window invalidates cached queries
         _telemetry?.EmitPipeline(new PipelineTelemetry(DateTimeOffset.Now,
             "launch", spec.App ?? spec.Path ?? spec.Aumid ?? spec.Uri ?? "?",

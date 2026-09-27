@@ -14,6 +14,16 @@ public interface IWindowService
     bool FocusWindow(long hwnd);
     /// <summary>Graceful close (WM_CLOSE). May surface save prompts.</summary>
     bool CloseWindow(long hwnd);
+    /// <summary>Checks if the window is currently blocked by an active modal popup dialog.</summary>
+    WindowInfo? GetModalPopup(long hwnd);
+    /// <summary>Checks if any modal popup, error dialog, or modern system flyout (e.g. Share) is currently active and blocking desktop interaction.</summary>
+    WindowInfo? GetActiveBlockingPopup(long? targetHwnd = null) => null;
+    /// <summary>Is the window enabled (not disabled by a modal dialog or system state)?</summary>
+    bool IsWindowEnabled(long hwnd);
+    /// <summary>Finds all visible dialogs/popups across the desktop (error boxes, modals, confirmations).</summary>
+    IReadOnlyList<WindowInfo> FindSystemDialogs();
+    /// <summary>Determines if a window belongs to the host environment, terminal, IDE, or critical session.</summary>
+    bool IsWindowProtected(long hwnd, out string? reason);
 }
 
 public interface IIntegrityService

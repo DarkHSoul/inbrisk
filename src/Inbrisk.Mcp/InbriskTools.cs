@@ -155,8 +155,24 @@ public sealed class InbriskTools
         if (o.BaseObservationId.HasValue)
             sb.AppendLine($"baseObservationId: {o.BaseObservationId.Value}");
         if (o.ActiveWindow != null)
-            sb.AppendLine($"active window: \"{o.ActiveWindow.Title}\" hwnd=0x{o.ActiveWindow.Hwnd:X} process={o.ActiveWindow.Process}");
+        {
+            var blocker = _s.Rt.WindowService.GetActiveBlockingPopup(o.ActiveWindow.Hwnd);
+            if (blocker != null && blocker.Hwnd != o.ActiveWindow.Hwnd)
+            {
+                sb.AppendLine($"⚠️ MODAL / SYSTEM POPUP ACTIVE: 0x{blocker.Hwnd:X} \"{blocker.Title}\" ({blocker.ProcessName})");
+                sb.AppendLine($"   The desktop is currently BLOCKED by this popup/flyout! Dismiss it first (e.g. press Escape via computer_hotkey 'Escape' or click its controls) before interacting with background windows.");
+            }
+        }
         else sb.AppendLine("active window: (none)");
+
+        var sysDialogs = _s.Rt.WindowService.FindSystemDialogs();
+        if (sysDialogs.Count > 0)
+        {
+            sb.AppendLine($"systemDialogs: {sysDialogs.Count} — active popup, warning, or error windows:");
+            foreach (var d in sysDialogs)
+                sb.AppendLine($"  0x{d.Hwnd:X} \"{d.Title}\" {d.ProcessName} " +
+                    (d.OwnerHwnd.HasValue ? $"[owner=0x{d.OwnerHwnd.Value:X}]" : "[top-level dialog]"));
+        }
 
         if (deltaOnly == true)
         {
@@ -261,7 +277,7 @@ public sealed class InbriskTools
         "List top-level windows (hwnd, title, process, bounds, active flag). " +
         "Windows matching the input-blocking signature (visible, layered, " +
         "not click-through, covering a monitor — e.g. a glitched overlay) " +
-        "are marked [INPUT-BLOCKING]; see computer_reset_input.")]
+        "are marked [INPUT-BLOCKING]; modal popups/dialogs and blocked windows are explicitly flagged.")]
     public CallToolResult Windows(CancellationToken ct = default)
     {
         var wins = _s.Rt.Windows();
@@ -269,10 +285,26 @@ public sealed class InbriskTools
             .Select(b => b.Hwnd).ToHashSet();
         var sb = new StringBuilder();
         foreach (var w in wins)
+        {
+            var flags = new List<string>();
+            if (w.IsForeground) flags.Add("[active]");
+            if (w.IsElevated) flags.Add("[ELEVATED/UIPI: observation-only]");
+            if (blockers.Contains(w.Hwnd)) flags.Add("[INPUT-BLOCKING]");
+            if (w.IsModalPopup) flags.Add("[MODAL/DIALOG]");
+            if (w.ModalPopupHwnd.HasValue) flags.Add($"[BLOCKED by modal 0x{w.ModalPopupHwnd.Value:X}]");
+            if (!w.IsEnabled) flags.Add("[DISABLED/UNRESPONSIVE]");
+            if (_s.Rt.WindowService.IsWindowProtected(w.Hwnd, out _))
+                flags.Add("[PROTECTED]");
+            else if (_s.Rt.Provenance.CanAgentClose(w.Hwnd, out _))
+                flags.Add("[AGENT-OWNED: safe-to-close]");
+            else
+                flags.Add("[USER-OWNED: do-not-close]");
+
+            var flagStr = flags.Count > 0 ? "  " + string.Join(" ", flags) : "";
             sb.AppendLine($"0x{w.Hwnd:X}  \"{w.Title}\"  {w.ProcessName}  " +
                 $"({w.Bounds.X},{w.Bounds.Y} {w.Bounds.Width}x{w.Bounds.Height})" +
-                (w.IsForeground ? "  [active]" : "") +
-                (blockers.Contains(w.Hwnd) ? "  [INPUT-BLOCKING]" : ""));
+                flagStr);
+        }
         return Text(sb.ToString());
     }
 
@@ -280,51 +312,193 @@ public sealed class InbriskTools
         "Gracefully close a window (posts WM_CLOSE — save prompts appear " +
         "normally, the app stays in control). Target by hwnd, process name, " +
         "or title substring. Use this to clean up windows you opened when a " +
-        "task is done — don't leave them on the user's desktop.")]
+        "task is done — don't leave them on the user's desktop. Protected " +
+        "host terminals, IDEs, and Colab sessions are guarded against accidental closure. " +
+        "By default, Inbrisk Application Lifecycle Policy permits closing ONLY applications " +
+        "opened by the agent (ownership: agent). Pre-existing user applications cannot be closed " +
+        "unless force:true is explicitly set. 'When in doubt, leave it open.'")]
     public CallToolResult CloseWindow(
         [Description("window handle — decimal or 0x-prefixed")] string? hwnd = null,
         [Description("process name of the window to close, e.g. \"mspaint\"")] string? process = null,
         [Description("substring of the window title")] string? titleContains = null,
+        [Description("semantic target object, e.g. {\"process\": \"notepad.exe\", \"hwnd\": \"0x...\"}")] TargetSpec? target = null,
+        [Description("override lifecycle policy to close a pre-existing user window if explicitly requested by the user (default false)")] bool force = false,
         CancellationToken ct = default)
     {
+        hwnd ??= target?.Hwnd ?? (target?.Window != null && (target.Window.StartsWith("0x", StringComparison.OrdinalIgnoreCase) || long.TryParse(target.Window, out _)) ? target.Window : null);
+        process ??= target?.Process;
+        titleContains ??= target?.Name ?? target?.NameContains ?? (hwnd == null ? target?.Window : null);
+
         var wins = _s.Rt.Windows();
         WindowInfo? w = null;
         if (ParseHwnd(hwnd) is { } h)
             w = wins.FirstOrDefault(x => x.Hwnd == h);
         else if (!string.IsNullOrWhiteSpace(process))
         {
-            var hits = wins.Where(x => (x.ProcessName ?? "").Contains(process, StringComparison.OrdinalIgnoreCase)).ToList();
+            var hits = wins.Where(x => MatchesProcess(x.ProcessName, process)).ToList();
+            var closableHits = hits.Where(x => !_s.Rt.WindowService.IsWindowProtected(x.Hwnd, out _)).ToList();
+            if (closableHits.Count > 0) hits = closableHits;
+
             if (hits.Count > 1)
-                return Text(JsonSerializer.Serialize(new { error = "AmbiguousTarget",
-                    detail = $"{hits.Count} windows owned by '{process}' — pick one by hwnd",
-                    candidates = hits.Select(x => $"0x{x.Hwnd:X} \"{x.Title}\"").ToList() }, J));
-            w = hits.FirstOrDefault();
+            {
+                var agentHits = hits.Where(x => _s.Rt.Provenance.CanAgentClose(x.Hwnd, out _)).ToList();
+                if (agentHits.Count == 1)
+                    w = agentHits[0];
+                else
+                {
+                    var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
+                    var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
+                    if (fgHit != null)
+                        w = fgHit;
+                    else
+                        return Text(JsonSerializer.Serialize(new { error = "AmbiguousTarget",
+                            detail = $"{hits.Count} windows owned by '{process}' — pick one by hwnd",
+                            candidates = hits.Select(x => $"0x{x.Hwnd:X} \"{x.Title}\"").ToList() }, J));
+                }
+            }
+            else
+            {
+                w = hits.FirstOrDefault();
+            }
         }
         else if (!string.IsNullOrWhiteSpace(titleContains))
         {
             var hits = wins.Where(x => x.Title.Contains(titleContains, StringComparison.OrdinalIgnoreCase)).ToList();
+            var closableHits = hits.Where(x => !_s.Rt.WindowService.IsWindowProtected(x.Hwnd, out _)).ToList();
+            if (closableHits.Count > 0) hits = closableHits;
+
             if (hits.Count > 1)
-                return Text(JsonSerializer.Serialize(new { error = "AmbiguousTarget",
-                    detail = $"{hits.Count} windows match '{titleContains}' — pick one by hwnd",
-                    candidates = hits.Select(x => $"0x{x.Hwnd:X} \"{x.Title}\"").ToList() }, J));
-            w = hits.FirstOrDefault();
+            {
+                var agentHits = hits.Where(x => _s.Rt.Provenance.CanAgentClose(x.Hwnd, out _)).ToList();
+                if (agentHits.Count == 1)
+                    w = agentHits[0];
+                else
+                {
+                    var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
+                    var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
+                    if (fgHit != null)
+                        w = fgHit;
+                    else
+                        return Text(JsonSerializer.Serialize(new { error = "AmbiguousTarget",
+                            detail = $"{hits.Count} windows match '{titleContains}' — pick one by hwnd",
+                            candidates = hits.Select(x => $"0x{x.Hwnd:X} \"{x.Title}\"").ToList() }, J));
+                }
+            }
+            else
+            {
+                w = hits.FirstOrDefault();
+            }
         }
         else return Text(JsonSerializer.Serialize(new { error = "Malformed",
-            detail = "pass hwnd, process, or titleContains" }, J));
+            detail = "pass hwnd, process, titleContains, or target: {process: ...}" }, J));
 
         if (w == null)
             return Text(JsonSerializer.Serialize(new { error = "TargetNotFound",
                 detail = "no matching window — list candidates with computer_windows" }, J));
 
-        var closed = _s.Rt.CloseWindow(w.Hwnd);
-        return Text(JsonSerializer.Serialize(new
+        if (_s.Rt.WindowService.IsWindowProtected(w.Hwnd, out var protectReason))
         {
-            success = true, closed,
-            hwnd = $"0x{w.Hwnd:X}", title = w.Title, process = w.ProcessName,
-            detail = closed
-                ? "window closed"
-                : "WM_CLOSE posted but window still exists — it may be showing a save prompt (observe it) or the app hung",
-        }, J));
+            return Text(JsonSerializer.Serialize(new
+            {
+                error = "ProtectedWindow",
+                hwnd = $"0x{w.Hwnd:X}",
+                title = w.Title,
+                process = w.ProcessName,
+                detail = $"Refusing to close window: {protectReason}. Automated closure would terminate the agent or server connection."
+            }, J));
+        }
+
+        if (w.IsElevated && Inbrisk.Platform.Windows.Topology.IntegrityService.ProcessIntegrityLevel(Environment.ProcessId) < 0x3000)
+        {
+            return Text(JsonSerializer.Serialize(new
+            {
+                error = "ElevatedUipiBlocked",
+                hwnd = $"0x{w.Hwnd:X}",
+                title = w.Title,
+                process = w.ProcessName,
+                isElevated = true,
+                detail = $"Target window '{w.ProcessName}' (0x{w.Hwnd:X}) is running ELEVATED with High/System integrity while Inbrisk is running as standard user. Windows User Interface Privilege Isolation (UIPI) blocks WM_CLOSE, input injection, and termination across integrity levels. Run Inbrisk as Administrator or close this window manually."
+            }, J));
+        }
+
+        if (!force && !_s.Rt.Provenance.CanAgentClose(w.Hwnd, out var lifecycleReason))
+        {
+            return Text(JsonSerializer.Serialize(new
+            {
+                error = "PolicyDenied",
+                hwnd = $"0x{w.Hwnd:X}",
+                title = w.Title,
+                process = w.ProcessName,
+                ownership = "user",
+                openedByAgent = false,
+                detail = lifecycleReason + " If the user explicitly instructed you to close this user-owned application, pass force: true."
+            }, J));
+        }
+
+        var closed = _s.Rt.CloseWindow(w.Hwnd);
+        if (!closed && force)
+        {
+            try
+            {
+                using var proc = Process.GetProcessById(w.Pid);
+                proc.Kill();
+                closed = proc.WaitForExit(1500) || proc.HasExited;
+            }
+            catch (Exception ex)
+            {
+                return Text(JsonSerializer.Serialize(new
+                {
+                    error = "ForceKillFailed",
+                    hwnd = $"0x{w.Hwnd:X}",
+                    title = w.Title,
+                    process = w.ProcessName,
+                    detail = $"WM_CLOSE failed and force-kill was attempted, but failed: {ex.Message} (process may be elevated or system-protected)."
+                }, J));
+            }
+        }
+
+        if (closed)
+        {
+            return Text(JsonSerializer.Serialize(new
+            {
+                success = true,
+                closed = true,
+                hwnd = $"0x{w.Hwnd:X}",
+                title = w.Title,
+                process = w.ProcessName,
+                notification = $"Closed {w.ProcessName} — no longer needed for this task.",
+                detail = $"Closed '{w.ProcessName}' (0x{w.Hwnd:X}) — application was opened by the agent and is no longer needed for this task."
+            }, J));
+        }
+        else
+        {
+            var modal = _s.Rt.WindowService.GetModalPopup(w.Hwnd);
+            var hasModal = modal != null && modal.Hwnd != w.Hwnd;
+            return Text(JsonSerializer.Serialize(new
+            {
+                success = false,
+                closed = false,
+                hwnd = $"0x{w.Hwnd:X}",
+                title = w.Title,
+                process = w.ProcessName,
+                hasUnsavedDataPrompt = hasModal,
+                modalPopup = hasModal ? $"0x{modal!.Hwnd:X} \"{modal.Title}\"" : null,
+                detail = hasModal
+                    ? $"WM_CLOSE posted to '{w.ProcessName}', but window remains open because an unsaved changes confirmation dialog appeared (0x{modal!.Hwnd:X} \"{modal.Title}\"). To protect user data, the window was not force-killed. Inspect or interact with the dialog."
+                    : "WM_CLOSE posted but window still exists — it may be showing a save prompt (observe it) or the app hung",
+            }, J));
+        }
+    }
+
+    private static bool MatchesProcess(string? actual, string query)
+    {
+        if (string.IsNullOrWhiteSpace(actual) || string.IsNullOrWhiteSpace(query)) return false;
+        var act = actual.Trim();
+        var q = query.Trim();
+        var normAct = act.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? act[..^4] : act;
+        var normQ = q.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? q[..^4] : q;
+        return act.Contains(q, StringComparison.OrdinalIgnoreCase)
+            || normAct.Contains(normQ, StringComparison.OrdinalIgnoreCase);
     }
 
     [McpServerTool(Name = "computer_reset_input"), Description(
@@ -679,6 +853,8 @@ public sealed class InbriskTools
                 valueEquals: value, className: className,
                 enabled: enabled == true ? true : null);
         if (err != null) return err;
+        if (!string.IsNullOrWhiteSpace(name))
+            els = els.Where(e => e.Name?.Contains(name, StringComparison.OrdinalIgnoreCase) == true).ToList();
         els = ApplyPropFilters(els, new TargetSpec(
             NameNotContains: nameNotContains, Value: value,
             ValueContains: valueContains, ClassName: className));
@@ -851,15 +1027,40 @@ public sealed class InbriskTools
     [McpServerTool(Name = "computer_inspect"), Description(
         "Deep view of one window's element tree (with dialogRole " +
         "annotations for file dialogs) or one element's full property set. " +
-        "Pass relational=true to group list/table rows with their child actions and labels.")]
+        "Pass relational=true to group list/table rows with their child actions and labels. " +
+        "Accepts hwnd, elementId, or target object {hwnd, elementId}. " +
+        "Automatically detects and surfaces blocking modal popups and error dialogs.")]
     public CallToolResult Inspect(
         [Description("window handle to inspect (hex or decimal); default = active")] string? hwnd = null,
         [Description("elementId for single-element detail")] string? elementId = null,
+        [Description("target specification: accepts {hwnd: '...'}, {elementId: '...'}, or string")] JsonElement? target = null,
         [Description("max elements to list — default 40 (slim) / 80 (full)")] int? maxElements = null,
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
         [Description("group rows/items relationally with their child actions and labels — ideal for lists/tables")] bool relational = false,
         CancellationToken ct = default)
     {
+        if (target.HasValue)
+        {
+            if (target.Value.ValueKind == JsonValueKind.String)
+            {
+                var ts = target.Value.GetString();
+                if (!string.IsNullOrWhiteSpace(ts))
+                {
+                    if (ts.StartsWith("uia_", StringComparison.OrdinalIgnoreCase))
+                        elementId ??= ts;
+                    else
+                        hwnd ??= ts;
+                }
+            }
+            else if (target.Value.ValueKind == JsonValueKind.Object)
+            {
+                if (target.Value.TryGetProperty("hwnd", out var jh) && jh.GetString() is { } jhs)
+                    hwnd ??= jhs;
+                if (target.Value.TryGetProperty("elementId", out var je) && je.GetString() is { } jes)
+                    elementId ??= jes;
+            }
+        }
+
         if (BadDetail(detail) is { } bd) return bd;
         using var trace = PerfTrace.Begin("tool", "computer_inspect");
         ct.ThrowIfCancellationRequested();
@@ -887,23 +1088,38 @@ public sealed class InbriskTools
         }
         var h = ParseHwnd(hwnd) ?? _s.Rt.ForegroundWindow()?.Hwnd;
         if (h == null) return Error(OutcomeKind.Malformed, "no hwnd and no active window");
+
+        var rootH = WindowService.GetRootHwnd(h.Value);
+        var modal = _s.Rt.WindowService.GetActiveBlockingPopup(rootH);
+        var isModalBlocked = modal != null && modal.Hwnd != rootH;
+        var inspectHwnd = isModalBlocked ? modal!.Hwnd : rootH;
+
         IReadOnlyList<UiElement> els;
         using (PerfTrace.Stage("inspect.uia"))
-            els = _s.Rt.Inspect(h.Value);
-        var win = _s.Rt.Window(h.Value);
+            els = _s.Rt.Inspect(inspectHwnd);
+        var win = _s.Rt.Window(inspectHwnd);
         var app = win?.ProcessName ?? "";
-        var screen = _s.Memory.RecordObservation(h.Value, app, win?.Title ?? "", els);
+        var screen = _s.Memory.RecordObservation(inspectHwnd, app, win?.Title ?? "", els);
         var tags = DialogTags(els);
         var slim = Slim(detail);
         var cap = maxElements ?? (slim ? 40 : 80);
+
+        var modalWarning = "";
+        if (isModalBlocked)
+        {
+            modalWarning = $"⚠️ [MODAL-OR-POPUP-ACTIVE: 0x{modal!.Hwnd:X} \"{modal.Title}\" ({modal.ProcessName})]\n" +
+                $"WARNING: Window 0x{h.Value:X} is currently BLOCKED by foreground popup/dialog 0x{modal.Hwnd:X}.\n" +
+                $"Actions sent to 0x{h.Value:X} will fail. You must dismiss or interact with this modal dialog or flyout first (e.g. press Escape).\n" +
+                $"Inspecting controls of active popup 0x{modal.Hwnd:X}:\n\n";
+        }
 
         if (relational)
         {
             var rows = RelationalInspector.ExtractRows(els);
             if (rows.Count > 0)
             {
-                var rb = new StringBuilder();
-                rb.AppendLine($"window 0x{h:X} [screen: {screen}]: {rows.Count} relational rows:");
+                var rb = new StringBuilder(modalWarning);
+                rb.AppendLine($"window 0x{inspectHwnd:X} [screen: {screen}]: {rows.Count} relational rows:");
                 foreach (var row in rows.Take(cap))
                 {
                     rb.Append($"  [{row.ElementId}] {row.Role}: ");
@@ -921,8 +1137,8 @@ public sealed class InbriskTools
                 return Text(rb.ToString().TrimEnd());
             }
         }
-        var b = new StringBuilder();
-        b.AppendLine($"window 0x{h:X} [screen: {screen}]: {els.Count} elements " +
+        var b = new StringBuilder(modalWarning);
+        b.AppendLine($"window 0x{inspectHwnd:X} [screen: {screen}]: {els.Count} elements " +
             $"(showing {Math.Min(els.Count, cap)}):");
         foreach (var e in els.Take(cap))
             b.AppendLine(slim
@@ -1590,7 +1806,11 @@ public sealed class InbriskTools
         }
 
         if (state == null)
-            return Error(OutcomeKind.TargetNotFound, "No active or recorded plan run found to pause.");
+        {
+            var fallbackId = !string.IsNullOrWhiteSpace(runId) ? runId : "run_" + Guid.NewGuid().ToString("N")[..8];
+            state = new RunState { RunId = fallbackId };
+            _s.Runs[fallbackId] = state;
+        }
 
         state.SafePointPauseRequested = true;
         state.IsPausedForHuman = true;
@@ -1640,9 +1860,13 @@ public sealed class InbriskTools
         if (BadDetail(detail) is { } bd) return bd;
         if (!_s.Runs.TryGetValue(runId, out var state))
         {
-            var known = _s.Runs.Keys;
-            return Error(OutcomeKind.TargetNotFound,
-                $"runId '{runId}' not found. Active/known runs: [{string.Join(", ", known)}]");
+            state = new RunState { RunId = runId, Slim = Slim(detail) };
+            if (bindings != null)
+            {
+                foreach (var kv in bindings)
+                    state.Bindings[kv.Key] = kv.Value;
+            }
+            _s.Runs[runId] = state;
         }
 
         var sw = Stopwatch.StartNew();
@@ -3974,15 +4198,55 @@ public sealed class InbriskTools
 
     [McpServerTool(Name = "computer_focus_window"), Description(
         "Bring a window to the foreground — verified against " +
-        "GetForegroundWindow. Usually NOT needed: action tools " +
-        "auto-foreground their target's window. Use this to choose which " +
-        "window receives subsequent computer_key/computer_hotkey input.")]
+        "GetForegroundWindow. Target by hwnd, process name, or title substring. " +
+        "Usually NOT needed: action tools auto-foreground their target's window. " +
+        "Use this to choose which window receives subsequent computer_key/computer_hotkey input.")]
     public Task<CallToolResult> FocusWindow(
-        [Description("window handle (hex or decimal)")] string hwnd,
+        [Description("window handle — decimal or 0x-prefixed")] string? hwnd = null,
+        [Description("process name of the window to focus, e.g. \"notepad\"")] string? process = null,
+        [Description("substring of the window title")] string? titleContains = null,
+        [Description("semantic target object, e.g. {\"process\": \"notepad.exe\", \"hwnd\": \"0x...\"}")] TargetSpec? target = null,
         CancellationToken ct = default)
     {
-        var h = ParseHwnd(hwnd);
-        if (h == null) return Task.FromResult(Error(OutcomeKind.Malformed, "bad hwnd"));
+        hwnd ??= target?.Hwnd ?? (target?.Window != null && (target.Window.StartsWith("0x", StringComparison.OrdinalIgnoreCase) || long.TryParse(target.Window, out _)) ? target.Window : null);
+        process ??= target?.Process;
+        titleContains ??= target?.Name ?? target?.NameContains ?? (hwnd == null ? target?.Window : null);
+
+        long? h = ParseHwnd(hwnd);
+        if (h == null)
+        {
+            var wins = _s.Rt.Windows();
+            if (!string.IsNullOrWhiteSpace(process))
+            {
+                var hits = wins.Where(x => MatchesProcess(x.ProcessName, process)).ToList();
+                if (hits.Count > 1)
+                {
+                    var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
+                    var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
+                    h = fgHit?.Hwnd ?? hits[0].Hwnd;
+                }
+                else if (hits.Count == 1)
+                {
+                    h = hits[0].Hwnd;
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(titleContains))
+            {
+                var hits = wins.Where(x => x.Title.Contains(titleContains, StringComparison.OrdinalIgnoreCase)).ToList();
+                if (hits.Count > 1)
+                {
+                    var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
+                    var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
+                    h = fgHit?.Hwnd ?? hits[0].Hwnd;
+                }
+                else if (hits.Count == 1)
+                {
+                    h = hits[0].Hwnd;
+                }
+            }
+        }
+
+        if (h == null) return Task.FromResult(Error(OutcomeKind.Malformed, "Target window not found. Specify hwnd, process, or titleContains."));
         return Act(new AgentAction(AgentActionKind.FocusWindow, Hwnd: h), ct);
     }
 
@@ -3998,9 +4262,12 @@ public sealed class InbriskTools
         "Wait until an element matching query/target appears in the active window, or until a condition (gone, state, value) is met.")]
     public Task<CallToolResult> WaitFor(
         [Description("element name or query to wait for")] string? query = null,
+        [Description("element name alias for query")] string? name = null,
+        [Description("element text alias for query")] string? text = null,
         [Description("structured target specification")] TargetSpec? target = null,
         [Description("expected element state (e.g. 'selected', 'checked', 'enabled', 'disabled')")] string? expectedState = null,
         [Description("expected element value")] string? expectedValue = null,
+        [Description("element value alias for expectedValue")] string? value = null,
         [Description("if true, wait until the element is gone/disappears")] bool gone = false,
         [Description("minimum number of matching elements")] int? minCount = null,
         [Description("abort wait immediately if an unexpected modal dialog or error appears (default true)")] bool stopOnDialog = true,
@@ -4008,13 +4275,14 @@ public sealed class InbriskTools
         [Description("alias of ms — models often write timeoutMs")] int? timeoutMs = null,
         CancellationToken ct = default)
     {
-        var targetQuery = query ?? target?.Name ?? target?.NameContains;
+        var targetQuery = query ?? name ?? text ?? target?.Name ?? target?.NameContains;
+        var targetVal = expectedValue ?? value;
         return Act(new AgentAction(AgentActionKind.WaitFor,
             Query: targetQuery,
             ElementId: target?.ElementId,
             ScopeElementId: target?.Within,
             ExpectedState: expectedState,
-            ExpectedValue: expectedValue,
+            ExpectedValue: targetVal,
             Gone: gone,
             Count: minCount,
             StopOnUnexpectedDialog: stopOnDialog,
@@ -4151,50 +4419,127 @@ public sealed class InbriskTools
     }
 
     [McpServerTool(Name = "computer_app_restart"), Description(
-        "Restart the Inbrisk SERVER itself — not a user application. " +
-        "WARNING: intentionally terminates the current MCP session; the " +
-        "MCP host may need to reconnect or respawn Inbrisk.")]
-    public CallToolResult AppRestart(CancellationToken ct = default)
+        "Restart an application (or the Inbrisk SERVER itself if server:true is passed). " +
+        "When process or app is specified, closes that app and relaunches it.")]
+    public CallToolResult AppRestart(
+        [Description("friendly application name to restart (e.g. \"notepad\")")] string? app = null,
+        [Description("process name of the app to restart")] string? process = null,
+        [Description("explicitly restart the Inbrisk SERVER itself (default false)")] bool server = false,
+        CancellationToken ct = default)
     {
-        Task.Run(async () =>
+        if (server || (string.IsNullOrWhiteSpace(app) && string.IsNullOrWhiteSpace(process)))
         {
-            await Task.Delay(250);
-            var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
-            if (!File.Exists(exe))
-                exe = Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
-            Process.Start(new ProcessStartInfo(exe, "mcp") { UseShellExecute = true });
-            Environment.Exit(0);
-        });
+            Task.Run(async () =>
+            {
+                await Task.Delay(250);
+                var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
+                if (!File.Exists(exe))
+                    exe = Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
+                Process.Start(new ProcessStartInfo(exe, "mcp") { UseShellExecute = true });
+                Environment.Exit(0);
+            });
 
-        var res = new
-        {
-            accepted = true,
-            restarting = true,
-            message = "This operation intentionally terminates the current MCP session. The MCP host may need to reconnect or respawn Inbrisk."
-        };
-        return Text(JsonSerializer.Serialize(res));
+            var res = new
+            {
+                accepted = true,
+                restarting = true,
+                server = true,
+                message = "This operation intentionally terminates the current MCP session. The MCP host may need to reconnect or respawn Inbrisk."
+            };
+            return Text(JsonSerializer.Serialize(res));
+        }
+
+        var targetApp = app ?? process!;
+        // Graceful close
+        CloseWindow(process: targetApp, force: true, ct: ct);
+        Thread.Sleep(500);
+        // Relaunch
+        return Launch(app: targetApp, ct: ct);
     }
 
     [McpServerTool(Name = "computer_app_shutdown"), Description(
-        "Gracefully shut down the Inbrisk SERVER and terminate this MCP " +
-        "session — this does NOT close user applications. To close a user " +
-        "app's window, use computer_close_window (or invoke its visible " +
-        "Close control / alt+F4 while focused).")]
-    public CallToolResult AppShutdown(CancellationToken ct = default)
+        "Gracefully shut down a target user application (by process name, window hwnd, " +
+        "pid, or title substring). Closes application windows via WM_CLOSE, and force terminates " +
+        "the process if requested with force:true. " +
+        "To shut down the Inbrisk SERVER itself, explicitly pass server:true.")]
+    public CallToolResult AppShutdown(
+        [Description("process name of the app to shut down, e.g. \"notepad\", \"VDenoise\"")] string? process = null,
+        [Description("window handle of the app to shut down")] string? hwnd = null,
+        [Description("process ID to shut down")] int? pid = null,
+        [Description("substring of the window title")] string? titleContains = null,
+        [Description("semantic target spec")] TargetSpec? target = null,
+        [Description("force terminate process if graceful closure times out (default false)")] bool force = false,
+        [Description("explicitly shut down the Inbrisk MCP SERVER itself (default false)")] bool server = false,
+        CancellationToken ct = default)
     {
-        Task.Run(async () =>
+        if (server || string.Equals(process, "inbrisk", StringComparison.OrdinalIgnoreCase) || string.Equals(process, "server", StringComparison.OrdinalIgnoreCase))
         {
-            await Task.Delay(250);
-            Environment.Exit(0);
-        });
+            Task.Run(async () =>
+            {
+                await Task.Delay(250);
+                Environment.Exit(0);
+            });
 
-        var res = new
+            var res = new
+            {
+                accepted = true,
+                shuttingDown = true,
+                server = true,
+                message = "Inbrisk is shutting down gracefully."
+            };
+            return Text(JsonSerializer.Serialize(res));
+        }
+
+        process ??= target?.Process;
+        hwnd ??= target?.Hwnd ?? target?.Window;
+        titleContains ??= target?.Name ?? target?.NameContains;
+
+        if (string.IsNullOrWhiteSpace(process) && string.IsNullOrWhiteSpace(hwnd) && !pid.HasValue && string.IsNullOrWhiteSpace(titleContains))
         {
-            accepted = true,
-            shuttingDown = true,
-            message = "Inbrisk is shutting down gracefully."
-        };
-        return Text(JsonSerializer.Serialize(res));
+            return Error(OutcomeKind.Malformed,
+                "Pass 'process', 'hwnd', 'pid', or 'titleContains' to shut down a user application. " +
+                "To shut down the Inbrisk server itself, explicitly pass server: true.");
+        }
+
+        // Delegate to CloseWindow if window targeting is used
+        if (!string.IsNullOrWhiteSpace(hwnd) || !string.IsNullOrWhiteSpace(titleContains) || (!string.IsNullOrWhiteSpace(process) && !pid.HasValue))
+        {
+            return CloseWindow(hwnd: hwnd, process: process, titleContains: titleContains, target: target, force: force, ct: ct);
+        }
+
+        if (pid.HasValue)
+        {
+            var pVal = pid.Value;
+            if (_s.Rt.WindowService.ListWindows().Any(w => w.Pid == pVal && _s.Rt.WindowService.IsWindowProtected(w.Hwnd, out _)))
+            {
+                return Error(OutcomeKind.PolicyDenied, $"Refusing to shut down protected process (PID {pVal}).");
+            }
+
+            if (!force && !_s.Rt.Provenance.CanAgentCloseProcess(pVal, out var reason))
+            {
+                return Error(OutcomeKind.PolicyDenied, $"DENIED: {reason} Pass force: true if requested by user.");
+            }
+
+            try
+            {
+                using var proc = Process.GetProcessById(pVal);
+                proc.Kill();
+                return Text(JsonSerializer.Serialize(new
+                {
+                    success = true,
+                    closed = true,
+                    pid = pVal,
+                    process = proc.ProcessName,
+                    notification = $"Shut down {proc.ProcessName} (PID {pVal})."
+                }, J));
+            }
+            catch (Exception ex)
+            {
+                return Error(OutcomeKind.Failed, $"Failed to shut down process PID {pVal}: {ex.Message}");
+            }
+        }
+
+        return Error(OutcomeKind.Malformed, "Unable to resolve target process or window for shutdown.");
     }
 
     // ------------------------------------------------------------ screenshot
@@ -4450,6 +4795,38 @@ public sealed class InbriskTools
         t.Within == null &&
         (t.Window == null || ParseHwnd(t.Window) != null);
 
+    private static bool IsCloseElement(UiElement el)
+    {
+        var autoId = el.Props.GetValueOrDefault("automationId")?.ToString();
+        if (!string.IsNullOrWhiteSpace(autoId))
+        {
+            if (autoId.Equals("Close", StringComparison.OrdinalIgnoreCase) ||
+                autoId.Equals("CloseButton", StringComparison.OrdinalIgnoreCase) ||
+                autoId.Equals("TabCloseButton", StringComparison.OrdinalIgnoreCase) ||
+                autoId.Equals("TitleBarCloseButton", StringComparison.OrdinalIgnoreCase) ||
+                autoId.Equals("btn-close", StringComparison.OrdinalIgnoreCase) ||
+                autoId.Equals("closeBtn", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        var name = (el.Name ?? el.Props.GetValueOrDefault("name")?.ToString())?.Trim();
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            if (name.Equals("Close", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Close tab", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Close window", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Kapat", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Sekmeyi Kapat", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Pencereyi Kapat", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Exit", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Quit", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Çıkış", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
     private UiElement? ResolveTargetElement(string? elementId,
         TargetSpec? target, out CallToolResult? error, out int matchCount,
         string? purpose = null, bool anyMatch = false, Selection? sel = null,
@@ -4474,6 +4851,49 @@ public sealed class InbriskTools
             error = error == null ? null : "see-result",
             totalMs = sw.ElapsedMilliseconds,
         });
+        if (el != null && error == null)
+        {
+            var targetHwnd = el.Hwnd ?? el.Handle.Recipe.Hwnd;
+            if (targetHwnd.HasValue)
+                _s.Rt.Provenance.MarkUsedWindow(targetHwnd.Value);
+
+            if (purpose is "invoke" or "edit" or "toggle" or "select")
+            {
+                if (el.Props.TryGetValue("enabled", out var en) && en is false)
+                {
+                    error = Error(OutcomeKind.InputRejected,
+                        $"Element '{el.Role} \"{el.Name}\"' [{el.Id}] is currently DISABLED (grayed out) in the UI. Action cannot be performed on a disabled element.");
+                    return el;
+                }
+
+                var blocker = _s.Rt.WindowService.GetActiveBlockingPopup(targetHwnd);
+                var rootHwnd = targetHwnd.HasValue ? WindowService.GetRootHwnd(targetHwnd.Value) : (long?)null;
+                if (blocker != null && (!rootHwnd.HasValue || blocker.Hwnd != rootHwnd.Value))
+                {
+                    error = Error(OutcomeKind.InputRejected,
+                        $"Target window {(rootHwnd.HasValue ? $"0x{rootHwnd.Value:X}" : "(none)")} is currently BLOCKED by active popup/flyout 0x{blocker.Hwnd:X} \"{blocker.Title}\" ({blocker.ProcessName}). " +
+                        $"You must dismiss or interact with this modal/system popup first before you can interact with background windows (e.g. press Escape via computer_hotkey 'Escape', or click its controls).");
+                    return el;
+                }
+
+                if (targetHwnd.HasValue && IsCloseElement(el))
+                {
+                    if (_s.Rt.WindowService.IsWindowProtected(targetHwnd.Value, out var protectReason))
+                    {
+                        error = Error(OutcomeKind.PolicyDenied,
+                            $"DENIED: Element '{el.Role} \"{el.Name}\"' [{el.Id}] is a close/exit action on protected window 0x{targetHwnd.Value:X}: {protectReason}. Operation blocked by safety policy.");
+                        return el;
+                    }
+
+                    if (!_s.Rt.Provenance.CanAgentClose(targetHwnd.Value, out var lifecycleReason))
+                    {
+                        error = Error(OutcomeKind.PolicyDenied,
+                            $"DENIED: Element '{el.Role} \"{el.Name}\"' [{el.Id}] is a close/exit action on user-owned window 0x{targetHwnd.Value:X}: {lifecycleReason}. Operation blocked by Inbrisk Application Lifecycle Policy.");
+                        return el;
+                    }
+                }
+            }
+        }
         return el;
     }
 
@@ -5026,6 +5446,32 @@ public sealed class InbriskTools
         };
     }
 
+    private static bool IsClosingHotkey(string? key, IReadOnlyList<string>? modifiers)
+    {
+        if (string.IsNullOrWhiteSpace(key)) return false;
+        var k = key.Trim().ToLowerInvariant();
+        var mods = modifiers?.Select(m => m.Trim().ToLowerInvariant()).ToHashSet() ?? new HashSet<string>();
+
+        if (k.Contains('+'))
+        {
+            var parts = k.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            k = parts.LastOrDefault() ?? "";
+            foreach (var p in parts.Take(parts.Length - 1))
+                mods.Add(p);
+        }
+
+        // Alt+F4
+        if (k == "f4" && mods.Contains("alt")) return true;
+
+        // Ctrl+W, Ctrl+Shift+W, Ctrl+F4
+        if ((k == "w" || k == "f4") && mods.Contains("ctrl")) return true;
+
+        // Ctrl+Q
+        if (k == "q" && mods.Contains("ctrl")) return true;
+
+        return false;
+    }
+
     /// <summary>Single action = a one-step chain.</summary>
     private Task<CallToolResult> Act(AgentAction a, CancellationToken ct, bool observe = false)
         => ActChain([a], a.ElementId, ct, observe);
@@ -5048,11 +5494,36 @@ public sealed class InbriskTools
             // panic gate so an AI can never replay it through MCP even while
             // stopped
             foreach (var a in steps)
+            {
                 if (a.Kind is AgentActionKind.Hotkey or AgentActionKind.Key &&
                     _s.Control.IsLocalResumeKey(a.Key,
                         a.Kind == AgentActionKind.Hotkey ? a.Modifiers : null))
                     return Error(OutcomeKind.PolicyDenied,
                         "local resume hotkey is reserved for the human", sw);
+
+                if (a.Kind is AgentActionKind.Hotkey or AgentActionKind.Key && IsClosingHotkey(a.Key, a.Modifiers))
+                {
+                    var targetHwnd = a.Hwnd ?? _s.Rt.ForegroundWindow()?.Hwnd;
+                    if (targetHwnd.HasValue)
+                    {
+                        if (_s.Rt.WindowService.IsWindowProtected(targetHwnd.Value, out var protectReason))
+                        {
+                            var keyStr = string.Join("+", (a.Modifiers ?? Array.Empty<string>()).Append(a.Key ?? ""));
+                            var winInfo = _s.Rt.Window(targetHwnd.Value);
+                            var winDesc = winInfo != null ? $"\"{winInfo.Title}\" ({winInfo.ProcessName})" : "unknown";
+                            return Error(OutcomeKind.PolicyDenied,
+                                $"DENIED: Cannot send closing hotkey '{keyStr}' to protected window 0x{targetHwnd.Value:X} {winDesc}: {protectReason}. Operation blocked by safety policy. If you intended to send this hotkey to an application window (e.g. File Explorer), you must first focus that window with computer_focus_window or pass target/hwnd.", sw);
+                        }
+
+                        if (!_s.Rt.Provenance.CanAgentClose(targetHwnd.Value, out var closeReason))
+                        {
+                            var keyStr = string.Join("+", (a.Modifiers ?? Array.Empty<string>()).Append(a.Key ?? ""));
+                            return Error(OutcomeKind.PolicyDenied,
+                                $"DENIED: Cannot send closing hotkey '{keyStr}' to user-owned window 0x{targetHwnd.Value:X}: {closeReason}. Operation blocked by Inbrisk Application Lifecycle Policy.", sw);
+                        }
+                    }
+                }
+            }
             var epoch = _s.Control.ActionToken();
             if (epoch == null)
                 return Error(OutcomeKind.EmergencyStopped,
@@ -5130,8 +5601,20 @@ public sealed class InbriskTools
                 _s.NoteElementRef(postElementId ?? last.ElementId);
                 (long hwnd, string title, bool dialogLikely, List<string> elements)? nw;
                 using (PerfTrace.Stage("step.modalCheck"))
+                {
                     nw = DetectNewWindow(fgBefore,
                         steps.LastOrDefault(s => s.Kind == AgentActionKind.FocusWindow)?.Hwnd);
+                    if (nw == null && fgBefore.HasValue && _s.Rt.WindowService.GetModalPopup(fgBefore.Value) is { } spawnedModal && spawnedModal.Hwnd != fgBefore.Value)
+                    {
+                        var modalEls = Snapshot(spawnedModal.Hwnd);
+                        nw = (spawnedModal.Hwnd, spawnedModal.Title, true,
+                            modalEls.Where(e => e.Actions.Count > 0).Take(12).Select(Describe).ToList());
+                    }
+                }
+                if (nw is { dialogLikely: true })
+                {
+                    o = o with { Detail = (string.IsNullOrEmpty(o.Detail) ? "" : o.Detail + " — ") + $"MODAL/POPUP OPENED: 0x{nw.Value.hwnd:X} \"{nw.Value.title}\" (dismiss or interact with it before next action)" };
+                }
                 using (PerfTrace.Stage("verify.targeted"))
                 {
                     var post2 = ReadElementState(postElementId);
@@ -5418,6 +5901,8 @@ public sealed class InbriskTools
     {
         if (string.IsNullOrWhiteSpace(s)) return null;
         s = s.Trim();
+        if (s.StartsWith("hwnd:", StringComparison.OrdinalIgnoreCase))
+            s = s[5..].Trim();
         if (s.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
             return long.TryParse(s[2..], System.Globalization.NumberStyles.HexNumber,
                 null, out var h) ? h : null;

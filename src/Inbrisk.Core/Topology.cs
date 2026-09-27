@@ -22,7 +22,11 @@ public sealed record WindowInfo(
     bool IsForeground,
     bool IsElevated,
     bool OnCurrentVirtualDesktop,
-    int MonitorIndex)
+    int MonitorIndex,
+    bool IsModalPopup = false,
+    long? OwnerHwnd = null,
+    long? ModalPopupHwnd = null,
+    bool IsEnabled = true)
 {
     public override string ToString() =>
         $"{Title} [{ProcessName} pid={Pid} hwnd=0x{Hwnd:X}] {Bounds} {State}" +

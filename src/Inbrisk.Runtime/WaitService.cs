@@ -98,9 +98,19 @@ public sealed class WaitService
     public (long Hwnd, string Title)? CheckUnexpectedDialog(long? scopedHwnd)
     {
         if (_windows == null) return null;
+
+        // 1. Direct modal blocker check from WindowService
+        if (scopedHwnd != null && scopedHwnd > 0)
+        {
+            var blocker = _windows.GetActiveBlockingPopup(scopedHwnd);
+            if (blocker != null && blocker.Hwnd != scopedHwnd.Value)
+                return (blocker.Hwnd, blocker.Title.Length > 0 ? blocker.Title : "Modal Dialog");
+        }
+
         var fg = _windows.GetForegroundWindow();
         if (fg == null) return null;
         if (scopedHwnd != null && scopedHwnd > 0 && fg.Hwnd == scopedHwnd.Value) return null;
+        if (_windows.IsWindowProtected(fg.Hwnd, out _)) return null;
 
         var title = fg.Title ?? "";
         var isDialogTitle = title.Contains("Dialog", StringComparison.OrdinalIgnoreCase) ||
@@ -121,9 +131,11 @@ public sealed class WaitService
             try
             {
                 var buttons = _find(new FindSpec(Hwnd: fg.Hwnd, Role: Role.Button, MaxResults: 8));
-                var hasDialogButtons = buttons.Any(b =>
-                    b.Name is "OK" or "Cancel" or "Tamam" or "İptal" or "Yes" or "No" or "Evet" or "Hayır" or "Close" or "Kapat");
-                if (hasDialogButtons)
+                // Normal top-level windows have 'Close' titlebar buttons — exclude generic Close
+                // and look for actual dialog confirmation actions (OK/Cancel, Yes/No, etc.)
+                var dialogButtonCount = buttons.Count(b =>
+                    b.Name is "OK" or "Cancel" or "Tamam" or "İptal" or "Yes" or "No" or "Evet" or "Hayır" or "Retry" or "Yeniden Dene");
+                if (dialogButtonCount >= 1 && (isDialogTitle || dialogButtonCount >= 2))
                     return (fg.Hwnd, title.Length > 0 ? title : "Dialog");
             }
             catch { }

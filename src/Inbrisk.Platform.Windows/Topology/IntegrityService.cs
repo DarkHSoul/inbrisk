@@ -42,14 +42,21 @@ public sealed class IntegrityService : IIntegrityService
 
     /// <summary>Returns RID of the token's integrity level (0x2000 medium,
     /// 0x3000 high) or -1 if unreadable.</summary>
-    internal static int ProcessIntegrityLevel(int pid)
+    public static int ProcessIntegrityLevel(int pid)
     {
         var hProc = NativeMethods.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        if (hProc == IntPtr.Zero) return -1;
+        if (hProc == IntPtr.Zero)
+        {
+            var err = Marshal.GetLastWin32Error();
+            return err == 5 ? 0x3000 : -1; // ERROR_ACCESS_DENIED implies higher integrity than current caller
+        }
         try
         {
             if (!NativeMethods.OpenProcessToken(hProc, NativeMethods.TOKEN_QUERY, out var token))
-                return -1;
+            {
+                var err = Marshal.GetLastWin32Error();
+                return err == 5 ? 0x3000 : -1;
+            }
             try
             {
                 NativeMethods.GetTokenInformation(token, NativeMethods.TokenIntegrityLevel,
@@ -68,5 +75,9 @@ public sealed class IntegrityService : IIntegrityService
         finally { NativeMethods.CloseHandle(hProc); }
     }
 
-    internal static bool IsProcessElevated(int pid) => ProcessIntegrityLevel(pid) >= 0x3000;
+    public static bool IsProcessElevated(int pid)
+    {
+        var lvl = ProcessIntegrityLevel(pid);
+        return lvl >= 0x3000;
+    }
 }

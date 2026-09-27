@@ -1,0 +1,8 @@
+name: inbrisk
+version: 1.0.0
+schema: v1
+mcpServers:
+  - name: inbrisk
+    command: C:\Users\Ahmet\AppData\Local\Programs\Inbrisk\inbrisk.exe
+    args:
+      - mcp

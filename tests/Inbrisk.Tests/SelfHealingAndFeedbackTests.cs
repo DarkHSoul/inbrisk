@@ -17,6 +17,10 @@ public sealed class SelfHealingAndFeedbackTests
         public RectPx GetVirtualDesktopBounds() => new(0, 0, 1920, 1080);
         public bool FocusWindow(long hwnd) => true;
         public bool CloseWindow(long hwnd) => true;
+        public WindowInfo? GetModalPopup(long hwnd) => null;
+        public bool IsWindowEnabled(long hwnd) => true;
+        public IReadOnlyList<WindowInfo> FindSystemDialogs() => Array.Empty<WindowInfo>();
+        public bool IsWindowProtected(long hwnd, out string? reason) { reason = null; return false; }
     }
 
     private sealed class MockBackend : IElementBackend
