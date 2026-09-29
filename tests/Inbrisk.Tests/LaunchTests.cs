@@ -122,6 +122,45 @@ public sealed class LaunchUnitTests
     }
 
     [Fact]
+    public void TokenMatch_BeatsCompoundSubstring_EdgeWinsOverGoAwayEdge()
+    {
+        var (svc, win, spawns) = Svc();
+        svc.PackageEnumerator = () =>
+        [
+            new AppService.ResolvedApp(LaunchMethod.StartMenu,
+                @"C:\Path\Microsoft Edge.lnk", "Microsoft Edge", ["msedge"], 0),
+            new AppService.ResolvedApp(LaunchMethod.StartMenu,
+                @"C:\Path\GoAwayEdge.lnk", "GoAwayEdge", ["GoAwayEdge"], 0)
+        ];
+        win.Windows.Add(Win(0x4001, 7777, "New Tab - Microsoft Edge", "msedge.exe"));
+
+        var r = svc.Launch(For("Edge"));
+        Assert.True(r.Success, r.ErrorDetail);
+        Assert.Equal(0x4001, r.Hwnd);
+        Assert.Equal(7777, r.Pid);
+    }
+
+    [Fact]
+    public void UwpLocalizedAlias_MatchesApplicationFrameHost()
+    {
+        var (svc, win, spawns) = Svc();
+        // Packaged app for Settings in Turkish Windows is Ayarlar
+        svc.PackageEnumerator = () =>
+        [
+            new AppService.ResolvedApp(LaunchMethod.Aumid,
+                "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel",
+                "Ayarlar", ["SystemSettings"], 0)
+        ];
+        // UWP window is hosted under ApplicationFrameHost.exe with localized title "Ayarlar"
+        win.Windows.Add(Win(0x5001, 6666, "Ayarlar", "ApplicationFrameHost.exe"));
+
+        var r = svc.Launch(For("Settings"));
+        Assert.True(r.Success, r.ErrorDetail);
+        Assert.Equal(0x5001, r.Hwnd);
+        Assert.Equal(6666, r.Pid);
+    }
+
+    [Fact]
     public void AmbiguousName_ReturnsCandidates_NeverGuesses()
     {
         var (svc, _, spawns) = Svc();

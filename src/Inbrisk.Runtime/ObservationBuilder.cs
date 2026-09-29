@@ -113,12 +113,14 @@ public sealed class ObservationBuilder
         IReadOnlyList<RectPx> regions, long? targetHwnd)
     {
         var s = 0;
-        if (Interactive.Contains(e.Role) || e.Actions.Count > 0) s += 100;
+        var isEnabled = e.Props.GetValueOrDefault("enabled") is not false;
+        if (isEnabled && (Interactive.Contains(e.Role) || e.Actions.Count > 0)) s += 100;
+        else if (!isEnabled && Interactive.Contains(e.Role)) s += 5;
         if (e.Props.GetValueOrDefault("focused") is true) s += 40;
         if (recentRefs.Contains(e.Id)) s += 50;
         if (changedKeys.Contains(stableKey)) s += 30;
         if (e.Name != null) s += 10;
-        if (e.Props.GetValueOrDefault("enabled") is not false) s += 5;
+        if (isEnabled) s += 5;
         if (e.Hwnd == targetHwnd) s += 20;
         foreach (var r in regions)
             if (e.Bounds.Intersects(r)) { s += 15; break; }

@@ -251,6 +251,12 @@ public sealed class Executor
                 or ActionKind.Collapse or ActionKind.FocusElement or ActionKind.ScrollIntoView
                 when element != null:
             {
+                if (element.Props.TryGetValue("enabled", out var isEn) && isEn is false or 0 && intent.Kind != ActionKind.FocusElement)
+                {
+                    return new ActionResult(false, null, "guard", attempts,
+                        VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Disabled,
+                        $"element {element.Id} ('{element.Name}') is disabled; cannot perform {intent.Kind}");
+                }
                 var backend = _backends.First(b => b.Id == element.Handle.Backend);
                 var native = backend.PerformNative(element, intent, ct);
                 if (native != null)

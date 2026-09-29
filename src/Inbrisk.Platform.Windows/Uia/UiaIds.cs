@@ -59,8 +59,9 @@ internal static class UiaIds
     };
 
     internal static string[] ActionsFor(IUIAutomation uia, IUIAutomationElement el,
-        bool cached = false)
+        bool cached = false, bool isEnabled = true)
     {
+        if (!isEnabled) return Array.Empty<string>();
         var actions = new List<string> { "click" }; // coordinate click always possible
         if (cached)
         {

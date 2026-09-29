@@ -1175,7 +1175,7 @@ public sealed class UiaBackend : IElementBackend
         _live[id] = el;
         return new UiElement(id, BackendId.Uia, MapControlType(controlType),
             string.IsNullOrEmpty(name) ? null : name, bounds,
-            UiaIds.ActionsFor(uia, el, cached), props, handle,
+            UiaIds.ActionsFor(uia, el, cached, enabled != 0), props, handle,
             pid == 0 ? null : pid, hwnd == IntPtr.Zero ? null : hwnd.ToInt64());
     }
 

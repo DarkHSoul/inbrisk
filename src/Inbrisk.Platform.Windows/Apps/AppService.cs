@@ -335,7 +335,7 @@ public sealed class AppService : IAppService
         foreach (var lnk in EnumerateLinks(dir))
         {
             var name = Path.GetFileNameWithoutExtension(lnk);
-            var s = Score(Norm(name), norm);
+            var s = Score(name, app, Norm(name), norm);
             if (s <= 0) continue;
             var (isValid, tgtStem) = InspectLnk(lnk);
             if (!isValid) continue; // Skip stale/dead shortcuts to uninstalled apps
@@ -363,7 +363,7 @@ public sealed class AppService : IAppService
         foreach (var (keyName, path) in AppPaths())
         {
             var name = Path.GetFileNameWithoutExtension(keyName);
-            var s = Score(Norm(name), norm);
+            var s = Score(name, app, Norm(name), norm);
             if (s > 0 && File.Exists(path))
                 found.Add(new ResolvedApp(LaunchMethod.AppPath, path, name,
                     [name], s + 4));
@@ -374,10 +374,10 @@ public sealed class AppService : IAppService
         // while the PFN keeps the canonical "Microsoft.WindowsCalculator"
         foreach (var pkg in (PackageEnumerator ?? EnumeratePackages)())
         {
-            var s = Math.Max(Score(Norm(pkg.DisplayName), norm),
-                Score(Norm(pkg.Identifier), norm));
+            var s = Math.Max(Score(pkg.DisplayName, app, Norm(pkg.DisplayName), norm),
+                Score(pkg.Identifier, app, Norm(pkg.Identifier), norm));
             foreach (var hint in pkg.ExeHints)
-                s = Math.Max(s, Score(Norm(hint), norm));
+                s = Math.Max(s, Score(hint, app, Norm(hint), norm));
             if (s > 0)
                 found.Add(new ResolvedApp(LaunchMethod.Aumid, pkg.Identifier,
                     pkg.DisplayName, pkg.ExeHints, s + 3));
@@ -546,11 +546,56 @@ public sealed class AppService : IAppService
         _ => 5,
     };
 
+    private static readonly Dictionary<string, string[]> WellKnownLocalizedAliases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["settings"] = ["ayarlar", "settings", "immersivecontrolpanel"],
+        ["ayarlar"] = ["settings", "ayarlar", "immersivecontrolpanel"],
+        ["calculator"] = ["hesap makinesi", "calculator", "calc", "windowscalculator"],
+        ["hesapmakinesi"] = ["calculator", "hesap makinesi", "calc", "windowscalculator"],
+        ["photos"] = ["fotoğraflar", "photos", "windowsphotos"],
+        ["fotograflar"] = ["photos", "fotoğraflar", "windowsphotos"],
+        ["camera"] = ["kamera", "camera", "windowscamera"],
+        ["kamera"] = ["camera", "kamera", "windowscamera"],
+        ["store"] = ["microsoft store", "store", "mağaza", "windowsstore"],
+        ["magaza"] = ["microsoft store", "store", "mağaza", "windowsstore"],
+        ["alarms"] = ["saat", "alarms", "alarms & clock", "clock"],
+        ["clock"] = ["saat", "alarms", "alarms & clock", "clock"],
+        ["saat"] = ["clock", "alarms", "saat"],
+        ["weather"] = ["hava durumu", "weather", "bingweather"],
+        ["havadurumu"] = ["weather", "hava durumu", "bingweather"],
+        ["paint"] = ["paint", "mspaint"],
+        ["notepad"] = ["notepad", "not defteri"],
+        ["notdefteri"] = ["notepad", "not defteri"],
+        ["word"] = ["word", "microsoft word", "winword"],
+        ["excel"] = ["excel", "microsoft excel"],
+        ["powerpoint"] = ["powerpoint", "microsoft powerpoint"],
+        ["edge"] = ["microsoft edge", "edge", "msedge"],
+    };
+
+    private static int Score(string rawCandidate, string rawQuery, string candidateNorm, string queryNorm)
+    {
+        if (candidateNorm == queryNorm) return 100;
+
+        // Well-known localized aliases
+        if (WellKnownLocalizedAliases.TryGetValue(queryNorm, out var aliases) &&
+            aliases.Any(a => Norm(a) == candidateNorm))
+            return 95;
+        if (WellKnownLocalizedAliases.TryGetValue(candidateNorm, out var rAliases) &&
+            rAliases.Any(a => Norm(a) == queryNorm))
+            return 95;
+
+        // Distinct word token matching in raw candidate (e.g. "Edge" inside "Microsoft Edge" gets 85 vs compound "GoAwayEdge" getting 30)
+        var rawTokens = rawCandidate.Split(new[] { ' ', '-', '_', '.', '(', ')', '[', ']' }, StringSplitOptions.RemoveEmptyEntries);
+        if (rawTokens.Any(t => string.Equals(Norm(t), queryNorm, StringComparison.OrdinalIgnoreCase)))
+            return 85;
+
+        if (candidateNorm.StartsWith(queryNorm, StringComparison.Ordinal)) return 60;
+        if (candidateNorm.Contains(queryNorm, StringComparison.Ordinal)) return 30;
+        return 0;
+    }
+
     private static int Score(string candidate, string norm)
-        => candidate == norm ? 100
-         : candidate.StartsWith(norm, StringComparison.Ordinal) ? 60
-         : candidate.Contains(norm, StringComparison.Ordinal) ? 30
-         : 0;
+        => Score(candidate, norm, candidate, norm);
 
     private static string Norm(string s)
         => new string(s.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
@@ -1032,6 +1077,24 @@ public sealed class AppService : IAppService
             var winTitle = Norm(w.Title);
             if (winTitle.Contains(norm) || (reqNorm != null && winTitle.Contains(reqNorm))) return true;
             if (hints.Any(h => h.Length >= 4 && (winTitle.Contains(h) || pn.Contains(h)))) return true;
+
+            // 3. UWP / ApplicationFrameHost special handling
+            if (pn == "applicationframehost")
+            {
+                if (winTitle.Contains(norm) || (reqNorm != null && winTitle.Contains(reqNorm))) return true;
+                if (hints.Any(h => h.Length >= 4 && winTitle.Contains(h))) return true;
+                if (reqNorm != null && WellKnownLocalizedAliases.TryGetValue(reqNorm, out var reqAliases) &&
+                    reqAliases.Any(a => winTitle.Contains(Norm(a)))) return true;
+                if (WellKnownLocalizedAliases.TryGetValue(norm, out var normAliases) &&
+                    normAliases.Any(a => winTitle.Contains(Norm(a)))) return true;
+            }
+
+            // 4. Localized aliases fallback for regular windows
+            if (reqNorm != null && WellKnownLocalizedAliases.TryGetValue(reqNorm, out var rAliases) &&
+                rAliases.Any(a => winTitle.Contains(Norm(a)) || pn.Contains(Norm(a)))) return true;
+            if (WellKnownLocalizedAliases.TryGetValue(norm, out var nAliases) &&
+                nAliases.Any(a => winTitle.Contains(Norm(a)) || pn.Contains(Norm(a)))) return true;
+
             return false;
         }).ToList();
         return BestWindow(named);

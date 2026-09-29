@@ -110,8 +110,9 @@ public static class McpHost
                     "or fall back to shell/PowerShell; tell the user that " +
                     "control is stopped and only they can resume it with " +
                     "the local resume hotkey or the tray icon. Do not " +
-                    "repeat this before every action. When the user asks " +
-                    "to interact with an " +
+                    "repeat this before every action. " +
+                    "EXECUTION EFFICIENCY & MULTI-STEP PLANS: LLM roundtrips dominate task latency. Whenever you can foresee a sequence of 2 or more steps (such as launch + wait_for + click, or focus + type + submit), ALWAYS combine them into a single 'computer_run' plan rather than calling separate tools turn-by-turn. Single-action tools (computer_click, computer_type) are strictly for exploration or when the next step genuinely depends on unpredicted UI state. " +
+                    "When the user asks to interact with an " +
                     "application that is not currently running, prefer " +
                     "computer_launch (or a computer_run launch step) instead " +
                     "of shell/PowerShell to locate or start it. To open a " +

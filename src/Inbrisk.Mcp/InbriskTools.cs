@@ -76,7 +76,8 @@ public sealed class InbriskTools
     private static string SlimObsEl(ObsElement e)
     {
         var b = e.Bounds;
-        return $"[{e.Id}] {e.Role}" +
+        var dis = e.State?.Contains("disabled", StringComparison.OrdinalIgnoreCase) == true ? " [DISABLED]" : "";
+        return $"[{e.Id}] {e.Role}{dis}" +
             (e.Name is { Length: > 0 } n ? $" \"{TruncEdges(n.Trim(), 80)}\"" : "") +
             (!string.IsNullOrEmpty(e.Value)
                 ? $" value=\"{TruncEdges(e.Value, 80)}\"" : "") +
@@ -222,14 +223,17 @@ public sealed class InbriskTools
             var elCap = maxElements ?? (slim ? 60 : int.MaxValue);
             sb.AppendLine($"elements ({Math.Min(o.Elements.Count, elCap)} of {o.Elements.Count} shown):");
             foreach (var e in o.Elements.Take(elCap))
+            {
+                var dis = e.State?.Contains("disabled", StringComparison.OrdinalIgnoreCase) == true ? " [DISABLED]" : "";
                 sb.AppendLine(slim
                     ? "  " + SlimObsEl(e)
-                    : $"  [{e.Id}] {e.Role}" +
+                    : $"  [{e.Id}] {e.Role}{dis}" +
                         (e.Name != null ? $" \"{e.Name}\"" : "") +
                         (e.Value != null ? $" value=\"{e.Value}\"" : "") +
                         (e.State != null ? $" state={e.State}" : "") +
                         (e.Actions.Count > 0 ? $" actions=[{string.Join(",", e.Actions)}]" : "") +
                         $" bounds=({e.Bounds.X},{e.Bounds.Y} {e.Bounds.Width}x{e.Bounds.Height})");
+            }
             if (o.Elements.Count > elCap)
                 sb.AppendLine($"  …{o.Elements.Count - elCap} more — pass maxElements to see them");
             if (o.RecentEvents.Count > 0)
@@ -3760,8 +3764,11 @@ public sealed class InbriskTools
     }
 
     private static string Describe(UiElement e)
-        => $"[{e.Id}] {e.Role} \"{Trunc(e.Name, 60)}\" " +
-           $"bounds=({e.Bounds.X},{e.Bounds.Y} {e.Bounds.Width}x{e.Bounds.Height})";
+    {
+        var dis = e.Props.TryGetValue("enabled", out var en) && en is false ? " [DISABLED]" : "";
+        return $"[{e.Id}] {e.Role}{dis} \"{Trunc(e.Name, 60)}\" " +
+               $"bounds=({e.Bounds.X},{e.Bounds.Y} {e.Bounds.Width}x{e.Bounds.Height})";
+    }
 
     /// <summary>Step actions that cannot mutate the UI — a plan made only of
     /// these skips the pre-run baseline snapshot.</summary>
