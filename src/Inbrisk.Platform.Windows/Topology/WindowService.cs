@@ -327,7 +327,7 @@ public sealed class WindowService : IWindowService
 
         if (!isFileExplorerFolder)
         {
-            var settings = UserSettings.Load();
+            var settings = UserSettings.LoadCached();
             if (settings.ProtectedProcesses != null)
             {
                 foreach (var p in settings.ProtectedProcesses)
@@ -342,7 +342,7 @@ public sealed class WindowService : IWindowService
             }
 
             if (proc is "windowsterminal.exe" or "conhost.exe" or "powershell.exe" or "pwsh.exe"
-                or "cmd.exe" or "code.exe" or "antigravity.exe" or "cursor.exe" or "devenv.exe" or "explorer.exe" or "dwm.exe" or "inbrisk.exe" or "devin.exe")
+                or "cmd.exe" or "code.exe" or "antigravity.exe" or "cursor.exe" or "devenv.exe" or "explorer.exe" or "dwm.exe" or "inbrisk.exe" or "devin.exe" or "claude.exe")
             {
                 reason = $"protected host terminal, IDE, or system shell ('{proc}')";
                 return true;
@@ -353,8 +353,8 @@ public sealed class WindowService : IWindowService
             title.Contains("Colab", StringComparison.OrdinalIgnoreCase) ||
             title.Contains("Qwen", StringComparison.OrdinalIgnoreCase) ||
             title.Contains("Antigravity", StringComparison.OrdinalIgnoreCase) ||
-            title.Contains("Inbrisk", StringComparison.OrdinalIgnoreCase) ||
-            title.Contains("Claude", StringComparison.OrdinalIgnoreCase) ||
+            (proc.StartsWith("inbrisk", StringComparison.OrdinalIgnoreCase) && title.StartsWith("Inbrisk", StringComparison.OrdinalIgnoreCase)) ||
+            (proc.StartsWith("claude", StringComparison.OrdinalIgnoreCase) || title.EndsWith(" - Claude", StringComparison.OrdinalIgnoreCase) || title.EndsWith(" | Claude", StringComparison.OrdinalIgnoreCase)) ||
             title.Contains("Jupyter", StringComparison.OrdinalIgnoreCase) ||
             title.Equals("Program Manager", StringComparison.OrdinalIgnoreCase))
         {

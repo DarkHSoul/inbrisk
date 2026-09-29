@@ -361,7 +361,12 @@ public sealed class InbriskTools
             w = wins.FirstOrDefault(x => x.Hwnd == h);
         else if (!string.IsNullOrWhiteSpace(process))
         {
-            var hits = wins.Where(x => MatchesProcess(x.ProcessName, process)).ToList();
+            var hits = wins
+                .Select(x => (Window: x, Score: ScoreProcessMatch(x.ProcessName, process)))
+                .Where(x => x.Score > 0)
+                .OrderByDescending(x => x.Score)
+                .Select(x => x.Window)
+                .ToList();
             var closableHits = hits.Where(x => !_s.Rt.WindowService.IsWindowProtected(x.Hwnd, out _)).ToList();
             if (closableHits.Count > 0) hits = closableHits;
 
@@ -533,15 +538,61 @@ public sealed class InbriskTools
         }
     }
 
-    private static bool MatchesProcess(string? actual, string query)
+    private static int ScoreProcessMatch(string? actual, string query)
     {
-        if (string.IsNullOrWhiteSpace(actual) || string.IsNullOrWhiteSpace(query)) return false;
+        if (string.IsNullOrWhiteSpace(actual) || string.IsNullOrWhiteSpace(query)) return 0;
         var act = actual.Trim();
         var q = query.Trim();
         var normAct = act.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? act[..^4] : act;
         var normQ = q.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? q[..^4] : q;
-        return act.Contains(q, StringComparison.OrdinalIgnoreCase)
-            || normAct.Contains(normQ, StringComparison.OrdinalIgnoreCase);
+
+        // Exact match (100)
+        if (string.Equals(act, q, StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(normAct, normQ, StringComparison.OrdinalIgnoreCase))
+            return 100;
+
+        // Common known aliases (95)
+        if ((normQ.Equals("edge", StringComparison.OrdinalIgnoreCase) && normAct.Equals("msedge", StringComparison.OrdinalIgnoreCase)) ||
+            (normQ.Equals("word", StringComparison.OrdinalIgnoreCase) && normAct.Equals("winword", StringComparison.OrdinalIgnoreCase)) ||
+            (normQ.Equals("calc", StringComparison.OrdinalIgnoreCase) && (normAct.Equals("calculatorapp", StringComparison.OrdinalIgnoreCase) || normAct.Equals("calculator", StringComparison.OrdinalIgnoreCase))))
+            return 95;
+
+        // Starts-with prefix (80)
+        if (normAct.StartsWith(normQ, StringComparison.OrdinalIgnoreCase))
+            return 80;
+
+        // Token / word boundary match (70 / 60)
+        var tokens = normAct.Split(new[] { '.', '_', '-', ' ' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (var token in tokens)
+        {
+            if (string.Equals(token, normQ, StringComparison.OrdinalIgnoreCase))
+                return 70;
+            if (token.StartsWith(normQ, StringComparison.OrdinalIgnoreCase))
+                return 60;
+        }
+
+        // Substring match with lower score (40) — only for tokens length >= 4 to avoid false short positives
+        if (normQ.Length >= 4 && normAct.IndexOf(normQ, StringComparison.OrdinalIgnoreCase) >= 0)
+            return 40;
+
+        return 0;
+    }
+
+    private static bool MatchesProcess(string? actual, string query) => ScoreProcessMatch(actual, query) > 0;
+
+    private WindowInfo? FindBestWindowForProcess(string process)
+    {
+        var wins = _s.Rt.Windows();
+        var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
+
+        return wins
+            .Select(w => (Window: w, Score: ScoreProcessMatch(w.ProcessName, process)))
+            .Where(x => x.Score > 0)
+            .OrderByDescending(x => x.Score)
+            .ThenByDescending(x => x.Window.Hwnd == fgHwnd ? 1 : 0)
+            .ThenByDescending(x => !string.IsNullOrWhiteSpace(x.Window.Title) ? 1 : 0)
+            .Select(x => x.Window)
+            .FirstOrDefault();
     }
 
     [McpServerTool(Name = "computer_reset_input"), Description(
@@ -1008,8 +1059,7 @@ public sealed class InbriskTools
         int? pid = null;
         if (process != null)
         {
-            var w = _s.Rt.Windows().FirstOrDefault(w =>
-                (w.ProcessName ?? "").Contains(process, StringComparison.OrdinalIgnoreCase));
+            var w = FindBestWindowForProcess(process);
             if (w == null)
             {
                 error = Error(OutcomeKind.TargetNotFound,
@@ -3660,9 +3710,7 @@ public sealed class InbriskTools
         }
         if (t.Process != null)
         {
-            var w = _s.Rt.Windows().FirstOrDefault(w =>
-                (w.ProcessName ?? "").Contains(t.Process,
-                    StringComparison.OrdinalIgnoreCase));
+            var w = FindBestWindowForProcess(t.Process);
             return w != null ? (null, w.Pid, null, null)
                 : (null, null, null, $"no window for process '{t.Process}'");
         }
@@ -3849,10 +3897,11 @@ public sealed class InbriskTools
         if (t == null) return null;
         var hw = ParseHwnd(t.Window);
         if (hw != null) return hw;
-        var w = _s.Rt.Windows().FirstOrDefault(w =>
-            (t.Window != null && w.Title.Contains(t.Window, StringComparison.OrdinalIgnoreCase)) ||
-            (t.Process != null && (w.ProcessName ?? "").Contains(t.Process,
-                StringComparison.OrdinalIgnoreCase)));
+        WindowInfo? w = null;
+        if (t.Process != null)
+            w = FindBestWindowForProcess(t.Process);
+        if (w == null && t.Window != null)
+            w = _s.Rt.Windows().FirstOrDefault(x => x.Title.Contains(t.Window, StringComparison.OrdinalIgnoreCase));
         return w?.Hwnd;
     }
 
@@ -4368,7 +4417,12 @@ public sealed class InbriskTools
             var wins = _s.Rt.Windows();
             if (!string.IsNullOrWhiteSpace(process))
             {
-                var hits = wins.Where(x => MatchesProcess(x.ProcessName, process)).ToList();
+                var hits = wins
+                    .Select(x => (Window: x, Score: ScoreProcessMatch(x.ProcessName, process)))
+                    .Where(x => x.Score > 0)
+                    .OrderByDescending(x => x.Score)
+                    .Select(x => x.Window)
+                    .ToList();
                 if (hits.Count > 1)
                 {
                     var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
@@ -5206,10 +5260,7 @@ public sealed class InbriskTools
         // below must look at that process's window — otherwise we report
         // ambient foreground facts (and close matches) from an unrelated
         // window, which actively misleads the model.
-        var procWin = target.Process == null ? null
-            : _s?.Rt?.Windows().FirstOrDefault(w =>
-                (w.ProcessName ?? "").Contains(target.Process,
-                    StringComparison.OrdinalIgnoreCase));
+        var procWin = target.Process == null ? null : FindBestWindowForProcess(target.Process);
         var scopeDesc = target.Hwnd != null ? $"Window 0x{ParseHwnd(target.Hwnd):X}"
             : target.Window != null ? $"Window titled '{target.Window}'"
             : procWin != null ? $"Process '{target.Process}' window '{procWin.Title}' (0x{procWin.Hwnd:X})"

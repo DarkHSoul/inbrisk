@@ -157,6 +157,7 @@ public sealed class AutoVerifier
     {
         var el = pre.Element;
         if (el == null) return null; // typed at focused element we can't read → honest
+        if (string.IsNullOrEmpty(text)) return null; // nothing typed to verify
         if (!el.Props.ContainsKey("value")) return null;
         var before = NormEol((string?)el.Props.GetValueOrDefault("value")) ?? "";
         var textN = NormEol(text) ?? "";
@@ -175,9 +176,9 @@ public sealed class AutoVerifier
             : null; // value changed but doesn't contain text (masking/formatting) → honest
     }
 
-    /// <summary>Click/Invoke/etc: element gone (dialog closed), own state
-    /// changed, or a semantic event in its window → verified. Anything else
-    /// stays Unverified.</summary>
+    /// <summary>Click/Invoke/etc: element gone with window closed, own state
+    /// changed, or a semantic event in its window → verified/observed. Anything else
+    /// stays honest Unverified (null).</summary>
     private StepOutcome? VerifyActed(PreState pre, WindowInfo? window, CancellationToken ct)
     {
         var el = pre.Element;
@@ -199,7 +200,17 @@ public sealed class AutoVerifier
         }
         var last = ReRead(el);
         if (last == null)
-            return Verified("ElementGone", detail: "element no longer present after action");
+        {
+            var targetHwnd = el.Hwnd ?? window?.Hwnd;
+            if (targetHwnd is { } closedHwnd && _windows.GetWindow(closedHwnd) == null)
+                return Verified("WindowClosed", detail: "window closed after action");
+
+            var evGone = AnySemanticEvent(pre, window ?? (targetHwnd is { } goneHwnd ? _windows.GetWindow(goneHwnd) : null));
+            return evGone != null
+                ? ObservedChange("SemanticEvent", actual: evGone.Kind.ToString(),
+                    detail: "window event observed, but target element was no longer found after action")
+                : null;
+        }
         var ev2 = AnySemanticEvent(pre, window ?? (el.Hwnd is { } h ? _windows.GetWindow(h) : null));
         return ev2 != null
             ? ObservedChange("SemanticEvent", actual: ev2.Kind.ToString(),

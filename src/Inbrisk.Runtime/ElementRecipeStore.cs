@@ -27,6 +27,9 @@ public sealed class ElementRecipeStore
     private long _lastFlush;
     private bool _dirty;
 
+    private static long _lastPruneMs;
+    private const long PruneIntervalMs = 60_000;
+
     public ElementRecipeStore(string? dir = null)
     {
         _dir = dir ?? Path.Combine(
@@ -35,6 +38,81 @@ public sealed class ElementRecipeStore
                 "inbrisk"),
             "element-recipes");
         _ownPath = Path.Combine(_dir, $"elements-{Environment.ProcessId}.json");
+
+        try
+        {
+            AppDomain.CurrentDomain.ProcessExit += (_, _) => CleanupOwnFile();
+        }
+        catch { }
+
+        PruneOldFiles();
+    }
+
+    public void CleanupOwnFile()
+    {
+        try
+        {
+            if (File.Exists(_ownPath)) File.Delete(_ownPath);
+        }
+        catch { }
+    }
+
+    public void PruneOldFiles()
+    {
+        var now = Environment.TickCount64;
+        if (now - _lastPruneMs < PruneIntervalMs) return;
+        _lastPruneMs = now;
+
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                if (!Directory.Exists(_dir)) return;
+                var dirInfo = new DirectoryInfo(_dir);
+                var files = dirInfo.GetFiles("elements-*.json");
+                if (files.Length == 0) return;
+
+                var livePids = new HashSet<int>(System.Diagnostics.Process.GetProcesses().Select(p => p.Id));
+                var cutoff = DateTime.UtcNow - TimeSpan.FromHours(1);
+
+                foreach (var f in files)
+                {
+                    try
+                    {
+                        if (f.FullName.Equals(_ownPath, StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        var m = Regex.Match(f.Name, @"^elements-(\d+)\.json$");
+                        bool isDead = false;
+                        if (m.Success && int.TryParse(m.Groups[1].Value, out var pid))
+                        {
+                            if (!livePids.Contains(pid))
+                                isDead = true;
+                        }
+
+                        if (isDead || f.LastWriteTimeUtc < cutoff)
+                        {
+                            f.Delete();
+                        }
+                    }
+                    catch { }
+                }
+
+                var remaining = new DirectoryInfo(_dir).GetFiles("elements-*.json")
+                    .OrderByDescending(f => f.LastWriteTimeUtc)
+                    .Skip(50);
+                foreach (var old in remaining)
+                {
+                    try
+                    {
+                        if (!old.FullName.Equals(_ownPath, StringComparison.OrdinalIgnoreCase))
+                            old.Delete();
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+        });
     }
 
     private sealed record PersistedElement(

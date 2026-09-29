@@ -19,6 +19,9 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _taskCts = new();
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> _taskLeases = new();
 
+    private readonly string _lockFilePath;
+    private FileStream? _crossProcessLock;
+
     private volatile DesktopLease? _currentPhysicalLease;
     private readonly Timer _watchdogTimer;
     private bool _disposed;
@@ -33,8 +36,9 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
     public event Action<InputLeaseInfo>? LeaseReleased;
     public event Action<string, string?>? TaskCancelled;
 
-    public DesktopArbiter()
+    public DesktopArbiter(string? lockFilePath = null)
     {
+        _lockFilePath = lockFilePath ?? Path.Combine(Path.GetTempPath(), "inbrisk", "physical_input.lock");
         // Periodic watchdog running every 1000ms to clean up expired leases
         _watchdogTimer = new Timer(WatchdogTick, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
     }
@@ -79,9 +83,26 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
                 throw new TimeoutException($"Timed out after {effTimeout.TotalMilliseconds:0}ms waiting for PhysicalInput lease ({curOwner}).");
             }
 
+            FileStream? fs = null;
+            try
+            {
+                var remaining = effTimeout - sw.Elapsed;
+                if (remaining <= TimeSpan.Zero)
+                    remaining = TimeSpan.FromMilliseconds(50);
+                fs = await AcquireCrossProcessLockAsync(remaining, linkedCts.Token).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _physicalSemaphore.Release();
+                if (ex is OperationCanceledException && taskCts.IsCancellationRequested)
+                    throw new OperationCanceledException($"Task '{ownerId}' was cancelled by DesktopArbiter.");
+                throw new TimeoutException($"Timed out waiting for physical input lock (cross-process contention): {ex.Message}", ex);
+            }
+
             var lease = CreateLeaseInternal(ownerId, kind, description, effDuration, targetHwnd, taskCts);
             lock (_gate)
             {
+                _crossProcessLock = fs;
                 _currentPhysicalLease = lease;
             }
 
@@ -125,9 +146,17 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
                 return false;
             }
 
+            if (!TryAcquireCrossProcessLock(out var fs))
+            {
+                _physicalSemaphore.Release();
+                lease = null;
+                return false;
+            }
+
             var created = CreateLeaseInternal(ownerId, kind, description, effDuration, targetHwnd, taskCts);
             lock (_gate)
             {
+                _crossProcessLock = fs;
                 _currentPhysicalLease = created;
             }
 
@@ -141,6 +170,75 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
             LeaseAcquired?.Invoke(created.ToInfo());
             lease = created;
             return true;
+        }
+    }
+
+    private async Task<FileStream> AcquireCrossProcessLockAsync(TimeSpan timeout, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var lockDir = Path.GetDirectoryName(_lockFilePath);
+        if (!string.IsNullOrEmpty(lockDir) && !Directory.Exists(lockDir))
+        {
+            Directory.CreateDirectory(lockDir);
+        }
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                return new FileStream(
+                    _lockFilePath,
+                    FileMode.OpenOrCreate,
+                    FileAccess.ReadWrite,
+                    FileShare.None,
+                    bufferSize: 1,
+                    FileOptions.None);
+            }
+            catch (IOException) // File locked by another process
+            {
+                if (sw.Elapsed >= timeout)
+                    throw;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                if (sw.Elapsed >= timeout)
+                    throw;
+            }
+
+            var remaining = timeout - sw.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+                throw new TimeoutException($"Timed out waiting for cross-process input lock at '{_lockFilePath}'.");
+
+            var delayMs = Math.Min(30, (int)remaining.TotalMilliseconds);
+            if (delayMs <= 0) delayMs = 1;
+            await Task.Delay(delayMs, ct).ConfigureAwait(false);
+        }
+    }
+
+    private bool TryAcquireCrossProcessLock(out FileStream? lockStream)
+    {
+        lockStream = null;
+        var lockDir = Path.GetDirectoryName(_lockFilePath);
+        if (!string.IsNullOrEmpty(lockDir) && !Directory.Exists(lockDir))
+        {
+            try { Directory.CreateDirectory(lockDir); } catch { return false; }
+        }
+
+        try
+        {
+            lockStream = new FileStream(
+                _lockFilePath,
+                FileMode.OpenOrCreate,
+                FileAccess.ReadWrite,
+                FileShare.None,
+                bufferSize: 1,
+                FileOptions.None);
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -203,6 +301,8 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
         lock (_gate)
         {
             _currentPhysicalLease = null;
+            _crossProcessLock?.Dispose();
+            _crossProcessLock = null;
         }
 
         OnInputCleanup?.Invoke();
@@ -254,6 +354,8 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
                 if (_currentPhysicalLease == lease)
                 {
                     _currentPhysicalLease = null;
+                    _crossProcessLock?.Dispose();
+                    _crossProcessLock = null;
                 }
             }
             try
@@ -330,6 +432,11 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
         _disposed = true;
         _watchdogTimer.Dispose();
         CancelAllInternal("DesktopArbiter disposed");
+        lock (_gate)
+        {
+            _crossProcessLock?.Dispose();
+            _crossProcessLock = null;
+        }
         _physicalSemaphore.Dispose();
     }
 

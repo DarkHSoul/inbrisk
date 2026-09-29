@@ -149,6 +149,8 @@ public sealed class PerfTrace : IDisposable
 public static class PerfLog
 {
     private static readonly object Gate = new();
+    private const long MaxFileBytes = 5 * 1024 * 1024; // 5 MB
+
     public static string FilePath =>
         Path.Combine(UserSettings.DataDir, "perf-trace.jsonl");
 
@@ -160,6 +162,16 @@ public static class PerfLog
             lock (Gate)
             {
                 Directory.CreateDirectory(UserSettings.DataDir);
+                if (File.Exists(FilePath))
+                {
+                    var info = new FileInfo(FilePath);
+                    if (info.Length > MaxFileBytes)
+                    {
+                        var oldPath = FilePath + ".old";
+                        try { if (File.Exists(oldPath)) File.Delete(oldPath); } catch { }
+                        try { File.Move(FilePath, oldPath); } catch { }
+                    }
+                }
                 File.AppendAllText(FilePath, line + "\n");
             }
         }

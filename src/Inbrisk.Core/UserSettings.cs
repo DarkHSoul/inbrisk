@@ -62,7 +62,8 @@ public sealed class UserSettings
         "cmd.exe",
         "antigravity.exe",
         "cursor.exe",
-        "devenv.exe"
+        "devenv.exe",
+        "claude.exe"
     };
 
     /// <summary>
@@ -79,6 +80,25 @@ public sealed class UserSettings
         Environment.GetEnvironmentVariable("INBRISK_DATA_DIR") ??
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "inbrisk");
+
+    private static UserSettings? _cachedSettings;
+    private static DateTime _cacheTimestamp = DateTime.MinValue;
+    private static readonly object _cacheGate = new();
+
+    public static UserSettings LoadCached(TimeSpan? ttl = null)
+    {
+        var effTtl = ttl ?? TimeSpan.FromSeconds(2);
+        var now = DateTime.UtcNow;
+        lock (_cacheGate)
+        {
+            if (_cachedSettings != null && (now - _cacheTimestamp) < effTtl)
+                return _cachedSettings;
+
+            _cachedSettings = Load();
+            _cacheTimestamp = now;
+            return _cachedSettings;
+        }
+    }
 
     public static UserSettings Load()
     {
@@ -100,6 +120,11 @@ public sealed class UserSettings
             File.WriteAllText(tmp, JsonSerializer.Serialize(this,
                 new JsonSerializerOptions { WriteIndented = true }));
             File.Move(tmp, SettingsPath, overwrite: true);
+            lock (_cacheGate)
+            {
+                _cachedSettings = this;
+                _cacheTimestamp = DateTime.UtcNow;
+            }
         }
         catch { /* preferences must never break a session */ }
     }

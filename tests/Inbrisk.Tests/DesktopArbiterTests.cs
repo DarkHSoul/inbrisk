@@ -238,4 +238,41 @@ public class DesktopArbiterTests
         Assert.Equal("ConcurrencyConflict", doc.RootElement.GetProperty("error").GetString());
         Assert.Contains("another_ai_agent", doc.RootElement.GetProperty("detail").GetString());
     }
+
+    [Fact]
+    public async Task DesktopArbiter_CrossProcessLock_PreventsConcurrentAcquisitions()
+    {
+        var tempLockFile = Path.Combine(Path.GetTempPath(), $"arbiter_test_{Guid.NewGuid():N}.lock");
+        try
+        {
+            using var arbiter1 = new DesktopArbiter(tempLockFile);
+            using var arbiter2 = new DesktopArbiter(tempLockFile);
+
+            // Process 1 (arbiter1) acquires physical lease
+            await using var lease1 = await arbiter1.AcquireAsync("proc1", LeaseKind.PhysicalInput, "Process 1 action");
+            Assert.True(lease1.IsActive);
+
+            // Process 2 (arbiter2) attempts to acquire physical lease with short timeout -> must fail due to cross-process lock contention
+            await Assert.ThrowsAsync<TimeoutException>(async () =>
+            {
+                await arbiter2.AcquireAsync("proc2", LeaseKind.PhysicalInput, "Process 2 action", timeout: TimeSpan.FromMilliseconds(50));
+            });
+
+            // TryAcquire on arbiter2 must also return false
+            Assert.False(arbiter2.TryAcquire("proc2", LeaseKind.PhysicalInput, "Process 2 try", out var lease2Try));
+            Assert.Null(lease2Try);
+
+            // Release arbiter1 lease
+            lease1.Release();
+
+            // Now arbiter2 can acquire successfully
+            await using var lease2 = await arbiter2.AcquireAsync("proc2", LeaseKind.PhysicalInput, "Process 2 action", timeout: TimeSpan.FromMilliseconds(500));
+            Assert.True(lease2.IsActive);
+            Assert.Equal("proc2", lease2.OwnerId);
+        }
+        finally
+        {
+            try { if (File.Exists(tempLockFile)) File.Delete(tempLockFile); } catch { }
+        }
+    }
 }

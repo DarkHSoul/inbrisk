@@ -123,16 +123,11 @@ public class HumanTakeoverAndResumeTests
         var step3 = new InbriskTools.RunStep(Action: "pause_for_human", Reason: "Verify dialog");
         var badStep = new InbriskTools.RunStep(Action: "human", Text: "invalid_field");
 
-        // Validate via reflection since ValidateStep is private static
-        var mi = typeof(InbriskTools).GetMethod("ValidateStep",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-        Assert.NotNull(mi);
+        Assert.Null(InbriskTools.ValidateStep(step1));
+        Assert.Null(InbriskTools.ValidateStep(step2));
+        Assert.Null(InbriskTools.ValidateStep(step3));
 
-        Assert.Null(mi!.Invoke(null, [step1]));
-        Assert.Null(mi.Invoke(null, [step2]));
-        Assert.Null(mi.Invoke(null, [step3]));
-
-        var err = (string?)mi.Invoke(null, [badStep]);
+        var err = InbriskTools.ValidateStep(badStep);
         Assert.NotNull(err);
         Assert.Contains("text", err);
     }
