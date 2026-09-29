@@ -47,6 +47,8 @@ public static class DesktopBridge
 
     public static bool IsOnDefaultDesktop()
     {
+        if (string.Equals(Environment.GetEnvironmentVariable("INBRISK_DESKTOP_BRIDGE"), "off", StringComparison.OrdinalIgnoreCase))
+            return true;
         var name = GetCurrentDesktopName();
         return string.Equals(name, "Default", StringComparison.OrdinalIgnoreCase);
     }

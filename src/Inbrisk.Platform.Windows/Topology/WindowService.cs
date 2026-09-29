@@ -201,23 +201,38 @@ public sealed class WindowService : IWindowService
         // Owned dialog: has an owner window (e.g. Save As, File Open, font dialog, confirmation prompt, message box)
         if (owner != IntPtr.Zero && (cls == "#32770" || !string.IsNullOrWhiteSpace(title))) return true;
 
+        // Top-level unowned windows: NEVER treat browsers, IDEs, or general document windows as system dialogs
+        if (cls is "Chrome_WidgetWin_1" or "MozillaWindowClass" or "CabinetWClass" or "ApplicationFrameWindow")
+            return false;
+
         var t = title.Trim();
-        if (t.Equals("Share", StringComparison.OrdinalIgnoreCase) ||
-            t.Equals("Paylaş", StringComparison.OrdinalIgnoreCase) ||
-            t.StartsWith("Share ", StringComparison.OrdinalIgnoreCase) ||
-            t.StartsWith("Paylaş ", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Hata", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Warning", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Uyarı", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Alert", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Dikkat", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Yanıt Vermiyor", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Not Responding", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Problem", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Sorun", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Crash", StringComparison.OrdinalIgnoreCase) ||
-            t.Contains("Çökme", StringComparison.OrdinalIgnoreCase))
+
+        // Standard Win32 dialog class (#32770) or TaskDialog:
+        if (cls is "#32770" or "TaskDialog" or "OperationStatusWindow")
+        {
+            if (t.Contains("Error", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Hata", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Warning", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Uyarı", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Alert", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Dikkat", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Yanıt Vermiyor", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Not Responding", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Crash", StringComparison.OrdinalIgnoreCase) ||
+                t.Contains("Çökme", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        // Exact match or strict suffix match for standalone unowned crash/error prompts
+        if (t.Equals("Error", StringComparison.OrdinalIgnoreCase) ||
+            t.Equals("Hata", StringComparison.OrdinalIgnoreCase) ||
+            t.Equals("Beklenmeyen Hata", StringComparison.OrdinalIgnoreCase) ||
+            t.Equals("Crash", StringComparison.OrdinalIgnoreCase) ||
+            t.EndsWith(" - Error", StringComparison.OrdinalIgnoreCase) ||
+            t.EndsWith(" - Hata", StringComparison.OrdinalIgnoreCase) ||
+            t.StartsWith("Crash: ", StringComparison.OrdinalIgnoreCase))
         {
             return true;
         }

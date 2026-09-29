@@ -59,13 +59,17 @@ public sealed class DesktopFixture : IDisposable
 
     public DesktopFixture()
     {
+        Environment.SetEnvironmentVariable("INBRISK_DESKTOP_BRIDGE", "off");
         var exe = FindTestAppExe();
         var psi = new ProcessStartInfo(exe) { UseShellExecute = false };
         // ask the app to open on the secondary monitor directly — spawning
         // on the primary first would flash a window on the user's main
         // screen before MoveToSecondaryMonitor could reposition it
         if (SecondaryMonitorCenter(480, 640) is { } pos)
+        {
             psi.Environment["INBRISK_TESTAPP_POS"] = $"{pos.X},{pos.Y}";
+            psi.Arguments = $"{pos.X},{pos.Y}";
+        }
         TestApp = Process.Start(psi)!;
         Inbrisk = new Inbrisk.Sdk.InbriskRuntime(new InbriskOptions(AutoConfirm: true,
             StartEvents: true,
@@ -77,9 +81,16 @@ public sealed class DesktopFixture : IDisposable
         {
             var w = Inbrisk.Windows().FirstOrDefault(w => w.Title == "InbriskTestApp");
             if (w != null) { Hwnd = w.Hwnd; break; }
+            if (TestApp.HasExited) break;
             Thread.Sleep(200);
         }
-        if (Hwnd == 0) throw new InvalidOperationException("TestApp window never appeared");
+
+        if (Hwnd == 0)
+        {
+            var wins = Inbrisk.Windows();
+            var desc = string.Join("; ", wins.Select(x => $"[pid={x.Pid}, title='{x.Title}', proc='{x.ProcessName}']"));
+            throw new InvalidOperationException($"TestApp window never appeared. HasExited={TestApp.HasExited}, ExitCode={(TestApp.HasExited ? TestApp.ExitCode : -1)}. Available windows ({wins.Count}): {desc}");
+        }
         // keep the test window off the primary monitor when a secondary
         // display exists — physical-input tests must not touch the user's
         // main screen
@@ -241,6 +252,7 @@ public sealed class DesktopFixture : IDisposable
         try { Inbrisk.Dispose(); } catch { }
         try { if (!TestApp.HasExited) TestApp.Kill(); } catch { }
         TestApp.Dispose();
+        Environment.SetEnvironmentVariable("INBRISK_DESKTOP_BRIDGE", null);
     }
 }
 

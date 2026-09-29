@@ -33,12 +33,7 @@ public class BehavioralProgramTests
         // Neither steps nor collect provided -> must fail validation
         var step = S("scan", target: new InbriskTools.TargetSpec(Role: "List", Name: "Songs"));
         
-        // Use reflection to call private ValidateStep
-        var method = typeof(InbriskTools).GetMethod("ValidateStep",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-        Assert.NotNull(method);
-
-        var err = (string?)method!.Invoke(null, new object[] { step });
+        var err = InbriskTools.ValidateStep(step);
         Assert.NotNull(err);
         Assert.Contains("requires at least 'steps' to execute or 'collect'", err);
     }
@@ -59,11 +54,7 @@ public class BehavioralProgramTests
             maxPages: 2,
             stopOn: new[] { "ambiguous_target", "unexpected_dialog" });
 
-        var method = typeof(InbriskTools).GetMethod("ValidateStep",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-        Assert.NotNull(method);
-
-        var err = (string?)method!.Invoke(null, new object[] { step });
+        var err = InbriskTools.ValidateStep(step);
         Assert.Null(err);
     }
 
@@ -75,11 +66,7 @@ public class BehavioralProgramTests
             target: new InbriskTools.TargetSpec(Role: "List"),
             steps: new[] { invalidSubStep });
 
-        var method = typeof(InbriskTools).GetMethod("ValidateStep",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-        Assert.NotNull(method);
-
-        var err = (string?)method!.Invoke(null, new object[] { step });
+        var err = InbriskTools.ValidateStep(step);
         Assert.NotNull(err);
         Assert.Contains("sub-step scan[0]: unknown plan action", err);
     }
@@ -391,5 +378,94 @@ public class BehavioralProgramTests
         Assert.Equal("NoElementMatched", diag.Reason);
         Assert.Contains("No element matched target spec", diag.Summary);
         Assert.Contains("computer_observe or computer_find", diag.SuggestedAction);
+    }
+
+    [Fact]
+    public void SubstituteInJsonNode_SafelySubstitutesQuotesAndBackslashes_WithoutJsonCorruption()
+    {
+        var method = typeof(InbriskTools).GetMethod("SubstituteInJsonNode",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var templateJson = """
+        [
+            {
+                "action": "type",
+                "text": "Hello {{userName}}, file is at {{filePath}}",
+                "target": {
+                    "name": "{{buttonName}}"
+                }
+            }
+        ]
+        """;
+
+        var node = System.Text.Json.Nodes.JsonNode.Parse(templateJson)!;
+        var parameters = new Dictionary<string, string>
+        {
+            ["userName"] = "John \"The Expert\" Doe",
+            ["filePath"] = @"C:\Users\Admin\Desktop\notes\file.txt",
+            ["buttonName"] = "Save & Exit"
+        };
+
+        method!.Invoke(null, new object[] { node, parameters });
+
+        var steps = node.Deserialize<InbriskTools.RunStep[]>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+        Assert.NotNull(steps);
+        Assert.Single(steps);
+        Assert.Equal(@"Hello John ""The Expert"" Doe, file is at C:\Users\Admin\Desktop\notes\file.txt", steps[0].Text);
+        Assert.Equal("Save & Exit", steps[0].Target?.Name);
+    }
+
+    [Fact]
+    public void GeneralizeRecipeStep_StripsEphemeralHwndAndElementId_AndInjectsDefaultApp()
+    {
+        var method = typeof(InbriskTools).GetMethod("GeneralizeRecipeStep",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(method);
+
+        var originalStep = new InbriskTools.RunStep(
+            Action: "click",
+            Target: new InbriskTools.TargetSpec(
+                Hwnd: "0x231DEA",
+                ElementId: "uia_1_2",
+                AutomationId: "SaveButton",
+                Role: "Button"),
+            ElementId: "uia_1_2",
+            Hwnd: "0x231DEA",
+            ObservationId: 12345,
+            FrameId: 67890);
+
+        var generalized = (InbriskTools.RunStep)method!.Invoke(null, new object?[] { originalStep, "notepad" })!;
+        Assert.NotNull(generalized);
+        Assert.Null(generalized.Hwnd);
+        Assert.Null(generalized.ElementId);
+        Assert.Null(generalized.ObservationId);
+        Assert.Null(generalized.FrameId);
+        Assert.NotNull(generalized.Target);
+        Assert.Null(generalized.Target.Hwnd);
+        Assert.Null(generalized.Target.ElementId);
+        Assert.Equal("notepad", generalized.Target.Process);
+        Assert.Equal("SaveButton", generalized.Target.AutomationId);
+        Assert.Equal("Button", generalized.Target.Role);
+    }
+
+    [Fact]
+    public void RecipeSerialization_OmitsNullFields_KeepingRecipeCompact()
+    {
+        var step = new InbriskTools.RunStep(
+            Action: "invoke",
+            Target: new InbriskTools.TargetSpec(Process: "notepad", AutomationId: "SaveButton"));
+
+        var json = JsonSerializer.Serialize(new[] { step }, new JsonSerializerOptions
+        {
+            WriteIndented = false,
+            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+        });
+
+        Assert.DoesNotContain("\"Hwnd\":null", json);
+        Assert.DoesNotContain("\"X\":null", json);
+        Assert.DoesNotContain("\"FrameId\":null", json);
+        Assert.Contains("\"Action\":\"invoke\"", json);
+        Assert.Contains("\"AutomationId\":\"SaveButton\"", json);
     }
 }

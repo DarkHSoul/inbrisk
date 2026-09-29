@@ -127,18 +127,14 @@ public sealed class SelfHealingAndFeedbackTests
             Action: "scroll_into_view",
             Target: new InbriskTools.TargetSpec(Role: "ListItem", Name: "TargetTrack"));
 
-        var method = typeof(InbriskTools).GetMethod("ValidateStep",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
-        Assert.NotNull(method);
-
-        var err1 = (string?)method!.Invoke(null, new object[] { stepWithId });
+        var err1 = InbriskTools.ValidateStep(stepWithId);
         Assert.Null(err1);
 
-        var err2 = (string?)method!.Invoke(null, new object[] { stepWithTarget });
+        var err2 = InbriskTools.ValidateStep(stepWithTarget);
         Assert.Null(err2);
 
         var stepWithoutTarget = new InbriskTools.RunStep(Action: "scroll_into_view");
-        var err3 = (string?)method!.Invoke(null, new object[] { stepWithoutTarget });
+        var err3 = InbriskTools.ValidateStep(stepWithoutTarget);
         Assert.NotNull(err3);
         Assert.Contains("requires elementId or target", err3);
     }

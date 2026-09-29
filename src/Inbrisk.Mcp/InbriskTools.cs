@@ -462,8 +462,27 @@ public sealed class InbriskTools
         }
 
         var closed = _s.Rt.CloseWindow(w.Hwnd);
+        var modal = _s.Rt.WindowService.GetModalPopup(w.Hwnd);
+        var hasModal = modal != null && modal.Hwnd != w.Hwnd;
+
         if (!closed && force)
         {
+            if (hasModal)
+            {
+                return Text(JsonSerializer.Serialize(new
+                {
+                    success = false,
+                    closed = false,
+                    error = "UnsavedDataPromptOpen",
+                    hwnd = $"0x{w.Hwnd:X}",
+                    title = w.Title,
+                    process = w.ProcessName,
+                    hasUnsavedDataPrompt = true,
+                    modalPopup = $"0x{modal!.Hwnd:X} \"{modal.Title}\"",
+                    detail = $"WM_CLOSE posted to '{w.ProcessName}', but window remains open because an unsaved changes confirmation dialog appeared (0x{modal.Hwnd:X} \"{modal.Title}\"). Force-kill was prevented to avoid data loss. Resolve or interact with the save prompt."
+                }, J));
+            }
+
             try
             {
                 using var proc = Process.GetProcessById(w.Pid);
@@ -498,8 +517,6 @@ public sealed class InbriskTools
         }
         else
         {
-            var modal = _s.Rt.WindowService.GetModalPopup(w.Hwnd);
-            var hasModal = modal != null && modal.Hwnd != w.Hwnd;
             return Text(JsonSerializer.Serialize(new
             {
                 success = false,
@@ -1412,7 +1429,16 @@ public sealed class InbriskTools
                 return Task.FromResult(Error(OutcomeKind.Malformed, $"recipe step [{i}]: {verr}"));
         }
 
-        var stepsJson = JsonSerializer.Serialize(steps, new JsonSerializerOptions { WriteIndented = true });
+        var generalizedSteps = new RunStep[steps.Length];
+        for (var i = 0; i < steps.Length; i++)
+            generalizedSteps[i] = GeneralizeRecipeStep(steps[i], app);
+
+        var stepsJson = JsonSerializer.Serialize(generalizedSteps, new JsonSerializerOptions
+        {
+            WriteIndented = true,
+            DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+        });
+
         var def = new TaskRecipeDefinition(
             Name: name,
             Description: description,
@@ -1425,6 +1451,102 @@ public sealed class InbriskTools
 
         _s.RecipeStore.Save(def);
         return Task.FromResult(Text($"✓ Recipe '{name}' saved successfully with {steps.Length} steps."));
+    }
+
+    private static RunStep GeneralizeRecipeStep(RunStep step, string? defaultApp)
+    {
+        var target = step.Target;
+        if (target != null)
+        {
+            var targetElId = target.ElementId;
+            if (targetElId != null && targetElId.StartsWith("uia_", StringComparison.OrdinalIgnoreCase))
+                targetElId = null;
+
+            var process = target.Process ?? defaultApp;
+            target = target with
+            {
+                Hwnd = null,
+                Process = process,
+                ElementId = targetElId
+            };
+        }
+
+        var elId = step.ElementId;
+        if (elId != null && elId.StartsWith("uia_", StringComparison.OrdinalIgnoreCase))
+            elId = null;
+
+        RunStep[]? subSteps = null;
+        if (step.Steps != null)
+        {
+            subSteps = new RunStep[step.Steps.Length];
+            for (var j = 0; j < step.Steps.Length; j++)
+                subSteps[j] = GeneralizeRecipeStep(step.Steps[j], defaultApp);
+        }
+
+        return step with
+        {
+            Target = target,
+            ElementId = elId,
+            Hwnd = null,
+            ObservationId = null,
+            FrameId = null,
+            ToObservationId = null,
+            ToFrameId = null,
+            Steps = subSteps
+        };
+    }
+
+    private static void SubstituteInJsonNode(System.Text.Json.Nodes.JsonNode node, Dictionary<string, string> parameters)
+    {
+        if (node is System.Text.Json.Nodes.JsonObject obj)
+        {
+            var keys = obj.Select(kv => kv.Key).ToList();
+            foreach (var key in keys)
+            {
+                var val = obj[key];
+                if (val is System.Text.Json.Nodes.JsonValue jVal && jVal.TryGetValue<string>(out var str))
+                {
+                    foreach (var (k, v) in parameters)
+                    {
+                        if (str.Contains("{{" + k + "}}", StringComparison.OrdinalIgnoreCase))
+                        {
+                            str = System.Text.RegularExpressions.Regex.Replace(
+                                str, @"\{\{" + System.Text.RegularExpressions.Regex.Escape(k) + @"\}\}", v ?? "",
+                                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        }
+                    }
+                    obj[key] = str;
+                }
+                else if (val != null)
+                {
+                    SubstituteInJsonNode(val, parameters);
+                }
+            }
+        }
+        else if (node is System.Text.Json.Nodes.JsonArray arr)
+        {
+            for (var i = 0; i < arr.Count; i++)
+            {
+                var val = arr[i];
+                if (val is System.Text.Json.Nodes.JsonValue jVal && jVal.TryGetValue<string>(out var str))
+                {
+                    foreach (var (k, v) in parameters)
+                    {
+                        if (str.Contains("{{" + k + "}}", StringComparison.OrdinalIgnoreCase))
+                        {
+                            str = System.Text.RegularExpressions.Regex.Replace(
+                                str, @"\{\{" + System.Text.RegularExpressions.Regex.Escape(k) + @"\}\}", v ?? "",
+                                System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        }
+                    }
+                    arr[i] = str;
+                }
+                else if (val != null)
+                {
+                    SubstituteInJsonNode(val, parameters);
+                }
+            }
+        }
     }
 
     [McpServerTool(Name = "computer_run_recipe"), Description(
@@ -1449,21 +1571,22 @@ public sealed class InbriskTools
                 $"recipe '{name}' not found. Available recipes: [{string.Join(", ", known)}]");
         }
 
-        var json = recipe.StepsJson;
-        if (parameters != null)
-        {
-            foreach (var (k, v) in parameters)
-            {
-                json = json.Replace("{{" + k + "}}", v)
-                           .Replace("{{" + k.ToLowerInvariant() + "}}", v);
-            }
-        }
-
         RunStep[] steps;
         try
         {
-            steps = JsonSerializer.Deserialize<RunStep[]>(json, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-                ?? throw new JsonException("null deserialization");
+            if (parameters != null && parameters.Count > 0)
+            {
+                var node = System.Text.Json.Nodes.JsonNode.Parse(recipe.StepsJson)
+                    ?? throw new JsonException("null json node");
+                SubstituteInJsonNode(node, parameters);
+                steps = node.Deserialize<RunStep[]>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                    ?? throw new JsonException("null deserialization");
+            }
+            else
+            {
+                steps = JsonSerializer.Deserialize<RunStep[]>(recipe.StepsJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                    ?? throw new JsonException("null deserialization");
+            }
         }
         catch (Exception ex)
         {

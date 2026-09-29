@@ -204,10 +204,13 @@ public sealed class WindowProtectionAndModalTests
         // But owned dialogs ARE system/modal dialogs
         Assert.True(WindowService.IsSystemDialogOrFlyout("charmap.exe", "#32770", "Group By", new IntPtr(0x1234)));
 
-        // 5. Regular apps should not be detected as system dialogs
+        // 5. Regular apps should not be detected as system dialogs (even with Problem, Project, or Error in tab/document title)
         Assert.False(WindowService.IsSystemDialogOrFlyout("notepad.exe", "Notepad", "Untitled - Notepad", IntPtr.Zero));
         Assert.False(WindowService.IsSystemDialogOrFlyout("powerpnt.exe", "PPTFrameClass", "Presentation1 - PowerPoint", IntPtr.Zero));
         Assert.False(WindowService.IsSystemDialogOrFlyout("chrome.exe", "Chrome_WidgetWin_1", "Google - Google Chrome", IntPtr.Zero));
+        Assert.False(WindowService.IsSystemDialogOrFlyout("chrome.exe", "Chrome_WidgetWin_1", "Solving a Problem with React - Google Chrome", IntPtr.Zero));
+        Assert.False(WindowService.IsSystemDialogOrFlyout("chrome.exe", "Chrome_WidgetWin_1", "Compiler Error CS0103 - Google Chrome", IntPtr.Zero));
+        Assert.False(WindowService.IsSystemDialogOrFlyout("chrome.exe", "Chrome_WidgetWin_1", "Project Roadmap - Google Chrome", IntPtr.Zero));
 
         // 6. PopupHost and lightweight menus/dropdowns are NEVER system dialogs even with owner
         Assert.False(WindowService.IsSystemDialogOrFlyout("app.exe", "PopupHost", "PopupHost", new IntPtr(0x1234)));

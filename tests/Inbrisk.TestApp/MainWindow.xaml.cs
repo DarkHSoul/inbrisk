@@ -16,7 +16,10 @@ public partial class MainWindow : Window
         // test harness may place the window on a non-primary monitor so
         // physical-input tests never touch the user's main screen — applied
         // after InitializeComponent or the XAML Left/Top would win
-        if (Environment.GetEnvironmentVariable("INBRISK_TESTAPP_POS") is { } pos)
+        var pos = Environment.GetEnvironmentVariable("INBRISK_TESTAPP_POS");
+        var cmdArgs = Environment.GetCommandLineArgs();
+        if (pos == null && cmdArgs.Length > 1) pos = cmdArgs[1];
+        if (pos is { })
         {
             var parts = pos.Split(',');
             if (parts.Length == 2 &&
