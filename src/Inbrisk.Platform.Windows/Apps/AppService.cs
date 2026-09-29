@@ -51,12 +51,33 @@ public sealed class AppService : IAppService
     internal sealed record ResolvedApp(LaunchMethod Method, string Identifier,
         string DisplayName, string[] ExeHints, int Score);
 
+    private static readonly TimeSpan AppsCacheTtl = TimeSpan.FromMinutes(10);
+    private IReadOnlyList<AppInfo>? _cachedApps;
+    private DateTime _appsCacheTime = DateTime.MinValue;
+    private readonly object _appsLock = new();
+
+    private static readonly TimeSpan PackagesCacheTtl = TimeSpan.FromMinutes(10);
+    private IReadOnlyList<ResolvedApp>? _cachedPackages;
+    private DateTime _packagesCacheTime = DateTime.MinValue;
+    private readonly object _packagesLock = new();
+
     public AppService(IWindowService windows, Func<long, bool>? uiaProbe = null,
         Func<string, bool>? isDeniedProcess = null)
     {
         _windows = windows;
         _uiaProbe = uiaProbe;
         _isDeniedProcess = isDeniedProcess ?? (_ => false);
+        Task.Run(() =>
+        {
+            try { ListApps(); }
+            catch { }
+        });
+    }
+
+    internal void InvalidateCache()
+    {
+        lock (_appsLock) _cachedApps = null;
+        lock (_packagesLock) _cachedPackages = null;
     }
 
     // ------------------------------------------------------------------
@@ -282,42 +303,54 @@ public sealed class AppService : IAppService
     /// also have a shortcut surface under the friendly name.</summary>
     public IReadOnlyList<AppInfo> ListApps()
     {
-        var windir = Environment.GetFolderPath(
-            Environment.SpecialFolder.Windows);
-        var byName = new Dictionary<string, AppInfo>(
-            StringComparer.OrdinalIgnoreCase);
-        void Add(string? name, LaunchMethod m, string launch, string kind)
-        {
-            if (string.IsNullOrWhiteSpace(name)) return;
-            byName.TryAdd(Norm(name), new(name, m, launch, kind));
-        }
+        if (_cachedApps != null && (DateTime.UtcNow - _appsCacheTime) < AppsCacheTtl)
+            return _cachedApps;
 
-        foreach (var dir in StartMenuDirs())
-        foreach (var lnk in EnumerateLinks(dir))
+        lock (_appsLock)
         {
-            var (isValid, _) = InspectLnk(lnk);
-            if (!isValid) continue;
-            var name = Path.GetFileNameWithoutExtension(lnk);
-            Add(name, LaunchMethod.StartMenu, $"app:\"{name}\"", "installed");
-        }
-        foreach (var (key, path) in AppPaths())
-            if (File.Exists(path))
-                Add(Path.GetFileNameWithoutExtension(key), LaunchMethod.AppPath,
-                    $"executable:\"{key}\"",
-                    path.StartsWith(windir, StringComparison.OrdinalIgnoreCase)
+            if (_cachedApps != null && (DateTime.UtcNow - _appsCacheTime) < AppsCacheTtl)
+                return _cachedApps;
+
+            var windir = Environment.GetFolderPath(
+                Environment.SpecialFolder.Windows);
+            var byName = new Dictionary<string, AppInfo>(
+                StringComparer.OrdinalIgnoreCase);
+            void Add(string? name, LaunchMethod m, string launch, string kind)
+            {
+                if (string.IsNullOrWhiteSpace(name)) return;
+                byName.TryAdd(Norm(name), new(name, m, launch, kind));
+            }
+
+            foreach (var dir in StartMenuDirs())
+            foreach (var lnk in EnumerateLinks(dir))
+            {
+                var (isValid, _) = InspectLnk(lnk);
+                if (!isValid) continue;
+                var name = Path.GetFileNameWithoutExtension(lnk);
+                Add(name, LaunchMethod.StartMenu, $"app:\"{name}\"", "installed");
+            }
+            foreach (var (key, path) in AppPaths())
+                if (File.Exists(path))
+                    Add(Path.GetFileNameWithoutExtension(key), LaunchMethod.AppPath,
+                        $"executable:\"{key}\"",
+                        path.StartsWith(windir, StringComparison.OrdinalIgnoreCase)
+                            ? "system" : "installed");
+            foreach (var pkg in (PackageEnumerator ?? EnumeratePackages)())
+                Add(pkg.DisplayName, LaunchMethod.Aumid,
+                    $"aumid:\"{pkg.Identifier}\"",
+                    pkg.Identifier.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
+                    pkg.Identifier.StartsWith("Windows.", StringComparison.OrdinalIgnoreCase) ||
+                    // _cw5n1h2txyewy is Microsoft's publisher id — covers
+                    // GUID-named inbox PFNs (FilePicker & friends)
+                    pkg.Identifier.Contains("_cw5n1h2txyewy", StringComparison.OrdinalIgnoreCase)
                         ? "system" : "installed");
-        foreach (var pkg in (PackageEnumerator ?? EnumeratePackages)())
-            Add(pkg.DisplayName, LaunchMethod.Aumid,
-                $"aumid:\"{pkg.Identifier}\"",
-                pkg.Identifier.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
-                pkg.Identifier.StartsWith("Windows.", StringComparison.OrdinalIgnoreCase) ||
-                // _cw5n1h2txyewy is Microsoft's publisher id — covers
-                // GUID-named inbox PFNs (FilePicker & friends)
-                pkg.Identifier.Contains("_cw5n1h2txyewy", StringComparison.OrdinalIgnoreCase)
-                    ? "system" : "installed");
 
-        return byName.Values
-            .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            var list = byName.Values
+                .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase).ToList();
+            _cachedApps = list;
+            _appsCacheTime = DateTime.UtcNow;
+            return list;
+        }
     }
 
     /// <summary>Every resolution mechanism for a friendly name, scored.</summary>
@@ -654,41 +687,53 @@ public sealed class AppService : IAppService
     /// staged system apps like Calculator that never appear per-user).</summary>
     internal IReadOnlyList<ResolvedApp> EnumeratePackages()
     {
-        var list = new List<ResolvedApp>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (_cachedPackages != null && (DateTime.UtcNow - _packagesCacheTime) < PackagesCacheTtl)
+            return _cachedPackages;
 
-        // WinRT PackageManager — the authoritative source: covers inbox and
-        // staged apps (Calculator & co. never land in the per-user repo) and
-        // returns LOCALIZED display names, so "Hesap Makinesi" matches too
-        try
+        lock (_packagesLock)
         {
-            var pm = new global::Windows.Management.Deployment.PackageManager();
-            foreach (var pkg in pm.FindPackagesForUser(""))
-            {
-                try
-                {
-                    var entries = pkg.GetAppListEntriesAsync()
-                        .AsTask().GetAwaiter().GetResult();
-                    var pkgName = pkg.DisplayName;
-                    foreach (var e in entries)
-                    {
-                        if (string.IsNullOrEmpty(e.AppUserModelId) ||
-                            !seen.Add(e.AppUserModelId)) continue;
-                        list.Add(new ResolvedApp(LaunchMethod.Aumid,
-                            e.AppUserModelId,
-                            !string.IsNullOrEmpty(pkgName)
-                                ? pkgName : pkg.Id.Name,
-                            [pkg.Id.Name], 0));
-                    }
-                }
-                catch { /* one broken package never aborts enumeration */ }
-            }
-        }
-        catch { /* WinRT unavailable → registry scan below still applies */ }
+            if (_cachedPackages != null && (DateTime.UtcNow - _packagesCacheTime) < PackagesCacheTtl)
+                return _cachedPackages;
 
-        foreach (var r in EnumeratePackagesRegistry())
-            if (seen.Add(r.Identifier)) list.Add(r);
-        return list;
+            var list = new List<ResolvedApp>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // WinRT PackageManager — the authoritative source: covers inbox and
+            // staged apps (Calculator & co. never land in the per-user repo) and
+            // returns LOCALIZED display names, so "Hesap Makinesi" matches too
+            try
+            {
+                var pm = new global::Windows.Management.Deployment.PackageManager();
+                foreach (var pkg in pm.FindPackagesForUser(""))
+                {
+                    try
+                    {
+                        var entries = pkg.GetAppListEntriesAsync()
+                            .AsTask().GetAwaiter().GetResult();
+                        var pkgName = pkg.DisplayName;
+                        foreach (var e in entries)
+                        {
+                            if (string.IsNullOrEmpty(e.AppUserModelId) ||
+                                !seen.Add(e.AppUserModelId)) continue;
+                            list.Add(new ResolvedApp(LaunchMethod.Aumid,
+                                e.AppUserModelId,
+                                !string.IsNullOrEmpty(pkgName)
+                                    ? pkgName : pkg.Id.Name,
+                                [pkg.Id.Name], 0));
+                        }
+                    }
+                    catch { /* one broken package never aborts enumeration */ }
+                }
+            }
+            catch { /* WinRT unavailable → registry scan below still applies */ }
+
+            foreach (var r in EnumeratePackagesRegistry())
+                if (seen.Add(r.Identifier)) list.Add(r);
+
+            _cachedPackages = list;
+            _packagesCacheTime = DateTime.UtcNow;
+            return list;
+        }
     }
 
     /// <summary>Registry fallback for package enumeration — per-user AppModel

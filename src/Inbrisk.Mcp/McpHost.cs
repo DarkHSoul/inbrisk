@@ -12,6 +12,28 @@ namespace Inbrisk.Mcp;
 /// inbrisk-mcp executable and from `inbrisk mcp` in the CLI.</summary>
 public static class McpHost
 {
+    private static readonly HashSet<string> CoreToolNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "computer_do",
+        "computer_run",
+        "computer_launch",
+        "computer_close_window",
+        "computer_windows",
+        "computer_observe",
+        "computer_find",
+        "computer_inspect",
+        "computer_click",
+        "computer_type",
+        "computer_hotkey",
+        "computer_screenshot",
+        "computer_reset_input",
+        "computer_capabilities",
+        "browser_browse",
+        "browser_click",
+        "browser_type",
+        "browser_snapshot",
+    };
+
     public static async Task<int> RunAsync(string[] args)
     {
         var builder = Host.CreateApplicationBuilder(args);
@@ -77,92 +99,51 @@ public static class McpHost
                                                                                                                         builder.Services.AddSingleton(control);
         builder.Services.AddSingleton(sp => new McpSession(
             sp.GetRequiredService<EmergencyControl>()));
-        builder.Services
+        var toolProfile = Environment.GetEnvironmentVariable("INBRISK_TOOL_PROFILE")
+            ?? userSettings.ToolProfile
+            ?? "full";
+        var isCoreProfile = toolProfile.Equals("core", StringComparison.OrdinalIgnoreCase);
+
+        var serverBuilder = builder.Services
             .AddMcpServer(o =>
             {
                 o.ServerInfo = new Implementation
                     { Name = "inbrisk", Version = version };
                 o.ServerInstructions =
-                    "Windows desktop eyes and hands. ACT IMMEDIATELY: these " +
-                    "tools are self-contained — do NOT explore the project, " +
-                    "filesystem, git history, or docs to 'understand' " +
-                    "Inbrisk before acting, and never use shell/PowerShell " +
-                    "just to learn the interface. Everything you need is in " +
-                    "this handshake, the tool schemas, and one optional " +
-                    "computer_capabilities call. When the user asks for an " +
-                    "action, call the tool right away — observing after " +
-                    "acting beats researching before acting. Do NOT call " +
-                    "tools/list — the tool list is already in your context; " +
-                    "call it only if the schema reference is missing. " +
-                    "Prefer " +
-                    "elementIds and " +
-                    "semantic targets over coordinates; use image points only " +
-                    "for pixel-only targets; re-observe after Stale/" +
-                    "StaleFrame results. When beginning a conversation in " +
-                    "which you intend to use Inbrisk computer-control tools, " +
-                    $"inform the user once that {control.PanicHotkey} immediately " +
-                    "stops Inbrisk computer control, and that only the local " +
-                    $"user can resume it with {control.ResumeHotkey} — an " +
-                    "emergency stop can never be cleared through the MCP API " +
-                    "by the model itself. If ANY tool returns controlState:" +
-                    "EmergencyStopped or an EmergencyStopped error, STOP " +
-                    "acting immediately — do not retry it, work around it, " +
-                    "or fall back to shell/PowerShell; tell the user that " +
-                    "control is stopped and only they can resume it with " +
-                    "the local resume hotkey or the tray icon. Do not " +
-                    "repeat this before every action. " +
-                    "EXECUTION EFFICIENCY & MULTI-STEP PLANS: LLM roundtrips dominate task latency. Whenever you can foresee a sequence of 2 or more steps (such as launch + wait_for + click, or focus + type + submit), ALWAYS combine them into a single 'computer_run' plan rather than calling separate tools turn-by-turn. Single-action tools (computer_click, computer_type) are strictly for exploration or when the next step genuinely depends on unpredicted UI state. " +
-                    "When the user asks to interact with an " +
-                    "application that is not currently running, prefer " +
-                    "computer_launch (or a computer_run launch step) instead " +
-                    "of shell/PowerShell to locate or start it. To open a " +
-                    "URL, do NOT pass it to computer_launch — call " +
-                    "browser_browse{url} directly (it self-heals a " +
-                    "debug-enabled browser if needed). Inside web pages use " +
-                    "the browser_* tools only: browser_snapshot gives " +
-                    "element uids for browser_click(uid) — no selector " +
-                    "guessing — and browser_capture returns network/" +
-                    "console/vitals in one call; never hand-roll CDP " +
-                    "scripts for that. " +
-                    "APPLICATION LIFECYCLE POLICY: " +
-                    "1. Never close, minimize, or alter applications that were already open before the task started (ownership: user). " +
-                    "2. Applications opened by you (ownership: agent) may be closed when no longer required and there is no unsaved user data. " +
-                    "3. Prefer graceful close (computer_close_window). Never force-kill. " +
-                    "4. Do NOT close the agent host/terminal, IDE, Colab browser, or protected apps. Inbrisk blocks these attempts. " +
-                    "5. After closing an application, notify the user: 'Closed <app> — no longer needed for this task.' " +
-                    "6. 'When in doubt, leave it open.' Leaving an application open has minor cost; closing a user's running app causes irreversible data loss. " +
-                    "POPUP & MODAL DIALOGS: Applications often open modal error boxes, confirmation dialogs, or wizards that disable their parent window. " +
-                    "If a window seems unresponsive, check computer_windows or computer_observe for [MODAL/DIALOG] or [BLOCKED by modal] tags, or inspect the window — " +
-                    "Inbrisk surfaces [MODAL-POPUP-ACTIVE] and inspects the modal dialog controls directly so you can dismiss or handle it first. " +
-                    "WINDOW FOCUS & NON-DISRUPTIVE INSPECTION POLICY: " +
-                    "Do not focus or activate a window merely because it is not foreground. If a target window is " +
-                    "[shown], not [minimized], and assigned to a visible monitor (e.g. secondary monitor), prefer non-disruptive inspection first: " +
-                    "1. UIA/computer_inspect or computer_find " +
-                    "2. monitor/window capture " +
-                    "3. screenshot of the target monitor (computer_screenshot with monitor index). " +
-                    "Only focus/activate the window when interaction explicitly requires foreground keyboard/mouse input or non-invasive inspection is insufficient. " +
-                    "For multi-step deterministic UI work, " +
-                    "prefer computer_run over issuing many individual " +
-                    "computer tools. Use individual tools for exploration or " +
-                    "when the next action depends on information not yet " +
-                    "visible. Insert checkpoints only where model reasoning " +
-                    "is actually required. Targeting: prefer process over " +
-                    "window (titles are localized); name is a substring — add " +
-                    "role or labelledBy to disambiguate; AmbiguousTarget " +
-                    "means refine, not retry. computer_run step fields are " +
-                    "validated strictly — unknown fields fail; call " +
-                    "computer_capabilities once if unsure about step syntax " +
-                    "(e.g. hotkey takes key+modifiers or keys:\"ctrl+s\"). " +
-                    "If desktop input seems stuck — clicks land nowhere or " +
-                    "act as if a key is held — call computer_reset_input: it " +
-                    "releases every modifier/button (including holds left by " +
-                    "dead processes) and can neutralize input-swallowing " +
-                    "overlay windows.";
+                    "Windows desktop eyes and hands automation runtime.\n" +
+                    "1. ACT IMMEDIATELY: Do NOT explore the codebase, docs, or shell to learn Inbrisk. Everything you need is in this schema.\n" +
+                    "2. SPEED FIRST (ROUNDTRIP LATENCY): Roundtrips dominate latency. Combine multi-step actions into single-turn calls:\n" +
+                    "   - Composite: computer_do(app: \"notepad\", type: \"hello\", hotkey: \"ctrl+s\")\n" +
+                    "   - Plan: computer_run(steps: [{action: \"launch\", app: \"calc\"}, {action: \"click\", target: {name: \"Five\"}}])\n" +
+                    "   Single-action tools (computer_click, computer_type) are strictly for exploration or unpredicted UI.\n" +
+                    "3. APPS & LAUNCH: Use computer_launch(app: \"...\") for desktop apps. For web, use browser_browse(url: \"...\") directly.\n" +
+                    "4. WINDOW LIFECYCLE: Never close or alter pre-existing user windows. Clean up windows you opened using computer_close_window(closeAllAgentWindows: true) or computer_close_window(hwnd: \"...\"). Never force-kill user applications. Protected IDEs/terminals/hosts are immune.\n" +
+                    "5. MODAL DIALOGS: If a window is unresponsive, check computer_windows or computer_observe for [MODAL-POPUP-ACTIVE] and handle or dismiss it first.\n" +
+                    "6. TARGETING: Prefer elementId or semantic target (process, name, role) over coordinates. Re-observe if Stale.\n" +
+                    $"7. SAFETY & HOTKEYS: {control.PanicHotkey} halts computer control instantly. Only local user can resume with {control.ResumeHotkey}. If EmergencyStopped, stop immediately.\n" +
+                    "8. RECOVERY: If mouse or keyboard modifiers feel stuck, call computer_reset_input.";
             })
             .WithStdioServerTransport()
             .WithToolsFromAssembly()
             .WithResourcesFromAssembly()
             .WithPromptsFromAssembly();
+
+        if (isCoreProfile)
+        {
+            serverBuilder.WithRequestFilters(f =>
+            {
+                f.AddListToolsFilter(next => async (req, ct) =>
+                {
+                    var res = await next(req, ct);
+                    if (res?.Tools != null)
+                    {
+                        var filtered = res.Tools.Where(t => CoreToolNames.Contains(t.Name)).ToList();
+                        res.Tools = filtered;
+                    }
+                    return res!;
+                });
+            });
+        }
 
         var app = builder.Build();
         try { await app.RunAsync(); }

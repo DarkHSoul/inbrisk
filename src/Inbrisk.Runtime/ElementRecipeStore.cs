@@ -27,7 +27,7 @@ public sealed class ElementRecipeStore
     private long _lastFlush;
     private bool _dirty;
 
-    private static long _lastPruneMs;
+    private long _lastPruneMs;
     private const long PruneIntervalMs = 60_000;
 
     public ElementRecipeStore(string? dir = null)
@@ -39,22 +39,12 @@ public sealed class ElementRecipeStore
             "element-recipes");
         _ownPath = Path.Combine(_dir, $"elements-{Environment.ProcessId}.json");
 
-        try
-        {
-            AppDomain.CurrentDomain.ProcessExit += (_, _) => CleanupOwnFile();
-        }
-        catch { }
-
         PruneOldFiles();
     }
 
-    public void CleanupOwnFile()
+    public void PruneNow()
     {
-        try
-        {
-            if (File.Exists(_ownPath)) File.Delete(_ownPath);
-        }
-        catch { }
+        DoPrune();
     }
 
     public void PruneOldFiles()
@@ -63,56 +53,66 @@ public sealed class ElementRecipeStore
         if (now - _lastPruneMs < PruneIntervalMs) return;
         _lastPruneMs = now;
 
-        ThreadPool.QueueUserWorkItem(_ =>
+        ThreadPool.QueueUserWorkItem(_ => DoPrune());
+    }
+
+    private void DoPrune()
+    {
+        try
         {
-            try
+            if (!Directory.Exists(_dir)) return;
+            var dirInfo = new DirectoryInfo(_dir);
+            var files = dirInfo.GetFiles("elements-*.json");
+            if (files.Length == 0) return;
+
+            var livePids = new HashSet<int>(System.Diagnostics.Process.GetProcesses().Select(p => p.Id));
+            var cutoff = DateTime.UtcNow - Ttl; // 30 minutes
+
+            foreach (var f in files)
             {
-                if (!Directory.Exists(_dir)) return;
-                var dirInfo = new DirectoryInfo(_dir);
-                var files = dirInfo.GetFiles("elements-*.json");
-                if (files.Length == 0) return;
-
-                var livePids = new HashSet<int>(System.Diagnostics.Process.GetProcesses().Select(p => p.Id));
-                var cutoff = DateTime.UtcNow - TimeSpan.FromHours(1);
-
-                foreach (var f in files)
+                try
                 {
-                    try
+                    if (f.FullName.Equals(_ownPath, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var m = Regex.Match(f.Name, @"^elements-(\d+)\.json$");
+                    int pid = 0;
+                    bool hasPid = m.Success && int.TryParse(m.Groups[1].Value, out pid);
+                    bool isProcessAlive = hasPid && livePids.Contains(pid);
+
+                    // Running processes must never have their recipe files purged
+                    if (isProcessAlive)
+                        continue;
+
+                    // Dead process files remain accessible for subsequent CLI commands until TTL expires
+                    if (f.LastWriteTimeUtc < cutoff)
                     {
-                        if (f.FullName.Equals(_ownPath, StringComparison.OrdinalIgnoreCase))
-                            continue;
-
-                        var m = Regex.Match(f.Name, @"^elements-(\d+)\.json$");
-                        bool isDead = false;
-                        if (m.Success && int.TryParse(m.Groups[1].Value, out var pid))
-                        {
-                            if (!livePids.Contains(pid))
-                                isDead = true;
-                        }
-
-                        if (isDead || f.LastWriteTimeUtc < cutoff)
-                        {
-                            f.Delete();
-                        }
+                        f.Delete();
                     }
-                    catch { }
                 }
+                catch { }
+            }
 
-                var remaining = new DirectoryInfo(_dir).GetFiles("elements-*.json")
-                    .OrderByDescending(f => f.LastWriteTimeUtc)
-                    .Skip(50);
-                foreach (var old in remaining)
+            // If directory still has excessive files (> 200), prune oldest dead files
+            var remaining = new DirectoryInfo(_dir).GetFiles("elements-*.json");
+            if (remaining.Length > 200)
+            {
+                foreach (var old in remaining.OrderBy(f => f.LastWriteTimeUtc))
                 {
-                    try
-                    {
-                        if (!old.FullName.Equals(_ownPath, StringComparison.OrdinalIgnoreCase))
-                            old.Delete();
-                    }
-                    catch { }
+                    if (old.FullName.Equals(_ownPath, StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    var m = Regex.Match(old.Name, @"^elements-(\d+)\.json$");
+                    if (m.Success && int.TryParse(m.Groups[1].Value, out var pid) && livePids.Contains(pid))
+                        continue;
+
+                    try { old.Delete(); } catch { }
+                    if (new DirectoryInfo(_dir).GetFiles("elements-*.json").Length <= 200)
+                        break;
                 }
             }
-            catch { }
-        });
+        }
+        catch { }
     }
 
     private sealed record PersistedElement(

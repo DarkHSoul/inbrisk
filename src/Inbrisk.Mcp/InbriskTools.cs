@@ -337,7 +337,7 @@ public sealed class InbriskTools
     [McpServerTool(Name = "computer_close_window"), Description(
         "Gracefully close a window (posts WM_CLOSE — save prompts appear " +
         "normally, the app stays in control). Target by hwnd, process name, " +
-        "or title substring. Use this to clean up windows you opened when a " +
+        "title substring, list of hwnds, or closeAllAgentWindows: true. Use this to clean up windows you opened when a " +
         "task is done — don't leave them on the user's desktop. Protected " +
         "host terminals, IDEs, and Colab sessions are guarded against accidental closure. " +
         "By default, Inbrisk Application Lifecycle Policy permits closing ONLY applications " +
@@ -345,9 +345,11 @@ public sealed class InbriskTools
         "unless force:true is explicitly set. 'When in doubt, leave it open.'")]
     public CallToolResult CloseWindow(
         [Description("window handle — decimal or 0x-prefixed")] string? hwnd = null,
+        [Description("batch list of window handles to close in one call")] string[]? hwnds = null,
         [Description("process name of the window to close, e.g. \"mspaint\"")] string? process = null,
         [Description("substring of the window title")] string? titleContains = null,
         [Description("semantic target object, e.g. {\"process\": \"notepad.exe\", \"hwnd\": \"0x...\"}")] TargetSpec? target = null,
+        [Description("close all windows opened during this session by the agent in a single turn")] bool closeAllAgentWindows = false,
         [Description("override lifecycle policy to close a pre-existing user window if explicitly requested by the user (default false)")] bool force = false,
         CancellationToken ct = default)
     {
@@ -356,6 +358,114 @@ public sealed class InbriskTools
         titleContains ??= target?.Name ?? target?.NameContains ?? (hwnd == null ? target?.Window : null);
 
         var wins = _s.Rt.Windows();
+
+        if (closeAllAgentWindows)
+        {
+            var closableWindows = wins
+                .Where(x => !_s.Rt.WindowService.IsWindowProtected(x.Hwnd, out _))
+                .Where(x => force || _s.Rt.Provenance.CanAgentClose(x.Hwnd, out _))
+                .ToList();
+
+            var closedList = new List<object>();
+            int closedCount = 0;
+            foreach (var win in closableWindows)
+            {
+                var wasClosed = _s.Rt.CloseWindow(win.Hwnd);
+                var winModal = _s.Rt.WindowService.GetModalPopup(win.Hwnd);
+                var winHasModal = winModal != null && winModal.Hwnd != win.Hwnd;
+                if (!wasClosed && force && !winHasModal)
+                {
+                    try
+                    {
+                        using var proc = Process.GetProcessById(win.Pid);
+                        proc.Kill();
+                        wasClosed = proc.WaitForExit(1000) || proc.HasExited;
+                    }
+                    catch { }
+                }
+                if (wasClosed) closedCount++;
+                closedList.Add(new
+                {
+                    hwnd = $"0x{win.Hwnd:X}",
+                    process = win.ProcessName,
+                    title = win.Title,
+                    closed = wasClosed,
+                    hasModal = winHasModal
+                });
+            }
+
+            return Text(JsonSerializer.Serialize(new
+            {
+                success = true,
+                batch = true,
+                closedCount,
+                totalFound = closableWindows.Count,
+                windows = closedList,
+                notification = $"Closed {closedCount} windows opened by the agent."
+            }, J));
+        }
+
+        if (hwnds is { Length: > 0 })
+        {
+            var batchList = new List<object>();
+            int batchClosed = 0;
+            foreach (var hStr in hwnds)
+            {
+                if (ParseHwnd(hStr) is not { } parsedHwnd)
+                {
+                    batchList.Add(new { hwnd = hStr, closed = false, error = "MalformedHwnd" });
+                    continue;
+                }
+                var win = wins.FirstOrDefault(x => x.Hwnd == parsedHwnd);
+                if (win == null)
+                {
+                    batchList.Add(new { hwnd = $"0x{parsedHwnd:X}", closed = false, error = "TargetNotFound" });
+                    continue;
+                }
+                if (_s.Rt.WindowService.IsWindowProtected(win.Hwnd, out var pr))
+                {
+                    batchList.Add(new { hwnd = $"0x{win.Hwnd:X}", process = win.ProcessName, closed = false, error = "ProtectedWindow", detail = pr });
+                    continue;
+                }
+                if (!force && !_s.Rt.Provenance.CanAgentClose(win.Hwnd, out var lr))
+                {
+                    batchList.Add(new { hwnd = $"0x{win.Hwnd:X}", process = win.ProcessName, closed = false, error = "PolicyDenied", detail = lr });
+                    continue;
+                }
+                var c = _s.Rt.CloseWindow(win.Hwnd);
+                var winModal = _s.Rt.WindowService.GetModalPopup(win.Hwnd);
+                var winHasModal = winModal != null && winModal.Hwnd != win.Hwnd;
+                if (!c && force && !winHasModal)
+                {
+                    try
+                    {
+                        using var proc = Process.GetProcessById(win.Pid);
+                        proc.Kill();
+                        c = proc.WaitForExit(1000) || proc.HasExited;
+                    }
+                    catch { }
+                }
+                if (c) batchClosed++;
+                batchList.Add(new
+                {
+                    hwnd = $"0x{win.Hwnd:X}",
+                    process = win.ProcessName,
+                    title = win.Title,
+                    closed = c,
+                    hasModal = winHasModal
+                });
+            }
+
+            return Text(JsonSerializer.Serialize(new
+            {
+                success = true,
+                batch = true,
+                closedCount = batchClosed,
+                totalRequested = hwnds.Length,
+                windows = batchList,
+                notification = $"Closed {batchClosed} of {hwnds.Length} windows."
+            }, J));
+        }
         WindowInfo? w = null;
         if (ParseHwnd(hwnd) is { } h)
             w = wins.FirstOrDefault(x => x.Hwnd == h);
@@ -1447,6 +1557,76 @@ public sealed class InbriskTools
             return _s.Control.State == ComputerControlState.EmergencyStopped
                 ? Error(OutcomeKind.EmergencyStopped,
                     StoppedDetail, sw)
+                : Error(OutcomeKind.Cancelled, "request cancelled", sw);
+        }
+        catch (Exception e)
+        {
+            return Error(OutcomeKind.Failed, e.Message, sw);
+        }
+    }
+
+    [McpServerTool(Name = "computer_do"), Description(
+        "Execute a composite fast UI action in a single turn without LLM roundtrips. " +
+        "Can launch/focus an app, click a target, type text, and/or send a hotkey. " +
+        "Examples: computer_do(app: \"notepad\", type: \"hello world\", hotkey: \"ctrl+s\"), " +
+        "computer_do(click: \"Save\", type: \"test.txt\", submit: true)")]
+    public async Task<CallToolResult> ComputerDo(
+        [Description("Application to launch or focus (e.g. 'Notepad', 'Calculator')")] string? app = null,
+        [Description("Target element name or text to click")] string? click = null,
+        [Description("Text to type into the target or focused window")] string? type = null,
+        [Description("Hotkey to press (e.g. 'ctrl+s', 'enter', 'alt+f4')")] string? hotkey = null,
+        [Description("Whether to press Enter after typing (default false)")] bool submit = false,
+        [Description("Semantic target or elementId to click")] TargetSpec? target = null,
+        [Description("Wait in milliseconds between steps (default 100ms)")] int waitMs = 100,
+        CancellationToken ct = default)
+    {
+        var steps = new List<RunStep>();
+
+        if (!string.IsNullOrWhiteSpace(app))
+        {
+            steps.Add(new RunStep { Action = "launch", App = app, WaitFor = "window" });
+            if (waitMs > 0 && (!string.IsNullOrWhiteSpace(click) || target != null || !string.IsNullOrWhiteSpace(type) || !string.IsNullOrWhiteSpace(hotkey)))
+                steps.Add(new RunStep { Action = "wait", Ms = waitMs });
+        }
+
+        if (!string.IsNullOrWhiteSpace(click) || target != null)
+        {
+            var clickTarget = target ?? new TargetSpec { Name = click };
+            steps.Add(new RunStep { Action = "click", Target = clickTarget });
+            if (waitMs > 0 && (!string.IsNullOrWhiteSpace(type) || !string.IsNullOrWhiteSpace(hotkey)))
+                steps.Add(new RunStep { Action = "wait", Ms = waitMs });
+        }
+
+        if (!string.IsNullOrWhiteSpace(type))
+        {
+            steps.Add(new RunStep { Action = "type", Text = type, Submit = submit });
+            if (waitMs > 0 && !string.IsNullOrWhiteSpace(hotkey))
+                steps.Add(new RunStep { Action = "wait", Ms = waitMs });
+        }
+
+        if (!string.IsNullOrWhiteSpace(hotkey))
+        {
+            steps.Add(new RunStep { Action = "hotkey", Keys = hotkey });
+        }
+
+        if (steps.Count == 0)
+        {
+            return Text(JsonSerializer.Serialize(new
+            {
+                error = "Malformed",
+                detail = "pass at least one action: app, click, type, or hotkey"
+            }, J));
+        }
+
+        var sw = Stopwatch.StartNew();
+        try
+        {
+            return await RunPlanCore(steps.ToArray(), null, sw, ct, detail: "slim");
+        }
+        catch (OperationCanceledException)
+        {
+            return _s.Control.State == ComputerControlState.EmergencyStopped
+                ? Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw)
                 : Error(OutcomeKind.Cancelled, "request cancelled", sw);
         }
         catch (Exception e)

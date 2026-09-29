@@ -42,6 +42,8 @@ public sealed class UserSettings
     /// "slim" compacts the heavy tool results (find/observe/run/capabilities)
     /// for small-context models; any tool call can override with detail.</summary>
     public string? OutputDetail { get; set; }
+    /// <summary>Tool profile: "full" (all tools) | "core" (streamlined essential tools for fast reasoning). Default "full".</summary>
+    public string? ToolProfile { get; set; }
     /// <summary>
     /// Processes protected from AI close/kill/termination actions.
     /// Immutable to AI; only editable by the human user via settings.
