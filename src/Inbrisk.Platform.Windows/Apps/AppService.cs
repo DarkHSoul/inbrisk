@@ -206,7 +206,7 @@ public sealed class AppService : IAppService
 
         // ---- readiness ----
         var ready = WaitReady(chosen, spawnedPid, readiness.Value,
-            spec.TimeoutMs, ct, total);
+            spec.TimeoutMs, ct, total, spec.App);
         if (ready.error != null)
             return Fail(ready.error, ready.detail, total,
                 resolvedName: chosen.DisplayName,
@@ -339,8 +339,23 @@ public sealed class AppService : IAppService
             if (s <= 0) continue;
             var (isValid, tgtStem) = InspectLnk(lnk);
             if (!isValid) continue; // Skip stale/dead shortcuts to uninstalled apps
+            var exes = new List<string> { name };
+            if (tgtStem != null)
+            {
+                exes.Add(tgtStem);
+                if (tgtStem.Contains("launcher", StringComparison.OrdinalIgnoreCase))
+                {
+                    var baseStem = System.Text.RegularExpressions.Regex.Replace(tgtStem, @"[-_]?launcher", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (!string.IsNullOrWhiteSpace(baseStem)) exes.Add(baseStem);
+                }
+            }
+            var parts = name.Split(new[] { ' ', '-', '_', '.' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length > 1 && parts[0].Length >= 3)
+            {
+                exes.Add(parts[0]);
+            }
             found.Add(new ResolvedApp(LaunchMethod.StartMenu, lnk, name,
-                tgtStem != null ? [name, tgtStem] : [name],
+                exes.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
                 s + 5)); // StartMenu beats equal-score PATH noise
         }
 
@@ -893,19 +908,38 @@ public sealed class AppService : IAppService
     private (string? error, string? detail, string? state, int? pid,
         long? hwnd, string? title, string? procName)
         WaitReady(ResolvedApp app, int? spawnedPid, LaunchReadiness readiness,
-            int timeoutMs, CancellationToken ct, Stopwatch total)
+            int timeoutMs, CancellationToken ct, Stopwatch total,
+            string? requestedName = null)
     {
         if (readiness == LaunchReadiness.None)
             return (null, null, "Started", spawnedPid, null, null, null);
 
         var deadline = total.ElapsedMilliseconds + timeoutMs;
-        var hints = app.ExeHints.Append(app.DisplayName)
-            .Select(Norm).Where(s => s.Length > 0).ToList();
+        var rawHints = new List<string>(app.ExeHints) { app.DisplayName };
+        if (!string.IsNullOrEmpty(requestedName))
+            rawHints.Add(requestedName);
+
+        foreach (var h in rawHints.ToList())
+        {
+            if (h.Contains("launcher", StringComparison.OrdinalIgnoreCase))
+            {
+                var stripped = System.Text.RegularExpressions.Regex.Replace(h, @"[-_]?launcher", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                if (!string.IsNullOrWhiteSpace(stripped)) rawHints.Add(stripped);
+            }
+            var parts = h.Split(new[] { ' ', '-', '_', '.' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length > 1 && parts[0].Length >= 3)
+            {
+                rawHints.Add(parts[0]);
+            }
+        }
+
+        var hints = rawHints.Select(Norm).Where(s => s.Length > 0).Distinct().ToList();
         var spawnedName = app.Method is LaunchMethod.ExplicitPath
             or LaunchMethod.AppPath or LaunchMethod.Executable
             ? Norm(Path.GetFileNameWithoutExtension(app.Identifier))
             : null;
 
+        WindowInfo? lastSeenWin = null;
         while (total.ElapsedMilliseconds < deadline)
         {
             ct.ThrowIfCancellationRequested();
@@ -919,14 +953,35 @@ public sealed class AppService : IAppService
             else
             {
                 var win = MatchWindow(spawnedPid, hints, spawnedName,
-                    app.DisplayName);
-                if (win != null && !IsHung(win.Hwnd) &&
-                    (_uiaProbe?.Invoke(win.Hwnd) ?? true))
-                    return (null, null, "Ready", win.Pid, win.Hwnd, win.Title,
-                        win.ProcessName);
+                    app.DisplayName, requestedName);
+                if (win != null)
+                {
+                    lastSeenWin = win;
+                    if (!IsHung(win.Hwnd) && (_uiaProbe?.Invoke(win.Hwnd) ?? true))
+                        return (null, null, "Ready", win.Pid, win.Hwnd, win.Title,
+                            win.ProcessName);
+                }
             }
             ct.WaitHandle.WaitOne(150);
         }
+
+        // If a matching top-level window was observed at any point during wait,
+        // treat it as Ready rather than timing out (heavy applications like Blender,
+        // Visual Studio, or game engines may be compiling shaders or showing a splash screen)
+        if (lastSeenWin != null)
+        {
+            return (null, null, "Ready", lastSeenWin.Pid, lastSeenWin.Hwnd,
+                lastSeenWin.Title, lastSeenWin.ProcessName);
+        }
+
+        // Final check right at the deadline
+        var finalWin = MatchWindow(spawnedPid, hints, spawnedName, app.DisplayName, requestedName);
+        if (finalWin != null)
+        {
+            return (null, null, "Ready", finalWin.Pid, finalWin.Hwnd,
+                finalWin.Title, finalWin.ProcessName);
+        }
+
         // debugging telemetry: what windows were visible at the deadline
         var seen = _windows.ListWindows()
             .Where(w => !w.Bounds.IsEmpty)
@@ -937,7 +992,7 @@ public sealed class AppService : IAppService
         if (isProcAlive && readiness == LaunchReadiness.Window)
         {
             return ("Timeout",
-                $"launched '{app.DisplayName}' via {app.Method} (pid={spawnedPid}) and process is actively running, but has no visible top-level window (likely minimized to system tray or running as a background service) within {timeoutMs}ms. For tray/background apps, use waitFor:\"process\" or \"none\". Windows visible: {string.Join(" | ", seen)}",
+                $"launched '{app.DisplayName}' via {app.Method} (pid={spawnedPid}) and process is actively running, but has no visible top-level window within {timeoutMs}ms (application may still be initializing heavy assets or minimized to system tray). Do not re-launch immediately; inspect or observe the application. Windows visible: {string.Join(" | ", seen)}",
                 "TimedOut", spawnedPid, null, null, null);
         }
 
@@ -949,7 +1004,7 @@ public sealed class AppService : IAppService
     }
 
     private WindowInfo? MatchWindow(int? pid, List<string> hints,
-        string? spawnedName, string displayName)
+        string? spawnedName, string displayName, string? requestedName = null)
     {
         var wins = _windows.ListWindows()
             .Where(w => !w.Bounds.IsEmpty && !string.IsNullOrEmpty(w.Title) &&
@@ -963,12 +1018,21 @@ public sealed class AppService : IAppService
             // fall through to name/title matching
         }
         var norm = Norm(displayName);
+        var reqNorm = requestedName != null ? Norm(requestedName) : null;
         var named = wins.Where(w =>
         {
             var pn = NormProc(w.ProcessName);
+            // 1. Direct process match against spawned name, requested name, or hints
             if (spawnedName != null && pn == spawnedName) return true;
-            if (hints.Count > 0 && hints.Contains(pn)) return true;
-            return hints.Count == 0 && spawnedName == null && pn.Length > 0 && Norm(w.Title).Contains(norm);
+            if (reqNorm != null && (pn == reqNorm || pn.StartsWith(reqNorm) || reqNorm.StartsWith(pn))) return true;
+            if (hints.Count > 0 && (hints.Contains(pn) || hints.Any(h => h.Length >= 4 && (h.StartsWith(pn) || pn.StartsWith(h))))) return true;
+            if (pn == norm || (norm.Length >= 4 && (norm.StartsWith(pn) || pn.StartsWith(norm)))) return true;
+
+            // 2. Title matching fallback
+            var winTitle = Norm(w.Title);
+            if (winTitle.Contains(norm) || (reqNorm != null && winTitle.Contains(reqNorm))) return true;
+            if (hints.Any(h => h.Length >= 4 && (winTitle.Contains(h) || pn.Contains(h)))) return true;
+            return false;
         }).ToList();
         return BestWindow(named);
     }

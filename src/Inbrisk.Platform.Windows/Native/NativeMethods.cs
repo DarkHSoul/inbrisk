@@ -112,6 +112,8 @@ internal static class NativeMethods
     [DllImport("user32.dll")] internal static extern void SwitchToThisWindow(IntPtr hWnd, bool fUnknown);
     [DllImport("user32.dll")] internal static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
     public const byte VK_MENU = 0x12;
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern uint MapVirtualKeyW(uint uCode, uint uMapType);
+    public const uint MAPVK_VK_TO_VSC = 0;
     [DllImport("user32.dll")] internal static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
     [DllImport("user32.dll")] internal static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);

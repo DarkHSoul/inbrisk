@@ -772,11 +772,35 @@ public sealed class SendInputService : IInputService
         U = new INPUTUNION { Mi = new MOUSEINPUT { DwFlags = flags } },
     };
 
-    private static INPUT Key(ushort vk, bool down) => new()
+    private static INPUT Key(ushort vk, bool down)
     {
-        Type = NativeMethods.INPUT_KEYBOARD,
-        U = new INPUTUNION { Ki = new KEYBDINPUT { WVk = vk, DwFlags = down ? 0 : NativeMethods.KEYEVENTF_KEYUP } },
-    };
+        uint flags = down ? 0 : NativeMethods.KEYEVENTF_KEYUP;
+        ushort scan = (ushort)NativeMethods.MapVirtualKeyW(vk, NativeMethods.MAPVK_VK_TO_VSC);
+        if (IsExtendedKey(vk))
+            flags |= NativeMethods.KEYEVENTF_EXTENDEDKEY;
+
+        return new INPUT
+        {
+            Type = NativeMethods.INPUT_KEYBOARD,
+            U = new INPUTUNION
+            {
+                Ki = new KEYBDINPUT
+                {
+                    WVk = vk,
+                    WScan = scan,
+                    DwFlags = flags
+                }
+            }
+        };
+    }
+
+    private static bool IsExtendedKey(ushort vk) => vk is
+        0x21 or 0x22 or 0x23 or 0x24 // PageUp, PageDown, End, Home
+        or 0x25 or 0x26 or 0x27 or 0x28 // Left, Up, Right, Down
+        or 0x2D or 0x2E // Insert, Delete
+        or 0x5B or 0x5C or 0x5D // LWin, RWin, Apps
+        or 0xA3 or 0xA5 // RControl, RMenu (AltGr)
+        or 0x6F; // Divide
 
     private static ushort ToVk(KeyCode k) => k switch
     {

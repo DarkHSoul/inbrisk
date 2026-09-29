@@ -43,6 +43,8 @@ ENV/
 telemetry.jsonl
 *.flag
 inbrisk_state.txt
+bridge_test_results.json
+stdin.txt
 
 # Development notes & local experiment reports
 inbrisksetup.txt

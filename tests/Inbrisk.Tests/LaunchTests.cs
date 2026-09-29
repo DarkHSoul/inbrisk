@@ -105,6 +105,23 @@ public sealed class LaunchUnitTests
     }
 
     [Fact]
+    public void LauncherHandoff_MatchesChildProcessWindow()
+    {
+        var (svc, win, _) = Svc();
+        // A launcher like blender-launcher spawns and exits; child process has different PID and bare name
+        win.Windows.Add(Win(0x3001, 8888, "(Unsaved) - Blender 5.2.0 LTS", "blender.exe"));
+        svc.PackageEnumerator = () =>
+        [
+            new AppService.ResolvedApp(LaunchMethod.StartMenu,
+                @"C:\Path\Blender 5.2.lnk", "Blender 5.2", ["Blender 5.2", "blender-launcher", "blender"], 100)
+        ];
+        var r = svc.Launch(For("Blender"));
+        Assert.True(r.Success, r.ErrorDetail);
+        Assert.Equal(0x3001, r.Hwnd);
+        Assert.Equal(8888, r.Pid);
+    }
+
+    [Fact]
     public void AmbiguousName_ReturnsCandidates_NeverGuesses()
     {
         var (svc, _, spawns) = Svc();

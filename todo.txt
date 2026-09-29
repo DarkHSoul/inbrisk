@@ -1,0 +1,1425 @@
+# INBRISK — WINDOWS-NATIVE AI COMPUTER-USE RUNTIME
+
+We are starting from an empty project.
+
+I am building **Inbrisk**, a model-agnostic Windows computer-use runtime that gives AI models the ability to observe, understand, and control the entire Windows desktop.
+
+This is **NOT** primarily:
+
+* a browser automation tool,
+* an MCP server,
+* a screenshot-clicking script,
+* a wrapper around PyAutoGUI,
+* or an agent tied to one specific AI provider.
+
+The long-term goal is:
+
+> **Give any capable AI model eyes and hands on a Windows computer through one unified runtime.**
+
+Inbrisk should eventually allow models such as OpenAI models, Claude, Gemini, local VLMs, UI-grounding models, and future models to control Windows without each model needing its own completely separate computer-control implementation.
+
+The architecture must therefore be **model-agnostic, backend-agnostic, modular, extensible, observable, and safety-aware**.
+
+---
+
+# 1. CORE DESIGN PRINCIPLE
+
+Do NOT reduce computer use to:
+
+```text
+screenshot
+→ LLM
+→ click(x,y)
+→ screenshot
+→ LLM
+→ click(x,y)
+```
+
+That should exist only as the universal fallback.
+
+Inbrisk should understand Windows through multiple perception and control mechanisms and automatically use the strongest available mechanism for the current target.
+
+Conceptually:
+
+```text
+                         AI MODEL
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │    INBRISK    │
+                    │ AGENT RUNTIME │
+                    └───────┬───────┘
+                            │
+                    Unified Computer API
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+         PERCEPTION                     ACTION
+             │                             │
+      ┌──────┼───────┐              ┌──────┼───────┐
+      ▼      ▼       ▼              ▼      ▼       ▼
+     UIA   Vision   CDP            UIA   SendInput  CDP
+      │      │       │              │      │       │
+      └──────┴───────┴──────────────┴──────┴───────┘
+                            │
+                         WINDOWS
+```
+
+The AI should not normally need to care which backend performed an action.
+
+For example:
+
+```text
+click(element)
+```
+
+might internally become:
+
+```text
+UIA InvokePattern
+```
+
+or:
+
+```text
+CDP DOM/Input action
+```
+
+or:
+
+```text
+SendInput mouse click
+```
+
+depending on what is available.
+
+---
+
+# 2. THE FOUR MAJOR WINDOWS CONTROL/PERCEPTION SYSTEMS
+
+Inbrisk should ultimately combine four major mechanisms.
+
+## A. Windows UI Automation — UIA
+
+UIA provides a machine-readable semantic representation of many Windows interfaces.
+
+Instead of only seeing pixels such as:
+
+```text
+[ screenshot ]
+```
+
+Inbrisk may be able to retrieve information resembling:
+
+```text
+Window: Settings
+
+├── Tab: System
+├── Tab: Bluetooth & devices
+├── ComboBox: Display resolution
+│   └── Value: 1920 × 1080
+├── Toggle: HDR
+│   └── State: Off
+├── Slider: Brightness
+│   └── Value: 75
+└── Button: Apply
+    ├── Enabled: true
+    └── BoundingRect: ...
+```
+
+Use UI Automation as the preferred semantic Windows interface whenever it provides useful information.
+
+Inbrisk should eventually understand concepts such as:
+
+* Window
+* Pane
+* Button
+* Text
+* Edit/TextBox
+* Document
+* Menu
+* MenuItem
+* Tab
+* List
+* ListItem
+* Tree
+* TreeItem
+* ComboBox
+* Checkbox
+* RadioButton
+* Slider
+* Toggle
+* Toolbar
+* Dialog
+
+Expose useful properties such as:
+
+* name
+* automation ID
+* control type
+* bounding rectangle
+* enabled
+* focused
+* selected
+* value
+* process/window ownership
+* available control patterns
+
+Where possible, prefer semantic actions instead of coordinate clicks.
+
+Examples:
+
+```text
+InvokePattern
+ValuePattern
+TogglePattern
+SelectionPattern
+ExpandCollapsePattern
+ScrollPattern
+RangeValuePattern
+```
+
+Conceptually:
+
+```text
+find:
+    role = button
+    name = "Apply"
+
+action:
+    invoke
+```
+
+is preferable to:
+
+```text
+click(1432, 817)
+```
+
+when the semantic action is reliable.
+
+However:
+
+**UIA is NOT assumed to expose everything.**
+
+Games, DirectX surfaces, custom-rendered interfaces, Unreal viewports, canvas/WebGL surfaces, unusual Electron components, and other custom UIs may expose incomplete or useless UIA trees.
+
+Therefore UIA is one perception/control backend, not the entire system.
+
+---
+
+# 3. CAPTURE ENGINE
+
+Do NOT equate capture with a simple screenshot function.
+
+Capture must be its own subsystem.
+
+Conceptually:
+
+```text
+Capture Engine
+
+├── Desktop Capture
+├── Monitor Capture
+├── Window Capture
+├── Region Capture
+├── Element Capture
+└── Continuous Frame Capture
+```
+
+The capture subsystem should eventually support efficient Windows-native capture technology.
+
+It must understand physical pixel coordinates and Windows DPI scaling correctly.
+
+We need to avoid the classic problem where:
+
+```text
+vision coordinate != actual Windows input coordinate
+```
+
+because the monitor uses:
+
+```text
+125%
+150%
+175%
+etc.
+```
+
+The runtime must be DPI-aware and should maintain a normalized coordinate model.
+
+---
+
+# 4. SINGLE-FRAME SCREENSHOT MODE
+
+The simplest observation mode is:
+
+```text
+capture_frame()
+```
+
+which returns the current visual state.
+
+But the runtime should support capturing only the relevant target:
+
+```text
+capture_desktop()
+capture_monitor(...)
+capture_window(...)
+capture_region(...)
+capture_element(...)
+```
+
+If only a 600×400 application region matters, do NOT unnecessarily send a full 4K multi-monitor desktop image to a vision model.
+
+This matters for:
+
+* latency,
+* vision token usage,
+* bandwidth,
+* inference cost,
+* grounding accuracy.
+
+---
+
+# 5. CONTINUOUS CAPTURE
+
+This is an important part of Inbrisk.
+
+Inbrisk should eventually be able to monitor frames continuously.
+
+For example:
+
+```text
+Windows Capture
+      ↓
+Frame Stream
+      ↓
+Frame Difference
+      ↓
+Change Detection
+      ↓
+Stability Detection
+```
+
+Do NOT interpret this as:
+
+> Send 60 screenshots per second to an LLM.
+
+That would be wasteful.
+
+Continuous capture should primarily happen locally.
+
+For example:
+
+```text
+30/60 FPS capture
+       ↓
+local frame-diff
+       ↓
+significant change detected
+       ↓
+changed region identified
+       ↓
+screen becomes stable
+       ↓
+only then invoke expensive perception/model if necessary
+```
+
+Example:
+
+The AI clicks Play in Unreal Engine.
+
+A naive agent might do:
+
+```text
+click()
+sleep(2 seconds)
+screenshot()
+LLM()
+```
+
+Inbrisk should eventually support:
+
+```text
+click()
+   ↓
+watch screen
+   ↓
+change starts
+   ↓
+loading / animation
+   ↓
+changes continue
+   ↓
+screen stabilizes
+   ↓
+capture relevant region
+   ↓
+continue reasoning
+```
+
+This allows actions to synchronize with the real interface rather than relying on arbitrary sleeps.
+
+The system should eventually support concepts such as:
+
+```text
+wait_for_change()
+wait_for_stable()
+wait_for_element()
+wait_for_window()
+wait_for_text()
+wait_for_disappear()
+```
+
+---
+
+# 6. FRAME DIFFERENCING
+
+Continuous capture should allow cheap local change detection.
+
+Possible future information:
+
+```text
+changed_pixels_percentage
+changed_regions
+motion_regions
+stable_for_ms
+window_changed
+focus_changed
+```
+
+Example:
+
+```text
+Screen changed: 2.8%
+Primary changed region:
+x=840
+y=120
+width=610
+height=440
+```
+
+This can allow Inbrisk to send only a relevant crop to vision.
+
+Do not prematurely implement sophisticated computer vision if unnecessary, but design the capture API so these capabilities can be added cleanly.
+
+---
+
+# 7. VISION PERCEPTION
+
+Capture and Vision are NOT the same subsystem.
+
+Keep them separated.
+
+```text
+Capture Engine
+      │
+      ▼
+raw pixels / frames
+      │
+      ▼
+Perception Engine
+```
+
+Vision is responsible for understanding visual content when structural interfaces cannot.
+
+Vision may eventually use:
+
+* multimodal LLMs,
+* UI grounding models,
+* object detection,
+* OCR,
+* local vision models,
+* specialized GUI grounding models.
+
+Example:
+
+UIA may expose:
+
+```text
+Window: Unreal Editor
+├── Menu
+├── Toolbar
+├── Content Browser
+└── Pane: Viewport
+```
+
+but know nothing useful about objects rendered inside the viewport.
+
+Vision can inspect that viewport and understand:
+
+```text
+character
+transform gizmo
+viewport icons
+3D objects
+custom controls
+rendered overlays
+```
+
+Therefore:
+
+> UIA understands structure.
+> Vision understands pixels.
+
+Neither replaces the other.
+
+---
+
+# 8. SENDINPUT / RAW INPUT
+
+Inbrisk needs a universal fallback for interaction.
+
+On Windows this should eventually use native input injection rather than making PyAutoGUI the fundamental architecture.
+
+Conceptually support:
+
+```text
+mouse_move
+mouse_down
+mouse_up
+click
+double_click
+right_click
+drag
+scroll
+
+key_down
+key_up
+key_press
+hotkey
+type_text
+```
+
+The implementation should correctly handle:
+
+* DPI scaling
+* multiple monitors
+* negative monitor coordinates
+* physical vs logical coordinates
+* keyboard modifiers
+* Unicode text
+* focus
+* timing
+
+Raw input is extremely important because it works even when UIA cannot perform a semantic action.
+
+For example:
+
+```text
+Unreal viewport
+game
+canvas
+custom UI
+```
+
+may ultimately require:
+
+```text
+Vision → coordinates → SendInput
+```
+
+---
+
+# 9. CDP — CHROME DEVTOOLS PROTOCOL
+
+CDP should NOT be the architectural foundation of Inbrisk.
+
+Inbrisk controls Windows, not merely browsers.
+
+However CDP should eventually become a specialized backend for Chromium-based environments.
+
+Conceptually:
+
+```text
+                 INBRISK
+                    │
+       ┌────────────┼────────────┐
+       ▼            ▼            ▼
+      UIA           CDP        Vision
+       │            │            │
+ Windows UI     Chromium      Pixels
+```
+
+CDP can potentially provide much richer information than screenshots for browser content:
+
+* DOM
+* accessibility tree
+* elements
+* bounding boxes
+* page state
+* runtime
+* tabs/targets
+* input
+* network information
+
+It may also be useful for Electron applications when appropriate access exists.
+
+Again:
+
+CDP is a **specialist backend**, not the product itself.
+
+---
+
+# 10. UNIFIED SCENE / OBSERVATION MODEL
+
+A major architectural goal should be to merge information from different perception backends.
+
+The AI should eventually receive something conceptually resembling:
+
+```json
+{
+  "activeApplication": "UnrealEditor.exe",
+  "window": {
+    "title": "MyGame - Unreal Editor",
+    "bounds": [0, 0, 1920, 1080]
+  },
+
+  "elements": [
+    {
+      "id": "uia_41",
+      "source": "uia",
+      "role": "button",
+      "name": "Compile",
+      "bounds": [820, 72, 895, 104],
+      "actions": ["invoke"]
+    },
+
+    {
+      "id": "vision_12",
+      "source": "vision",
+      "description": "Play icon in viewport toolbar",
+      "bounds": [912, 74, 954, 108],
+      "confidence": 0.96,
+      "actions": ["click"]
+    }
+  ]
+}
+```
+
+The exact schema does not need to look like this.
+
+The important idea is:
+
+> Normalize different perception systems into a common representation.
+
+The model should not need to separately understand all implementation details of UIA, CDP, screenshots, and Windows APIs.
+
+---
+
+# 11. ACTION RESOLUTION
+
+High-level actions should be backend-independent whenever possible.
+
+For example:
+
+```text
+click(element)
+```
+
+Inbrisk should determine the strongest execution strategy.
+
+Possible priority:
+
+```text
+1. Native semantic action
+2. Specialist backend action
+3. Coordinate-based SendInput
+```
+
+Example:
+
+```text
+Button "Apply"
+```
+
+could result in:
+
+```text
+UIA InvokePattern
+```
+
+while:
+
+```text
+visual element inside Unreal viewport
+```
+
+could result in:
+
+```text
+SendInput click(bounds.center)
+```
+
+Browser elements might use CDP.
+
+The caller should not need to manually choose the backend for ordinary actions.
+
+But advanced callers should still be able to override strategy for debugging/testing.
+
+---
+
+# 12. PERCEPTION FALLBACK STRATEGY
+
+Conceptually:
+
+```text
+Need to locate something
+        │
+        ▼
+Can semantic Windows UI identify it?
+        │
+       YES
+        │
+       UIA
+        │
+       DONE
+
+If NO:
+        │
+        ▼
+Is this a browser/CDP target?
+        │
+       YES
+        │
+       CDP
+        │
+       DONE
+
+If NO:
+        │
+        ▼
+Capture relevant visual region
+        │
+        ▼
+Vision / grounding
+        │
+        ▼
+coordinates
+        │
+        ▼
+SendInput
+```
+
+Do not hard-code this exact decision tree if a better abstraction exists.
+
+The architectural principle matters more than the precise ordering.
+
+---
+
+# 13. OBSERVE → ACT → VERIFY
+
+Computer-use actions must not be assumed successful merely because the input API returned success.
+
+For example:
+
+```text
+click(button)
+```
+
+returning without error does NOT prove the intended UI state changed.
+
+The runtime should eventually support:
+
+```text
+OBSERVE
+   ↓
+ACT
+   ↓
+OBSERVE
+   ↓
+VERIFY
+```
+
+Example:
+
+```text
+Goal:
+Enable HDR
+
+Before:
+HDR = Off
+
+Action:
+toggle(HDR)
+
+After:
+HDR = On
+
+Result:
+VERIFIED
+```
+
+If verification fails:
+
+```text
+retry
+alternative backend
+refocus
+re-observe
+vision fallback
+recover
+```
+
+may be appropriate.
+
+This reliability layer is a major part of Inbrisk's value.
+
+---
+
+# 14. ELEMENT IDENTITY
+
+Avoid making the AI repeatedly rediscover the same control.
+
+Elements should be capable of receiving temporary runtime IDs:
+
+```text
+uia_41
+cdp_18
+vision_7
+window_3
+```
+
+Then an agent can say:
+
+```text
+click("uia_41")
+```
+
+rather than repeatedly describing:
+
+> the Apply button near the bottom-right of Settings.
+
+However element references may become stale when the UI changes.
+
+Design for stale-element detection and re-resolution.
+
+---
+
+# 15. WINDOWS / PROCESS AWARENESS
+
+Inbrisk should understand more than pixels.
+
+Eventually expose information such as:
+
+```text
+running processes
+top-level windows
+active window
+window title
+HWND
+PID
+process executable
+window bounds
+minimized/maximized state
+foreground state
+monitor
+DPI
+```
+
+Potential operations:
+
+```text
+list_windows()
+focus_window()
+move_window()
+resize_window()
+minimize_window()
+maximize_window()
+restore_window()
+close_window()
+```
+
+Do not assume all operations should use mouse clicks.
+
+Use Windows-native APIs when appropriate.
+
+---
+
+# 16. MULTI-MONITOR SUPPORT
+
+Multi-monitor support must be architectural, not an afterthought.
+
+Inbrisk should understand:
+
+```text
+Desktop Space
+├── Monitor 1
+├── Monitor 2
+└── Monitor N
+```
+
+including:
+
+* negative coordinates,
+* different resolutions,
+* different DPI scaling,
+* different refresh rates,
+* primary monitor designation.
+
+An element coordinate must map reliably to input coordinates.
+
+---
+
+# 17. CLIPBOARD
+
+Clipboard should be a first-class capability.
+
+Potential operations:
+
+```text
+clipboard_read()
+clipboard_write()
+clipboard_clear()
+```
+
+Where safe and appropriate, clipboard-based text transfer may be much more reliable and faster than simulated typing.
+
+But do not use clipboard blindly for sensitive information.
+
+---
+
+# 18. OCR
+
+OCR can exist as another perception capability.
+
+Conceptually:
+
+```text
+pixels
+  ↓
+OCR
+  ↓
+text + bounds
+```
+
+This can be useful when:
+
+* UIA does not expose text,
+* vision model invocation would be excessive,
+* text is rendered inside custom surfaces.
+
+OCR should not automatically replace UIA or Vision.
+
+It is another perception source.
+
+---
+
+# 19. APPLICATION EXAMPLE — UNREAL ENGINE
+
+Unreal Engine demonstrates why this hybrid architecture matters.
+
+UIA may understand:
+
+```text
+File
+Edit
+Window
+toolbar controls
+dialogs
+Content Browser controls
+Details panel controls
+```
+
+Vision may understand:
+
+```text
+3D viewport
+character
+transform gizmo
+viewport overlays
+custom-rendered controls
+scene state
+```
+
+Windows APIs understand:
+
+```text
+UnrealEditor.exe
+HWND
+window position
+window state
+focus
+DPI
+```
+
+Input can perform:
+
+```text
+keyboard shortcuts
+mouse interactions
+viewport manipulation
+dragging
+```
+
+Eventually an Inbrisk agent should be able to move between these mechanisms automatically.
+
+---
+
+# 20. MODEL ADAPTERS
+
+Do NOT hard-wire the runtime to one AI provider.
+
+Eventually we may want adapters for:
+
+```text
+OpenAI
+Anthropic
+Google
+local VLM
+UI-TARS
+Qwen-VL family
+future computer-use models
+```
+
+Conceptually:
+
+```text
+Agent Runtime
+     │
+     ├── OpenAI Adapter
+     ├── Anthropic Adapter
+     ├── Gemini Adapter
+     └── Local Adapter
+```
+
+The core Windows control runtime must remain usable without any specific LLM.
+
+---
+
+# 21. MCP
+
+MCP is NOT the core architecture.
+
+It may later expose Inbrisk capabilities to external agents.
+
+For example:
+
+```text
+Inbrisk Core
+     │
+     ├── Native SDK
+     ├── CLI
+     ├── Agent Runtime
+     ├── MCP Server
+     └── future APIs
+```
+
+An MCP wrapper should be thin.
+
+Do not design Inbrisk around the limitations of MCP clients.
+
+---
+
+# 22. POTENTIAL HIGH-LEVEL API
+
+Do not blindly implement this API. Treat it as intent.
+
+Possible future calls:
+
+```text
+observe()
+screenshot()
+
+list_windows()
+focus_window()
+
+find(...)
+find_all(...)
+
+click(...)
+double_click(...)
+right_click(...)
+drag(...)
+
+type(...)
+key(...)
+hotkey(...)
+scroll(...)
+
+read(...)
+set_value(...)
+toggle(...)
+select(...)
+
+wait_for(...)
+wait_for_change(...)
+wait_for_stable(...)
+
+clipboard_read()
+clipboard_write()
+```
+
+Higher-level example:
+
+```text
+const settings = await inbrisk.find({
+    role: "window",
+    name: "Settings"
+});
+
+const hdr = await inbrisk.find({
+    within: settings,
+    role: "toggle",
+    name: "HDR"
+});
+
+await inbrisk.toggle(hdr);
+
+await inbrisk.verify({
+    element: hdr,
+    state: "on"
+});
+```
+
+Again: design the correct abstraction rather than blindly copying this example.
+
+---
+
+# 23. SAFETY
+
+Because this system controls a real computer, safety cannot be bolted on at the end.
+
+Architect for:
+
+```text
+kill switch
+pause/resume
+action logging
+dangerous action classification
+confirmation policies
+application allow/deny rules
+input rate limits
+secret handling
+screenshot privacy
+audit trail
+```
+
+Potential high-risk actions include:
+
+```text
+deleting files
+sending messages
+submitting forms
+purchases
+installing software
+running commands
+changing security settings
+entering credentials
+```
+
+The architecture should allow policies such as:
+
+```text
+ALLOW
+CONFIRM
+DENY
+```
+
+without putting policy logic inside every individual backend.
+
+---
+
+# 24. OBSERVABILITY / DEBUGGING
+
+This project will become impossible to debug if actions are opaque.
+
+Every action should eventually produce structured telemetry.
+
+Example:
+
+```text
+ACTION #1842
+
+Intent:
+Click "Compile"
+
+Resolved element:
+uia_41
+
+Backend:
+UIA
+
+Method:
+InvokePattern
+
+Duration:
+18 ms
+
+Verification:
+Compile state changed
+
+Result:
+SUCCESS
+```
+
+For vision fallback:
+
+```text
+ACTION #1843
+
+Intent:
+Click Play
+
+UIA:
+No matching element
+
+Vision:
+Match confidence 0.94
+
+Bounds:
+[912, 74, 954, 108]
+
+Input backend:
+SendInput
+
+Verification:
+Viewport changed
+
+Result:
+SUCCESS
+```
+
+This will be extremely important when debugging computer-use behavior.
+
+---
+
+# 25. PERFORMANCE PRINCIPLE
+
+Do not call an expensive multimodal model when Windows already knows the answer.
+
+Preferred philosophy:
+
+```text
+cheap structural information
+        ↓
+specialized structural information
+        ↓
+cheap local perception
+        ↓
+expensive vision reasoning
+```
+
+Likewise:
+
+Do not repeatedly send an unchanged 4K screenshot to a model.
+
+Use:
+
+```text
+UI state
+window state
+frame difference
+cropping
+changed regions
+semantic trees
+cached observations
+```
+
+to reduce unnecessary inference.
+
+---
+
+# 26. IMPORTANT DISTINCTION
+
+Keep these concepts separate:
+
+```text
+CAPTURE
+    obtains pixels
+
+PERCEPTION
+    understands state
+
+GROUNDING
+    maps intent to UI targets
+
+ACTION
+    manipulates the system
+
+VERIFICATION
+    checks whether the intended result happened
+
+RECOVERY
+    determines what to do when it did not
+```
+
+Do not collapse all of these into one giant agent function.
+
+---
+
+# 27. DESIRED LONG-TERM LOOP
+
+The eventual system should resemble:
+
+```text
+               USER GOAL
+                   │
+                   ▼
+                MODEL
+                   │
+                   ▼
+                INTENT
+                   │
+                   ▼
+               INBRISK
+                   │
+             ┌─────┴─────┐
+             │  OBSERVE  │
+             └─────┬─────┘
+                   │
+          UIA / CDP / Vision
+                   │
+                   ▼
+                GROUND
+                   │
+                   ▼
+                 ACT
+                   │
+        UIA / CDP / SendInput
+                   │
+                   ▼
+               MONITOR
+                   │
+       events / frames / UI changes
+                   │
+                   ▼
+                VERIFY
+                   │
+             ┌─────┴─────┐
+             │           │
+          SUCCESS       FAILED
+             │           │
+             ▼           ▼
+          continue     RECOVER
+                         │
+                         └────→ OBSERVE
+```
+
+---
+
+# 28. DEVELOPMENT STRATEGY
+
+We are starting from an empty folder.
+
+Do NOT attempt to implement the entire vision.
+
+Build the foundation incrementally.
+
+The first version should prove that the architecture is correct.
+
+My preferred initial priority is approximately:
+
+```text
+1. Windows/process/window discovery
+2. DPI/coordinate system
+3. UI Automation inspection
+4. UIA actions
+5. Native mouse/keyboard input
+6. basic screen/window capture
+7. unified element representation
+8. observation API
+9. action resolution
+10. verification primitives
+```
+
+Then:
+
+```text
+11. continuous capture
+12. frame difference/stability detection
+13. vision adapter
+14. OCR
+15. CDP
+16. model adapters
+17. MCP
+```
+
+This ordering can be changed if there is a strong technical reason.
+
+---
+
+# 29. FIRST MILESTONE
+
+The first milestone should NOT be:
+
+> Build a full autonomous AI agent.
+
+Instead, prove that **Inbrisk itself can understand and manipulate Windows independently of an LLM.**
+
+For example, from a CLI/test harness:
+
+```text
+inbrisk windows
+
+→ Desktop
+→ Explorer
+→ Notepad
+→ Settings
+→ Chrome
+→ Unreal Editor
+```
+
+Then:
+
+```text
+inbrisk inspect "Notepad"
+
+Window: Notepad
+└── Document: Text editor
+```
+
+Then something conceptually like:
+
+```text
+inbrisk find --role button --name "Save"
+```
+
+and:
+
+```text
+inbrisk click <element>
+```
+
+Then verify that it actually worked.
+
+Once this layer is reliable, attaching an AI model becomes substantially easier.
+
+---
+
+# 30. WHAT I WANT FROM YOU NOW
+
+Before writing significant implementation code:
+
+1. Analyze this architecture critically.
+2. Identify anything technically incorrect or unrealistic.
+3. Identify missing Windows technologies or architectural components that would materially improve the system.
+4. Decide the best implementation language/runtime for the Windows-native core.
+5. Decide which parts should be native and which can safely be higher-level.
+6. Propose the module/package architecture.
+7. Define the unified element/observation representation.
+8. Define the action interface.
+9. Define backend selection/fallback behavior.
+10. Define how DPI and multi-monitor coordinate normalization will work.
+11. Define how stale UI elements will be handled.
+12. Define the first milestone and its automated tests.
+13. Explain any security/integrity-level limitations, including elevated/UAC windows.
+14. Explain how UIA, native Windows APIs, capture, SendInput, Vision, OCR and CDP should cooperate rather than duplicate one another.
+15. Point out anything in my proposal that you think should be changed.
+
+Do **not** simplify the product into “just use screenshots and PyAutoGUI.”
+
+Do **not** simplify it into “just build an MCP server.”
+
+Do **not** simplify it into browser automation.
+
+Do **not** tie the architecture to one model vendor.
+
+The objective is a serious, general-purpose **Windows computer-use runtime for AI agents**.
+
+The central principle is:
+
+> **UIA when Windows can describe it. Vision when only pixels can describe it. Native input when physical interaction is required. Specialized backends such as CDP when they provide a stronger representation. Observe every important action and verify the result.**
+
+Start by giving me the architecture/engineering assessment and proposed implementation plan. Do not begin large-scale implementation until that foundation is clear.

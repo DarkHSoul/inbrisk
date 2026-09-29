@@ -274,20 +274,42 @@ public sealed class InbriskTools
     }
 
     [McpServerTool(Name = "computer_windows"), Description(
-        "List top-level windows (hwnd, title, process, bounds, active flag). " +
-        "Windows matching the input-blocking signature (visible, layered, " +
-        "not click-through, covering a monitor — e.g. a glitched overlay) " +
-        "are marked [INPUT-BLOCKING]; modal popups/dialogs and blocked windows are explicitly flagged.")]
+        "List top-level windows with orthogonal states (hwnd, title, app, rect, flags). " +
+        "Flags report independent dimensions: focus ([foreground]), visibility ([shown]), " +
+        "placement ([normal], [maximized], [minimized]), and monitor assignment ([monitor:0 primary], [monitor:1 secondary]). " +
+        "POLICY: Do not focus or activate a window merely because it is not foreground. If a target window is [shown], " +
+        "not [minimized], and assigned to a visible monitor, prefer non-disruptive inspection (computer_inspect, computer_find, " +
+        "or computer_screenshot with monitor index) without stealing user focus. " +
+        "Windows matching the input-blocking signature are marked [INPUT-BLOCKING]; modal popups/dialogs and blocked windows are explicitly flagged.")]
     public CallToolResult Windows(CancellationToken ct = default)
     {
         var wins = _s.Rt.Windows();
+        var monitors = _s.Rt.WindowService.GetMonitors();
         var blockers = InputHealth.FindBlockingWindows()
             .Select(b => b.Hwnd).ToHashSet();
         var sb = new StringBuilder();
         foreach (var w in wins)
         {
             var flags = new List<string>();
-            if (w.IsForeground) flags.Add("[active]");
+            if (w.IsForeground) flags.Add("[foreground]");
+            flags.Add("[shown]");
+            flags.Add(w.State switch
+            {
+                WindowState.Minimized => "[minimized]",
+                WindowState.Maximized => "[maximized]",
+                _ => "[normal]"
+            });
+
+            if (w.MonitorIndex >= 0 && w.MonitorIndex < monitors.Count)
+            {
+                var mon = monitors[w.MonitorIndex];
+                flags.Add(mon.IsPrimary ? $"[monitor:{mon.Index} primary]" : $"[monitor:{mon.Index} secondary]");
+            }
+            else
+            {
+                flags.Add($"[monitor:{w.MonitorIndex}]");
+            }
+
             if (w.IsElevated) flags.Add("[ELEVATED/UIPI: observation-only]");
             if (blockers.Contains(w.Hwnd)) flags.Add("[INPUT-BLOCKING]");
             if (w.IsModalPopup) flags.Add("[MODAL/DIALOG]");
@@ -301,8 +323,8 @@ public sealed class InbriskTools
                 flags.Add("[USER-OWNED: do-not-close]");
 
             var flagStr = flags.Count > 0 ? "  " + string.Join(" ", flags) : "";
-            sb.AppendLine($"0x{w.Hwnd:X}  \"{w.Title}\"  {w.ProcessName}  " +
-                $"({w.Bounds.X},{w.Bounds.Y} {w.Bounds.Width}x{w.Bounds.Height})" +
+            sb.AppendLine($"0x{w.Hwnd:X}  \"{w.Title}\"  app={w.ProcessName}  " +
+                $"rect=({w.Bounds.X},{w.Bounds.Y} {w.Bounds.Width}x{w.Bounds.Height})" +
                 flagStr);
         }
         return Text(sb.ToString());
@@ -570,7 +592,8 @@ public sealed class InbriskTools
         "call computer_launch again immediately with the candidate's " +
         "identifier; do not narrate intermediate steps. " +
         "search: searches the installed-apps catalog (computer_apps) and " +
-        "opens the best match — same pipeline as app.")]
+        "opens the best match — same pipeline as app. " +
+        "Heavy applications (e.g. Blender, IDEs, browsers) take time to load shaders, splash screens, and modules — computer_launch waits automatically (default 25000ms). Do NOT immediately re-launch or conclude failure if an app takes a moment to load; inspect or observe instead of looping launch.")]
     public CallToolResult Launch(
         [Description("friendly app name (\"Spotify\", \"Notepad\", \"Calculator\") — preferred")] string? app = null,
         [Description("search installed apps and open the best match — alias of app (\"Unreal\" finds UnrealEditor)")] string? search = null,
@@ -581,7 +604,7 @@ public sealed class InbriskTools
         [Description("structured arguments — one element = one verbatim argument")] string[]? arguments = null,
         [Description("spawn a new instance instead of reusing a running window — default false")] bool? newInstance = null,
         [Description("window (default) | process | none")] string? waitFor = null,
-        [Description("readiness timeout ms — default 10000")] int? timeoutMs = null,
+        [Description("readiness timeout ms — default 25000")] int? timeoutMs = null,
         [Description("optional remote debugging port for Chrome DevTools Protocol / CDP (e.g. 9222)")] int? debugPort = null,
         CancellationToken ct = default)
     {
@@ -612,7 +635,7 @@ public sealed class InbriskTools
         {
             r = _s.Rt.Launch(new LaunchSpec(app ?? search, executable, path,
                 aumid, uri, arguments, newInstance ?? false,
-                waitFor ?? "window", timeoutMs ?? 10000, debugPort), linked.Token);
+                waitFor ?? "window", timeoutMs ?? 25000, debugPort), linked.Token);
         }
         catch (OperationCanceledException)
         {
@@ -1163,11 +1186,10 @@ public sealed class InbriskTools
 
     [McpServerTool(Name = "computer_click"), Description(
         "Click an element. Prefer computer_invoke for buttons/menu items " +
-        "(no focus/geometry needed). Three targeting styles: elementId, " +
+        "(no focus/geometry needed). Targeting styles: elementId, " +
         "semantic target {window,process,role,name,automationId,labelledBy," +
-        "nearText,within,ancestor}, or image point x+y with frameId+" +
-        "observationId (stale frames rejected). button:left|right|double. " +
-        "Do NOT click coordinates when an elementId exists.")]
+        "nearText,within,ancestor}, or coordinates x+y (desktop or OCR coordinates; " +
+        "frameId/observationId optional). button:left|right|double.")]
     public Task<CallToolResult> Click(
         [Description("elementId from observe/find")] string? elementId = null,
         [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?}")] TargetSpec? target = null,
@@ -1186,7 +1208,7 @@ public sealed class InbriskTools
                 : button?.Equals("double", StringComparison.OrdinalIgnoreCase) == true
                     ? AgentActionKind.DoubleClick
                     : AgentActionKind.Click,
-            ElementId: el?.Id, Point: MakePoint(frameId, observationId, x, y)), ct, observe);
+            ElementId: el?.Id, Point: MakePoint(frameId, observationId, x ?? target?.X, y ?? target?.Y)), ct, observe);
     }
 
     [McpServerTool(Name = "computer_invoke"), Description(
@@ -1236,10 +1258,9 @@ public sealed class InbriskTools
         "navigation are internal. mode=replace|append|insert, " +
         "position=current|start|end, submit=Enter afterwards. Uses " +
         "ValuePattern when the control supports it (atomic + verified), " +
-        "else real keystrokes. To append at document end: " +
-        "{target:{process:\"notepad\",role:\"document\"},text:\"...\", " +
-        "mode:\"append\",position:\"end\"}. Do NOT pre-click/focus/Ctrl+End " +
-        "with separate calls — this tool does it.")]
+        "else real keystrokes. When typing into canvas/OpenGL/game windows " +
+        "without UIA controls (e.g. Blender file dialog), omit elementId and target " +
+        "to type directly into the focused window.")]
     public Task<CallToolResult> Type(
         [Description("text to type")] string text,
         [Description("elementId")] string? elementId = null,
@@ -2635,7 +2656,7 @@ public sealed class InbriskTools
     /// meaningless for the step's action, or a step with no effective
     /// operation is Malformed. A misspelled field must never produce a
     /// Verified-looking step.</summary>
-    private static string? ValidateStep(RunStep s)
+    public static string? ValidateStep(RunStep s)
     {
         if (s.Extra is { Count: > 0 } extra)
             return $"unknown step field(s): {string.Join(", ", extra.Keys)} — " +
@@ -2768,7 +2789,7 @@ public sealed class InbriskTools
         }
 
         var hasTarget = s.ElementId != null || s.Target != null;
-        var hasPoint = s.X != null && s.Y != null;
+        var hasPoint = (s.X != null && s.Y != null) || (s.Target?.X != null && s.Target?.Y != null);
         if (s.Select?.ToLowerInvariant() is { } sel &&
             sel is not ("first" or "last" or "nth"))
             return "select must be first|last|nth";
@@ -2790,10 +2811,6 @@ public sealed class InbriskTools
             "click" or "rightclick" or "right_click" or "doubleclick"
                 or "double_click" when !hasTarget && !hasPoint =>
                 $"{a} requires elementId, target, or x+y",
-            "click" or "rightclick" or "right_click" or "doubleclick"
-                or "double_click" when hasPoint &&
-                    (s.FrameId == null || s.ObservationId == null) =>
-                "x/y require frameId + observationId",
             "set_value" or "setvalue" when !hasTarget =>
                 "set_value requires elementId or target",
             "set_value" or "setvalue" when s.Text == null && s.Value == null =>
@@ -3480,7 +3497,7 @@ public sealed class InbriskTools
         }
         return new LaunchSpec(app, s.Executable, s.Path, s.Aumid, s.Uri,
             s.Arguments, s.NewInstance ?? false, s.WaitFor ?? "window",
-            s.Timeout ?? s.Ms ?? 10000, s.DebugPort);
+            s.Timeout ?? s.Ms ?? 25000, s.DebugPort);
     }
 
     /// <summary>wait_for scope: derive the window/process subtree to watch
@@ -3676,9 +3693,11 @@ public sealed class InbriskTools
             key = parts.LastOrDefault();
             mods = parts.Take(parts.Length - 1).ToArray();
         }
+        var pointX = s.X ?? s.Target?.X;
+        var pointY = s.Y ?? s.Target?.Y;
         return [new AgentAction(kind.Value,
             ElementId: el?.Id,
-            Point: MakePoint(s.FrameId, s.ObservationId, s.X, s.Y),
+            Point: MakePoint(s.FrameId, s.ObservationId, pointX, pointY),
             To: s.ToX != null && s.ToY != null
                 ? new ImagePoint(s.ToX.Value, s.ToY.Value,
                     s.ToFrameId ?? 0, s.ToObservationId ?? 0)
@@ -4197,10 +4216,11 @@ public sealed class InbriskTools
     }
 
     [McpServerTool(Name = "computer_focus_window"), Description(
-        "Bring a window to the foreground — verified against " +
-        "GetForegroundWindow. Target by hwnd, process name, or title substring. " +
-        "Usually NOT needed: action tools auto-foreground their target's window. " +
-        "Use this to choose which window receives subsequent computer_key/computer_hotkey input.")]
+        "Bring a window to the foreground — verified against GetForegroundWindow. " +
+        "Target by hwnd, process name, or title substring. Automatically unminimizes. " +
+        "POLICY: Do not call this merely because a window is not foreground; if a window is [shown] " +
+        "and not [minimized] on a visible or secondary monitor, prefer non-disruptive inspection " +
+        "(computer_inspect, computer_find, computer_screenshot with monitor index) first to avoid stealing user focus.")]
     public Task<CallToolResult> FocusWindow(
         [Description("window handle — decimal or 0x-prefixed")] string? hwnd = null,
         [Description("process name of the window to focus, e.g. \"notepad\"")] string? process = null,
@@ -4656,7 +4676,9 @@ public sealed class InbriskTools
         [Description("element's label text — UIA LabeledBy, else a nearby Text element spatially left/above")] string? LabelledBy = null,
         [Description("a Text element containing this must be within ~200px of the target")] string? NearText = null,
         [Description("elementId or hwnd — target bounds must be inside this element/window")] string? Within = null,
-        [Description("role name or text an ancestor in the UIA path must match")] string? Ancestor = null)
+        [Description("role name or text an ancestor in the UIA path must match")] string? Ancestor = null,
+        [Description("coordinate x (when targeting an image or screen point)")] int? X = null,
+        [Description("coordinate y (when targeting an image or screen point)")] int? Y = null)
     {
         public string Summary()
         {
@@ -5530,9 +5552,9 @@ public sealed class InbriskTools
                     StoppedDetail, sw);
             foreach (var point in steps.SelectMany(a =>
                     new[] { a.Point, a.To }).OfType<ImagePoint>())
-                if (point.ObservationId == 0 ||
+                if (point.FrameId != 0 && (point.ObservationId == 0 ||
                     !_s.FrameObservations.TryGetValue(point.FrameId, out var obsId) ||
-                    obsId != point.ObservationId)
+                    obsId != point.ObservationId))
                     return Error(OutcomeKind.StaleFrame,
                         "frameId and observationId must identify the same session frame", sw);
             var scope = _s?.ScopeHwnd ?? _s?.Rt?.ForegroundWindow()?.Hwnd;
@@ -5893,8 +5915,8 @@ public sealed class InbriskTools
         Text(JsonSerializer.Serialize(obj, J));
 
     private static ImagePoint? MakePoint(long? frameId, long? obsId, int? x, int? y)
-        => frameId is { } f && x is { } px && y is { } py
-            ? new ImagePoint(px, py, f, obsId ?? 0)
+        => x is { } px && y is { } py
+            ? new ImagePoint(px, py, frameId ?? 0, obsId ?? 0)
             : null;
 
     private static long? ParseHwnd(string? s)

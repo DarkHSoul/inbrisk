@@ -133,6 +133,13 @@ public static class McpHost
                     "POPUP & MODAL DIALOGS: Applications often open modal error boxes, confirmation dialogs, or wizards that disable their parent window. " +
                     "If a window seems unresponsive, check computer_windows or computer_observe for [MODAL/DIALOG] or [BLOCKED by modal] tags, or inspect the window — " +
                     "Inbrisk surfaces [MODAL-POPUP-ACTIVE] and inspects the modal dialog controls directly so you can dismiss or handle it first. " +
+                    "WINDOW FOCUS & NON-DISRUPTIVE INSPECTION POLICY: " +
+                    "Do not focus or activate a window merely because it is not foreground. If a target window is " +
+                    "[shown], not [minimized], and assigned to a visible monitor (e.g. secondary monitor), prefer non-disruptive inspection first: " +
+                    "1. UIA/computer_inspect or computer_find " +
+                    "2. monitor/window capture " +
+                    "3. screenshot of the target monitor (computer_screenshot with monitor index). " +
+                    "Only focus/activate the window when interaction explicitly requires foreground keyboard/mouse input or non-invasive inspection is insufficient. " +
                     "For multi-step deterministic UI work, " +
                     "prefer computer_run over issuing many individual " +
                     "computer tools. Use individual tools for exploration or " +

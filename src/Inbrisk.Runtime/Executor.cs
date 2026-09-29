@@ -132,6 +132,11 @@ public sealed class Executor
                     ?? throw new InbriskException(ErrorCode.NotFound, $"window 0x{wh:X} not found");
                 targetDesc = $"window '{window.Title}'";
             }
+            else if (intent.Kind is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText)
+            {
+                window = _windows.GetForegroundWindow();
+                if (window != null) targetDesc = $"foreground window '{window.Title}'";
+            }
 
             // --- guard: integrity level ---
             bool elevated;
@@ -319,6 +324,7 @@ public sealed class Executor
             {
                 if (window != null) GuardFocus(window, attempts);
                 if (element != null) FocusElement(element, attempts, ct);
+                else EnsureHoverInWindow(window, attempts);
                 var text = intent.Args?.TryGetValue("text", out var t) == true ? t?.ToString() ?? "" : "";
                 attempts.Add(Do(() => _input.TypeText(text), BackendId.Win32, "SendInput.type"));
                 return Ok(BackendId.Win32, "SendInput.type", attempts, sw);
@@ -328,6 +334,7 @@ public sealed class Executor
             {
                 if (window != null) GuardFocus(window, attempts);
                 if (element != null) FocusElement(element, attempts);
+                else EnsureHoverInWindow(window, attempts);
                 var key = ParseKey(intent.Args);
                 var count = Math.Clamp(
                     Convert.ToInt32(intent.Args?.TryGetValue("count", out var c) == true ? c : 1), 1, 200);
@@ -347,6 +354,7 @@ public sealed class Executor
             {
                 if (window != null) GuardFocus(window, attempts);
                 if (element != null) FocusElement(element, attempts);
+                else EnsureHoverInWindow(window, attempts);
                 var mods = ParseKeys(intent.Args, "modifiers");
                 var key = ParseKey(intent.Args);
                 attempts.Add(Do(() => _input.Hotkey(mods, key), BackendId.Win32, "SendInput.hotkey"));
@@ -534,5 +542,24 @@ public sealed class Executor
             foreach (var i in items)
                 if (Enum.TryParse<KeyCode>(i?.ToString(), true, out var kk)) list.Add(kk);
         return list;
+    }
+
+    private void EnsureHoverInWindow(WindowInfo? window, List<Attempt> attempts)
+    {
+        if (window == null) return;
+        try
+        {
+            var curPos = _input.CursorPosition();
+            var wb = window.Bounds;
+            if (wb.Width > 100 && wb.Height > 100 &&
+                (curPos.X < wb.X || curPos.X > wb.X + wb.Width ||
+                 curPos.Y < wb.Y + 50 || curPos.Y > wb.Y + wb.Height))
+            {
+                var targetX = wb.X + wb.Width / 2;
+                var targetY = wb.Y + Math.Max(60, wb.Height / 2);
+                attempts.Add(Do(() => _input.MoveMouse(targetX, targetY), BackendId.Win32, "SendInput.hoverToFocus"));
+            }
+        }
+        catch { }
     }
 }

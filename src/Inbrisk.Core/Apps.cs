@@ -57,7 +57,7 @@ public sealed record LaunchSpec(
     bool NewInstance = false,
     /// <summary>window|process|none — how far readiness waits.</summary>
     string WaitFor = "window",
-    int TimeoutMs = 10000,
+    int TimeoutMs = 25000,
     /// <summary>Optional remote debugging port (e.g. 9222 for Chrome DevTools Protocol).</summary>
     int? DebugPort = null);
 

@@ -283,6 +283,12 @@ public sealed class ActionResolver
         out string? error, out OutcomeKind rejectKind)
     {
         rejectKind = OutcomeKind.Malformed;
+        if (p.FrameId == 0)
+        {
+            // Direct screen/window coordinate (e.g. from OCR bounds or explicit coordinates without a video frame)
+            error = null;
+            return (p.X, p.Y);
+        }
         if (ctx.Frames.Count == 0)
         { error = "observation carried no frame — coordinates unusable"; return default; }
         if (!ctx.Frames.TryGetValue(p.FrameId, out var fref))
