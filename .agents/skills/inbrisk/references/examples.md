@@ -152,6 +152,27 @@ computer_run_recipe {name:"save-notepad", params:{filename:"b.txt"}}
 
 `save_as_recipe` also works on `computer_batch` and `computer_do`.
 
+## Reflex Engine — modal dialogs during a run
+
+```
+computer_run {enableReflex:true, autoDismissModals:"closeOnly", steps:[…]}
+  → a "Do you want to save?" dialog mid-run is cancelled silently
+    (background WM messages, no focus steal) and the plan resumes;
+    result carries reflex:{modals:[{title:"Save",action:"cancelled"}],
+    aborted:false}
+```
+
+A UAC prompt or unrecognized modal instead aborts the run:
+
+```
+→ {error:"InterruptedByDialog",
+   reflex:{modals:[{title:"User Account Control",…}],aborted:true}}
+```
+
+→ surface it to the user or replan — never click the security dialog or
+retry blindly. `autoDismissModals:"discard"` clicks Don't Save/Kaydetme;
+use it only when the task explicitly throws the work away.
+
 ## Session cleanup
 
 ```

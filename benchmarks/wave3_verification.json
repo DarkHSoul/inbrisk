@@ -1,0 +1,72 @@
+[
+  {
+    "name": "launch notepad",
+    "ok": true,
+    "detail": "{\"status\":\"Verified\",\"next\":\"inspect\",\"nextObservationRequired\":true,\"app\":\"notepad\",\"method\":\"AppPath\",\"process\":{\"pid\":24100},\"window\":{\"hwnd\":\"0x10A76\",\"titl"
+  },
+  {
+    "name": "hwnd captured",
+    "ok": true,
+    "detail": "{\"status\":\"Verified\",\"next\":\"inspect\",\"nextObservationRequired\":true,\"app\":\"notepad\",\"method\":\"AppPath\",\"process\":{\"pid\":24100},\"window\":{\"hwnd\":\"0x10A76\",\"titl"
+  },
+  {
+    "name": "S1 run completed over dismissed modal",
+    "ok": true,
+    "detail": "},\"runId\":\"r_56003880\",\"reflex\":{\"enabled\":true,\"mode\":\"closeOnly\",\"modals\":[{\"hwnd\":\"0x3B0338\",\"title\":\"Update available\",\"disposition\":\"Update\",\"actionTaken\":\"ClickButton\",\"reason\":\"update nag \\u2192 \\u0027Cancel\\u0027 (bm_click)\",\"ms\":42}],\"aborted\":false}}"
+  },
+  {
+    "name": "S1 reflex.modals non-empty",
+    "ok": true,
+    "detail": "\"modals\":[{\"hwnd\":\"0x3B0338\",\"title\":\"Update available\",\"disposition\":\"Update\",\"actionTaken\":\"ClickButton\",\"reason\":\"update nag \\u2192 \\u0027Cancel\\u0027 (bm_click)\",\"ms\":42}],\"aborted\":false}}"
+  },
+  {
+    "name": "S1 reflex.aborted != true",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "S1 modal was clicked (helper exited)",
+    "ok": true,
+    "detail": "helper still alive -> modal never clicked"
+  },
+  {
+    "name": "S3 abort -> InterruptedByDialog",
+    "ok": true,
+    "detail": "\",\"disposition\":\"GenericConfirm\",\"reason\":\"unclassified confirm-style dialog; buttons: Yes, No\",\"buttons\":[\"Yes\",\"No\"]},\"failedStep\":1,\"error\":\"unclassified confirm-style dialog; buttons: Yes, No\",\"resume\":\"computer_resume_run({runId:\\u0022r_19991e8b\\u0022})\"}"
+  },
+  {
+    "name": "S3 reflex.aborted true",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "S3 unknown modal NOT clicked",
+    "ok": true,
+    "detail": "helper exited -> something clicked it"
+  },
+  {
+    "name": "S4 enableReflex:false -> run blocked/paused",
+    "ok": true,
+    "detail": "ex\":{\"enabled\":false,\"mode\":\"closeOnly\",\"modals\":[],\"aborted\":false},\"failedStep\":1,\"error\":\"new window 0x13A09C4 \\u0022Update available\\u0022 appeared \\u2014 inspect its elements before resuming\",\"resume\":\"computer_resume_run({runId:\\u0022r_016eeb81\\u0022})\"}"
+  },
+  {
+    "name": "S4 modal NOT dismissed by reflex",
+    "ok": true,
+    "detail": "helper exited"
+  },
+  {
+    "name": "perf reflex.intercept present",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "perf reflex.dismiss present",
+    "ok": true,
+    "detail": ""
+  },
+  {
+    "name": "cleanup",
+    "ok": true,
+    "detail": "{\"pending\":1,\"reaped\":1,\"skipped\":[],\"pendingRemaining\":0,\"elapsedMs\":2038}"
+  }
+]

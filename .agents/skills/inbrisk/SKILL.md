@@ -110,7 +110,9 @@ Batch steps are compact — `do`/`t`/`v`/`role`/`keys` — NOT
   escalate or retry with force**), `ConfirmationDenied` (dangerous action
   requires local human consent — **report to the user, do not bypass**),
   `EmergencyStopped` (all control halted — only the local user can resume
-  with `Ctrl+Alt+Shift+Pause`; **stop working and tell the user**).
+  with `Ctrl+Alt+Shift+Pause`; **stop working and tell the user**),
+  `InterruptedByDialog` (a security/unknown modal aborted the reflex
+  engine — **surface to the user or replan, don't retry blindly**).
 
 ## Silent execution, OCR, recipes & session hygiene (new wave)
 
@@ -136,6 +138,26 @@ Batch steps are compact — `do`/`t`/`v`/`role`/`keys` — NOT
 - **Blender bridge**: `computer_adapter{adapter:"blender",
   action:"auto_install"}` is a one-time install; launching Blender
   afterwards auto-injects the `--python` bridge.
+
+## Reflex Engine — modal auto-dismiss while a plan runs
+
+- `computer_run`/`computer_batch`/`computer_do` accept `enableReflex`
+  (default **true**). While a plan runs, unexpected modal dialogs —
+  update prompts, save confirmations, error dialogs, cookie banners —
+  are intercepted and dismissed in the background via WM messages (no
+  focus steal), then the plan resumes.
+- `autoDismissModals`: `"off"` | `"save"` | `"discard"` | `"closeOnly"`.
+  Default `"closeOnly"` — save prompts are **cancelled, never
+  committed**. `"save"` clicks Save/Kaydet; `"discard"` clicks
+  Don't Save/Kaydetme — use `discard` **only** when the task explicitly
+  throws the work away.
+- Fail-safe: UAC/credential/security dialogs are **never** auto-clicked —
+  they abort the run with `InterruptedByDialog` plus the modal's details.
+  Unknown/unrecognized modals abort too (never blind-clicked).
+- The result JSON carries `reflex:{modals:[…], aborted}` telemetry —
+  read it to see exactly what was dismissed or what stopped the run.
+- Treat `InterruptedByDialog` as "surface to the user or replan", not a
+  retry signal — see references/safety.md.
 
 ## Safety rules (enforced server-side — don't fight them)
 

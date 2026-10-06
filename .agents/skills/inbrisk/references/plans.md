@@ -62,6 +62,30 @@ entries may be `verify`-flagged, so fall back to observe if one misses.
 `ifExists`/`ifNotExists`/`ifEnabled`/`ifValue` skip a step without failing —
 use them for "only click if the dialog exists" logic.
 
+## Reflex Engine — modal dialogs mid-run
+
+`enableReflex` (default **true**) on `computer_run`/`computer_batch`/
+`computer_do` watches for modal dialogs while the plan executes and
+dismisses recognized ones in the background via WM messages (no focus
+steal): update prompts, save confirmations, error dialogs, cookie
+banners. The plan then resumes automatically.
+
+`autoDismissModals` controls the disposition:
+
+| Value | Behavior |
+|---|---|
+| `"closeOnly"` (default) | Cancel/close only — save prompts are cancelled, **never committed** |
+| `"save"` | Save prompts click Save/Kaydet |
+| `"discard"` | Save prompts click Don't Save/Kaydetme — **only** when the task explicitly discards the work |
+| `"off"` | Reflex disabled; modals block the run as before |
+
+UAC/credential/security dialogs and unknown modals are never clicked —
+the run aborts with `error:"InterruptedByDialog"` plus the modal's
+title/buttons. The result carries `reflex:{modals:[{title,action,…}],
+aborted}` so you can see exactly what was dismissed or what stopped the
+run. On `InterruptedByDialog`: read the modal details, then surface to
+the user or replan — don't retry blindly (the same dialog will re-fire).
+
 ## Do NOT
 
 - Don't chain N single-tool calls when a plan expresses the same flow —
@@ -71,3 +95,5 @@ use them for "only click if the dialog exists" logic.
   the lighter-weight alternative to `computer_run`.
 - Don't re-observe after every step — the `delta` reports what changed.
 - Don't use raw coordinates when an `elementId`/semantic target exists.
+- Don't set `autoDismissModals:"discard"` unless the task explicitly
+  discards the work — it clicks Don't Save/Kaydetme for real.
