@@ -89,6 +89,9 @@ public interface IGhostPipWindowHost : IDisposable
 
     /// <summary>Dynamically repositions and resizes the window.</summary>
     void SetPositionAndSize(int x, int y, int width, int height);
+
+    /// <summary>Raised when the window is dragged or moved.</summary>
+    event Action<int, int>? PositionChanged;
 }
 
 #endregion
@@ -334,9 +337,23 @@ public class GhostPipManager : IDisposable
 
             // 2. Start high-performance renderer
             _renderer = new GhostPipRenderer(_currentConfig.SharedBufferMapName, _currentConfig.TargetFps);
+            _renderer.IsInteractive = _isInteractive;
             if (_windowHost.Hwnd != IntPtr.Zero)
             {
                 _renderer.StartRendering(_windowHost.Hwnd);
+            }
+
+            if (_windowHost != null)
+            {
+                _windowHost.PositionChanged += (newX, newY) =>
+                {
+                    lock (_gate)
+                    {
+                        _currentX = newX;
+                        _currentY = newY;
+                        _currentPosition = PipPresetPosition.Custom;
+                    }
+                };
             }
 
             _isRunning = true;
@@ -404,6 +421,10 @@ public class GhostPipManager : IDisposable
         {
             _isInteractive = interactive;
             _windowHost?.SetClickThrough(!interactive);
+            if (_renderer != null)
+            {
+                _renderer.IsInteractive = interactive;
+            }
         }
     }
 
@@ -605,7 +626,20 @@ public class GhostPipManager : IDisposable
             _setClickThroughMethod = t.GetMethod("SetClickThrough", new[] { typeof(bool) });
             _setOpacityMethod = t.GetMethod("SetOpacity", new[] { typeof(byte) });
             _setPosSizeMethod = t.GetMethod("SetPositionAndSize", new[] { typeof(int), typeof(int), typeof(int), typeof(int) });
+
+            try
+            {
+                var ev = t.GetEvent("PositionChanged");
+                if (ev != null)
+                {
+                    Action<int, int> handler = (nx, ny) => PositionChanged?.Invoke(nx, ny);
+                    ev.AddEventHandler(_instance, handler);
+                }
+            }
+            catch { }
         }
+
+        public event Action<int, int>? PositionChanged;
 
         public IntPtr Hwnd => (IntPtr)(_hwndProp?.GetValue(_instance) ?? IntPtr.Zero);
         public bool IsRunning => (bool)(_isRunningProp?.GetValue(_instance) ?? false);
@@ -898,6 +932,8 @@ public class GhostPipManager : IDisposable
                 catch { }
             }
         }
+
+        public event Action<int, int>? PositionChanged;
 
         public void Dispose()
         {

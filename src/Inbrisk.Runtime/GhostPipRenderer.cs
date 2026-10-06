@@ -155,6 +155,25 @@ public sealed class GhostPipRenderer : IDisposable
 
         [DllImport("gdi32.dll")]
         public static extern bool Ellipse(IntPtr hdc, int left, int top, int right, int bottom);
+
+        [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool TextOutW(IntPtr hdc, int x, int y, string lpString, int nCount);
+
+        [DllImport("gdi32.dll")]
+        public static extern uint SetTextColor(IntPtr hdc, uint crColor);
+
+        [DllImport("gdi32.dll")]
+        public static extern int SetBkMode(IntPtr hdc, int iBkMode);
+
+        [DllImport("user32.dll")]
+        public static extern int FillRect(IntPtr hDC, ref RECT lprc, IntPtr hbr);
+
+        [DllImport("gdi32.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr CreateFontW(
+            int nHeight, int nWidth, int nEscapement, int nOrientation, int fnWeight,
+            uint fdwItalic, uint fdwUnderline, uint fdwStrikeOut, uint fdwCharSet,
+            uint fdwOutputPrecision, uint fdwClipPrecision, uint fdwQuality,
+            uint fdwPitchAndFamily, string lpszFace);
     }
 
     private static uint RGB(byte r, byte g, byte b) => (uint)(r | (g << 8) | (b << 16));
@@ -218,6 +237,12 @@ public sealed class GhostPipRenderer : IDisposable
 
     /// <summary>Sequence number of the most recently rendered desktop frame.</summary>
     public long LastRenderedFrameIndex => Volatile.Read(ref _lastFrameIndex);
+
+    /// <summary>Height of the top drag handle bar in pixels when interactive.</summary>
+    public const int HeaderHeight = 26;
+
+    /// <summary>Gets or sets whether interactive mode is active (draws drag header bar).</summary>
+    public volatile bool IsInteractive = false;
 
     /// <summary>Total number of frames successfully presented to the PiP window.</summary>
     public long TotalRenderedFrames => Volatile.Read(ref _totalRenderedFrames);
@@ -616,17 +641,21 @@ public sealed class GhostPipRenderer : IDisposable
             bmi.bmiHeader.biCompression = 0; // BI_RGB
             bmi.bmiHeader.biSizeImage = (uint)(stride * srcHeight);
 
+            int headerOffset = IsInteractive ? HeaderHeight : 0;
+            int renderHeight = destHeight - headerOffset;
+            if (renderHeight <= 2) renderHeight = destHeight;
+
             // Fast hardware-assisted stretch directly from unmanaged shared memory
             Native.StretchDIBits(
                 _cachedHdcMem,
-                0, 0, destWidth, destHeight,
+                0, headerOffset, destWidth, renderHeight,
                 0, 0, srcWidth, srcHeight,
                 pPixels,
                 ref bmi,
                 DIB_RGB_COLORS,
                 SRCCOPY);
 
-            // Paint modern UI overlay (border & live dot)
+            // Paint modern UI overlay (border & live dot, plus drag handle when interactive)
             DrawModernUiOverlay(_cachedHdcMem, destWidth, destHeight);
 
             // Composite final frame atomically to window DC with zero flicker
@@ -654,6 +683,45 @@ public sealed class GhostPipRenderer : IDisposable
 
     private void DrawModernUiOverlay(IntPtr hdc, int width, int height)
     {
+        // 0. Drag Header Bar (Shown when interactive mode is active)
+        if (IsInteractive)
+        {
+            // Dark Header Background (#181820)
+            RECT rcHeader = new RECT { Left = 0, Top = 0, Right = width, Bottom = HeaderHeight };
+            IntPtr hHeaderBrush = Native.CreateSolidBrush(RGB(24, 24, 32));
+            Native.FillRect(hdc, ref rcHeader, hHeaderBrush);
+            Native.DeleteObject(hHeaderBrush);
+
+            // Cyan divider line at bottom of header (#06B6D4)
+            IntPtr hDividerPen = Native.CreatePen(PS_SOLID, 1, RGB(6, 182, 212));
+            IntPtr hOldPen = Native.SelectObject(hdc, hDividerPen);
+            IntPtr hOldBrush = Native.SelectObject(hdc, Native.GetStockObject(HOLLOW_BRUSH));
+            Native.Rectangle(hdc, 0, HeaderHeight - 1, width, HeaderHeight);
+            Native.SelectObject(hdc, hOldBrush);
+            Native.SelectObject(hdc, hOldPen);
+            Native.DeleteObject(hDividerPen);
+
+            // Drag handle grip and text
+            IntPtr hFont = Native.CreateFontW(
+                13, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
+            IntPtr hOldFont = Native.SelectObject(hdc, hFont);
+            Native.SetBkMode(hdc, 1); // TRANSPARENT
+
+            // Title and Grip Icon
+            Native.SetTextColor(hdc, RGB(224, 231, 255)); // Soft White/Cyan
+            string titleText = "\u283F Inbrisk Ghost  [Taşı / Drag]";
+            Native.TextOutW(hdc, 8, 5, titleText, titleText.Length);
+
+            // Interactive Badge
+            Native.SetTextColor(hdc, RGB(34, 197, 94)); // Emerald Green
+            string badgeText = "● CANLI / INTERACTIVE";
+            int badgeX = Math.Max(width - 160, 170);
+            Native.TextOutW(hdc, badgeX, 5, badgeText, badgeText.Length);
+
+            Native.SelectObject(hdc, hOldFont);
+            Native.DeleteObject(hFont);
+        }
+
         // 1. Sleek subtle border around the outer perimeter
         if (ShowBorder)
         {

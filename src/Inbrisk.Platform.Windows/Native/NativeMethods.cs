@@ -420,6 +420,11 @@ internal static class NativeMethods
 
     public const uint WM_NCHITTEST = 0x0084;
     public const int HTTRANSPARENT = -1;
+    public const int HTCLIENT = 1;
+    public const int HTCAPTION = 2;
+    public const int HTBOTTOMRIGHT = 17;
+
+    [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
     public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDOWN = 0x0201;
     public const uint WM_LBUTTONUP = 0x0202;

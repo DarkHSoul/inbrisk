@@ -17,7 +17,7 @@ namespace Inbrisk.Platform.Windows;
 public static class GhostUserProvisioner
 {
     public const string DefaultGhostUsername = "InbriskAgent";
-    public const string DefaultGhostPassword = "InbriskGhost!2026#Agent";
+    public const string DefaultGhostPassword = "Inbrisk#2026!G";
 
     [DllImport("netapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern int NetUserGetInfo(
@@ -123,22 +123,24 @@ public static class GhostUserProvisioner
 
         string effectivePassword = string.IsNullOrEmpty(password) ? DefaultGhostPassword : password;
 
-        // 1. Try 'net.exe user <name> <password> /add ...'
-        string netArgs = $"user \"{cleanName}\" \"{effectivePassword}\" /add /comment:\"Inbrisk Dedicated Ghost Agent\" /passwordchg:no /expires:never";
-        var (exitCode, _, _) = await Task.Run(() => RunProcess("net.exe", netArgs)).ConfigureAwait(false);
+        // 1. Try 'cmd.exe /c echo Y | net.exe user <name> <password> /add ...'
+        // Using cmd pipe ensures that even if Windows prompts for password length compatibility, Y is supplied automatically.
+        string cmdArgs = $"/c \"echo Y | net.exe user \"{cleanName}\" \"{effectivePassword}\" /add /comment:\"Inbrisk Dedicated Ghost Agent\" /passwordchg:no /expires:never\"";
+        var (exitCode, _, _) = await Task.Run(() => RunProcess("cmd.exe", cmdArgs)).ConfigureAwait(false);
 
         if (exitCode == 0 || DoesUserExist(cleanName))
         {
             return true;
         }
 
-        // 2. Fallback: PowerShell New-LocalUser
+        // 2. Fallback: PowerShell New-LocalUser via -EncodedCommand (avoids quoting & $ variable issues)
         try
         {
             string escapedPwd = effectivePassword.Replace("'", "''");
             string psScript = $"$p = ConvertTo-SecureString '{escapedPwd}' -AsPlainText -Force; " +
                               $"New-LocalUser -Name '{cleanName}' -Password $p -Description 'Inbrisk Dedicated Ghost Agent' -PasswordNeverExpires";
-            string psArgs = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{psScript}\"";
+            string base64 = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(psScript));
+            string psArgs = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {base64}";
             var (psExit, _, _) = await Task.Run(() => RunProcess("powershell.exe", psArgs)).ConfigureAwait(false);
             if (psExit == 0 || DoesUserExist(cleanName))
             {
@@ -177,11 +179,12 @@ public static class GhostUserProvisioner
             return true;
         }
 
-        // 2. Fallback: PowerShell Add-LocalGroupMember via Well-Known SID
+        // 2. Fallback: PowerShell Add-LocalGroupMember via Well-Known SID with -EncodedCommand
         try
         {
             string psScript = $"$group = Get-LocalGroup -SID 'S-1-5-32-555'; Add-LocalGroupMember -Group $group -Member '{cleanName}'";
-            string psArgs = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{psScript}\"";
+            string base64 = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(psScript));
+            string psArgs = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {base64}";
             var (psExit, psOut, psErr) = await Task.Run(() => RunProcess("powershell.exe", psArgs)).ConfigureAwait(false);
             if (psExit == 0 || IsAlreadyMember(psOut, psErr))
             {

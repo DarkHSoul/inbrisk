@@ -65,6 +65,14 @@ public sealed class GhostPipWindowHost : IDisposable
     /// </summary>
     public event Action<GhostPipWindowHost>? WindowDestroyed;
 
+    /// <summary>Height of the top drag handle bar in pixels when interactive.</summary>
+    public const int HeaderHeight = 26;
+
+    /// <summary>
+    /// Raised when the user drags or resizes the PiP window.
+    /// </summary>
+    public event Action<int, int>? PositionChanged;
+
     /// <summary>
     /// Gets the native Win32 window handle (HWND).
     /// </summary>
@@ -533,6 +541,38 @@ public sealed class GhostPipWindowHost : IDisposable
                 if (_clickThrough)
                 {
                     return new IntPtr(NativeMethods.HTTRANSPARENT);
+                }
+
+                // Interactive Mode:
+                int screenX = unchecked((short)(long)lParam);
+                int screenY = unchecked((short)((long)lParam >> 16));
+                var pt = new POINT { X = screenX, Y = screenY };
+                NativeMethods.ScreenToClient(hWnd, ref pt);
+
+                // Bottom-right resize handle (14x14 corner)
+                if (pt.X >= _width - 14 && pt.Y >= _height - 14)
+                {
+                    return new IntPtr(NativeMethods.HTBOTTOMRIGHT);
+                }
+
+                // Top header drag bar (0 <= Y < HeaderHeight) -> Native Windows smooth dragging!
+                if (pt.Y >= 0 && pt.Y < HeaderHeight)
+                {
+                    return new IntPtr(NativeMethods.HTCAPTION);
+                }
+
+                return new IntPtr(NativeMethods.HTCLIENT);
+
+            case 0x0232: // WM_EXITSIZEMOVE
+            case 0x0003: // WM_MOVE
+            case 0x0005: // WM_SIZE
+                if (NativeMethods.GetWindowRect(hWnd, out var wr))
+                {
+                    _x = wr.Left;
+                    _y = wr.Top;
+                    _width = wr.Right - wr.Left;
+                    _height = wr.Bottom - wr.Top;
+                    PositionChanged?.Invoke(_x, _y);
                 }
                 break;
 
