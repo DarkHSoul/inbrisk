@@ -1,22 +1,54 @@
-# Inbrisk Automation Examples
+# Examples (C# MCP)
 
-## 1. Launch Notepad and Write Text
-```json
-{
-  "steps": [
-    { "action": "launch", "app": "notepad" },
-    { "action": "wait", "window": { "title": "Notepad" } },
-    { "action": "set_value", "target": { "role": "document" }, "value": "INBRISK_NATIVE_FAST_PATH_OK" }
-  ]
-}
+All calls are MCP tool calls on the `inbrisk` server.
+
+## Find an element and click it
+
+```
+computer_find {process:"notepad", role:"document", limit:3}
+  → [uia_11076_40] Document "Metin düzenleyici" …
+computer_click {elementId:"uia_11076_40"}
+  → success, method:"UIA.LegacyIAccessible.DoDefaultAction", durationMs:317,
+    delta:{…}, provenance:{untrusted:true,…}
 ```
 
-## 2. Inspect Window Tree
-```bash
-inbrisk-cli observe --window "Notepad" --depth 2 --json
+## Multi-step in one call
+
+```
+computer_run {steps:[
+  {action:"launch", app:"notepad", waitFor:"window", timeoutMs:15000},
+  {action:"find", as:"doc", target:{process:"notepad", role:"document"}},
+  {action:"set_value", elementId:"$doc", text:"hello"},
+  {action:"hotkey", keys:"ctrl+s"}
+]}
 ```
 
-## 3. Verify Fast Path
-```bash
-inbrisk-cli fast-path verify --json
+## Screenshot with marks → click by ID
+
 ```
+computer_screenshot {target:"window", hwnd:"0x310516", maxWidth:1200, marks:true}
+  → frameId=12 … marks: 1 → uia_… "Save" button, 2 → uia_… "Cancel" …
+computer_click {elementId:"uia_…"}
+```
+
+## Ambiguity
+
+```
+computer_focus_window {process:"notepad"}
+  → AmbiguousTarget, candidates:[{hwnd,title,pid} ×4]
+  → retry: computer_focus_window {process:"notepad", window:"*Untitled"}
+```
+
+## Refusals — final, do not retry harder
+
+```
+computer_app_shutdown {pid:<explorer>}      → PolicyDenied (host/ancestor)
+computer_close_window {hwnd:<foreign>}      → PolicyDenied (CanAgentClose)
+computer_close_window {hwnd:X, force:true}  → SharedProcessKillRefused
+computer_hotkey {modifiers:["alt"],key:"F4"}→ ConfirmationDenied (local consent)
+```
+
+## Emergency
+
+Any result `{"error":"EmergencyStopped"}` → control is halted machine-wide.
+Only the local user resumes (Ctrl+Alt+Shift+Pause). Stop and inform them.
