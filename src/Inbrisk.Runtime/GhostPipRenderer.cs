@@ -734,20 +734,37 @@ public sealed class GhostPipRenderer : IDisposable
                 : "\u283F Ghost  [Taşı]";
             Native.TextOutW(hdc, 8, 5, titleText, titleText.Length);
 
-            // Action Buttons at far right of header: Expand [ 🗖 ] and Minimize [ ─ ]
+            // 3 Standard Windows Caption Buttons at far right of header:
+            // 1. Minimize / Arka Plana At [ ─ ] at width - 96 .. width - 64
+            RECT rcMin = new RECT { Left = width - 96, Top = 2, Right = width - 66, Bottom = HeaderHeight - 2 };
+            IntPtr hMinBrush = Native.CreateSolidBrush(RGB(35, 38, 50));
+            Native.FillRect(hdc, ref rcMin, hMinBrush);
+            Native.DeleteObject(hMinBrush);
             Native.SetTextColor(hdc, RGB(203, 213, 225)); // Slate-300
-            string expandBtn = "[ 🗖 ]";
-            Native.TextOutW(hdc, width - 54, 5, expandBtn, expandBtn.Length);
+            Native.TextOutW(hdc, width - 85, 4, "─", 1);
 
-            string minBtn = "[ ─ ]";
-            Native.TextOutW(hdc, width - 26, 5, minBtn, minBtn.Length);
+            // 2. Maximize / Tam Ekran     [ 🗖 ] at width - 64 .. width - 32
+            RECT rcMax = new RECT { Left = width - 64, Top = 2, Right = width - 34, Bottom = HeaderHeight - 2 };
+            IntPtr hMaxBrush = Native.CreateSolidBrush(RGB(35, 38, 50));
+            Native.FillRect(hdc, ref rcMax, hMaxBrush);
+            Native.DeleteObject(hMaxBrush);
+            Native.SetTextColor(hdc, RGB(203, 213, 225)); // Slate-300
+            Native.TextOutW(hdc, width - 53, 4, "🗖", 1);
+
+            // 3. Close / Kapat            [ ✕ ] at width - 32 .. width
+            RECT rcClose = new RECT { Left = width - 32, Top = 2, Right = width - 2, Bottom = HeaderHeight - 2 };
+            IntPtr hCloseBrush = Native.CreateSolidBrush(RGB(65, 25, 30)); // Subtle dark crimson red
+            Native.FillRect(hdc, ref rcClose, hCloseBrush);
+            Native.DeleteObject(hCloseBrush);
+            Native.SetTextColor(hdc, RGB(248, 113, 113)); // Bright Red-400
+            Native.TextOutW(hdc, width - 21, 4, "✕", 1);
 
             // Interactive Live Badge
-            if (width >= 340)
+            if (width >= 350)
             {
                 Native.SetTextColor(hdc, RGB(34, 197, 94)); // Emerald Green
-                string badgeText = width >= 480 ? "● CANLI / INTERACTIVE" : "● CANLI";
-                int badgeX = Math.Max(width - (width >= 480 ? 220 : 130), 170);
+                string badgeText = width >= 500 ? "● CANLI / ETKİLEŞİMLİ" : "● CANLI";
+                int badgeX = Math.Max(width - (width >= 500 ? 270 : 180), 160);
                 Native.TextOutW(hdc, badgeX, 5, badgeText, badgeText.Length);
             }
 

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using Inbrisk.Core;
 using Inbrisk.Platform.Windows.Native;
@@ -249,6 +250,20 @@ public sealed class GhostDesktopInput : IDisposable
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
 
+        public delegate bool EnumDesktopWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool EnumDesktopWindows(IntPtr hDesktop, EnumDesktopWindowsProc lpfn, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsIconic(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
         [DllImport("user32.dll")]
         public static extern IntPtr WindowFromPoint(POINT Point);
 
@@ -409,11 +424,22 @@ public sealed class GhostDesktopInput : IDisposable
         }
     }
 
-    private void WorkerLoop()
+    private void EnsureDesktopAttached()
     {
+        if (_hDesktop != IntPtr.Zero) return;
+
         try
         {
             _hDesktop = Win32.OpenDesktopW(_desktopName, 0, false, DESKTOP_ALL_ACCESS);
+            if (_hDesktop == IntPtr.Zero)
+            {
+                _hDesktop = Win32.OpenDesktopW(
+                    _desktopName,
+                    0,
+                    false,
+                    0x0001 | 0x0040 | 0x0080 | 0x0002);
+            }
+
             if (_hDesktop == IntPtr.Zero)
             {
                 _hDesktop = Win32.CreateDesktopW(
@@ -428,17 +454,19 @@ public sealed class GhostDesktopInput : IDisposable
             if (_hDesktop != IntPtr.Zero)
             {
                 _isDesktopBound = Win32.SetThreadDesktop(_hDesktop);
-                if (!_isDesktopBound)
-                {
-                    int err = Marshal.GetLastWin32Error();
-                    Debug.WriteLine($"[GhostDesktopInput] SetThreadDesktop failed for '{_desktopName}', win32 error={err}");
-                }
             }
-            else
-            {
-                int err = Marshal.GetLastWin32Error();
-                Debug.WriteLine($"[GhostDesktopInput] Open/CreateDesktop failed for '{_desktopName}', win32 error={err}");
-            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[GhostDesktopInput] EnsureDesktopAttached error: {ex.Message}");
+        }
+    }
+
+    private void WorkerLoop()
+    {
+        try
+        {
+            EnsureDesktopAttached();
         }
         catch (Exception ex)
         {
@@ -568,12 +596,12 @@ public sealed class GhostDesktopInput : IDisposable
             {
                 _lastTargetHwnd = hwnd;
                 IntPtr root = Win32.GetAncestor(hwnd, 2 /* GA_ROOT */);
-                if (root != IntPtr.Zero)
-                {
-                    Win32.SetForegroundWindow(root);
-                    Win32.SetActiveWindow(root);
-                }
+                if (root == IntPtr.Zero) root = hwnd;
+
+                Win32.SetForegroundWindow(root);
+                Win32.SetActiveWindow(root);
                 Win32.SetFocus(hwnd);
+                Win32.PostMessageW(root, WM_ACTIVATE, (IntPtr)1 /* WA_ACTIVE */, IntPtr.Zero);
                 Win32.PostMessageW(hwnd, WM_SETFOCUS, IntPtr.Zero, IntPtr.Zero);
             }
 
@@ -596,6 +624,7 @@ public sealed class GhostDesktopInput : IDisposable
             }
 
             IntPtr lParam = MakeLParam(clientPt.X, clientPt.Y);
+            Win32.PostMessageW(hwnd, WM_MOUSEMOVE, (IntPtr)_heldMouseKeys, lParam);
             Win32.PostMessageW(hwnd, msg, (IntPtr)_heldMouseKeys, lParam);
         });
     }
@@ -617,6 +646,13 @@ public sealed class GhostDesktopInput : IDisposable
             if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
             {
                 _lastTargetHwnd = hwnd;
+            }
+            else if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd))
+            {
+                hwnd = _lastTargetHwnd;
+                POINT pt = new POINT { X = desktopX, Y = desktopY };
+                Win32.ScreenToClient(hwnd, ref pt);
+                clientPt = pt;
             }
 
             uint msg;
@@ -853,7 +889,7 @@ public sealed class GhostDesktopInput : IDisposable
         RunOnGhostThread(() =>
         {
             IntPtr targetHwnd = FindKeyboardTarget();
-            if (targetHwnd == IntPtr.Zero) return;
+            if (targetHwnd == IntPtr.Zero || targetHwnd == Win32.GetDesktopWindow()) return;
 
             for (int i = 0; i < text.Length; i++)
             {
@@ -863,21 +899,18 @@ public sealed class GhostDesktopInput : IDisposable
                 if (c == '\n')
                 {
                     SendKeyPressCore(targetHwnd, VirtualKey.Enter);
-                    Thread.Sleep(5);
                     continue;
                 }
 
                 if (c == '\t')
                 {
                     SendKeyPressCore(targetHwnd, VirtualKey.Tab);
-                    Thread.Sleep(5);
                     continue;
                 }
 
                 uint scanCode = Win32.MapVirtualKeyW((uint)c, MAPVK_VK_TO_VSC);
                 uint lParam = 1 | (scanCode << 16);
                 Win32.PostMessageW(targetHwnd, WM_CHAR, (IntPtr)c, (IntPtr)lParam);
-                Thread.Sleep(5);
             }
         });
     }
@@ -1094,46 +1127,97 @@ public sealed class GhostDesktopInput : IDisposable
 
     /// <summary>
     /// Resolves the specific target HWND and computes client coordinates for a given ghost desktop point.
-    /// Uses WindowFromPoint and ChildWindowFromPointEx on the thread bound to the ghost desktop.
+    /// Enumerates visible windows specifically on the isolated ghost desktop (_hDesktop) in Z-order.
     /// </summary>
     private IntPtr GetWindowAtPoint(int desktopX, int desktopY, out POINT clientPt)
     {
-        var screenPt = new POINT { X = desktopX, Y = desktopY };
-        IntPtr hwnd = Win32.WindowFromPoint(screenPt);
+        EnsureDesktopAttached();
 
-        if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd))
+        IntPtr hitTopHwnd = IntPtr.Zero;
+
+        if (_hDesktop != IntPtr.Zero)
         {
-            hwnd = Win32.GetDesktopWindow();
-        }
-        else
-        {
-            // Drill down into visible child controls if present
-            var ptInWindow = screenPt;
-            if (Win32.ScreenToClient(hwnd, ref ptInWindow))
+            Win32.EnumDesktopWindows(_hDesktop, (hWnd, lParam) =>
             {
-                IntPtr child = Win32.ChildWindowFromPointEx(
-                    hwnd,
-                    ptInWindow,
-                    CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
-
-                if (child != IntPtr.Zero && child != hwnd && Win32.IsWindow(child))
+                if (hWnd == IntPtr.Zero || !Win32.IsWindow(hWnd) || !Win32.IsWindowVisible(hWnd) || Win32.IsIconic(hWnd))
                 {
-                    hwnd = child;
+                    return true;
                 }
-            }
+
+                if (!Win32.GetWindowRect(hWnd, out RECT rect))
+                {
+                    return true;
+                }
+
+                int w = rect.Right - rect.Left;
+                int h = rect.Bottom - rect.Top;
+                if (w <= 16 || h <= 16)
+                {
+                    return true;
+                }
+
+                var sbClass = new StringBuilder(256);
+                Win32.GetClassNameW(hWnd, sbClass, 256);
+                string cls = sbClass.ToString();
+
+                if (string.Equals(cls, "Progman", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "WorkerW", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "tooltips_class32", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Default IME", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                if (desktopX >= rect.Left && desktopX < rect.Right &&
+                    desktopY >= rect.Top && desktopY < rect.Bottom)
+                {
+                    hitTopHwnd = hWnd;
+                    return false; // Found topmost hit!
+                }
+
+                return true;
+            }, IntPtr.Zero);
         }
 
-        clientPt = screenPt;
-        if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
+        if (hitTopHwnd == IntPtr.Zero)
         {
-            Win32.ScreenToClient(hwnd, ref clientPt);
+            clientPt = new POINT { X = desktopX, Y = desktopY };
+            return Win32.GetDesktopWindow();
         }
 
-        return hwnd;
+        // Drill down into visible child controls
+        IntPtr targetHwnd = hitTopHwnd;
+        POINT curPt = new POINT { X = desktopX, Y = desktopY };
+        Win32.ScreenToClient(targetHwnd, ref curPt);
+
+        while (true)
+        {
+            IntPtr child = Win32.ChildWindowFromPointEx(
+                targetHwnd,
+                curPt,
+                CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT);
+
+            if (child == IntPtr.Zero || child == targetHwnd || !Win32.IsWindow(child))
+            {
+                break;
+            }
+
+            POINT screenPt = new POINT { X = desktopX, Y = desktopY };
+            Win32.ScreenToClient(child, ref screenPt);
+            curPt = screenPt;
+            targetHwnd = child;
+        }
+
+        clientPt = curPt;
+        return targetHwnd;
     }
 
     /// <summary>
     /// Dynamically locates the active keyboard input target window on the ghost desktop.
+    /// Strictly restricts targets to windows belonging to the isolated desktop (_hDesktop).
     /// </summary>
     private IntPtr FindKeyboardTarget()
     {
@@ -1143,11 +1227,10 @@ public sealed class GhostDesktopInput : IDisposable
             return TargetHwnd.Value;
         }
 
-        // 2. Focused control on the active thread
-        IntPtr fg = Win32.GetForegroundWindow();
-        if (fg != IntPtr.Zero && Win32.IsWindow(fg))
+        // 2. Last target window touched by mouse actions on the ghost desktop
+        if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd))
         {
-            uint threadId = Win32.GetWindowThreadProcessId(fg, out _);
+            uint threadId = Win32.GetWindowThreadProcessId(_lastTargetHwnd, out _);
             if (threadId != 0)
             {
                 var gui = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
@@ -1159,13 +1242,57 @@ public sealed class GhostDesktopInput : IDisposable
                         return gui.hwndActive;
                 }
             }
-            return fg;
+            return _lastTargetHwnd;
         }
 
-        // 3. Last target window touched by mouse actions
-        if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd))
+        // 3. Topmost visible window on _hDesktop
+        EnsureDesktopAttached();
+        IntPtr topWin = IntPtr.Zero;
+        if (_hDesktop != IntPtr.Zero)
         {
-            return _lastTargetHwnd;
+            Win32.EnumDesktopWindows(_hDesktop, (hWnd, lParam) =>
+            {
+                if (hWnd == IntPtr.Zero || !Win32.IsWindow(hWnd) || !Win32.IsWindowVisible(hWnd) || Win32.IsIconic(hWnd))
+                {
+                    return true;
+                }
+
+                var sbClass = new StringBuilder(256);
+                Win32.GetClassNameW(hWnd, sbClass, 256);
+                string cls = sbClass.ToString();
+
+                if (string.Equals(cls, "Progman", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "WorkerW", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "tooltips_class32", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(cls, "Default IME", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                topWin = hWnd;
+                return false; // Found topmost
+            }, IntPtr.Zero);
+        }
+
+        if (topWin != IntPtr.Zero)
+        {
+            _lastTargetHwnd = topWin;
+            uint threadId = Win32.GetWindowThreadProcessId(topWin, out _);
+            if (threadId != 0)
+            {
+                var gui = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
+                if (Win32.GetGUIThreadInfo(threadId, ref gui))
+                {
+                    if (gui.hwndFocus != IntPtr.Zero && Win32.IsWindow(gui.hwndFocus))
+                        return gui.hwndFocus;
+                    if (gui.hwndActive != IntPtr.Zero && Win32.IsWindow(gui.hwndActive))
+                        return gui.hwndActive;
+                }
+            }
+            return topWin;
         }
 
         // 4. Fallback to desktop window

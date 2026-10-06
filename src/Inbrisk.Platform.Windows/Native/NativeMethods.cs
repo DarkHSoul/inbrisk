@@ -127,6 +127,7 @@ internal static class NativeMethods
     [DllImport("user32.dll")] internal static extern bool GetCursorPos(out POINT lpPoint);
     [DllImport("user32.dll")] internal static extern IntPtr WindowFromPoint(POINT pt);
     [DllImport("user32.dll")] internal static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] internal static extern short GetKeyState(int nVirtKey);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")] internal static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")] internal static extern IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
     [DllImport("user32.dll")] internal static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);

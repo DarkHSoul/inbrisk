@@ -92,6 +92,11 @@ public sealed class GhostPipWindowHost : IDisposable
     public event Action<PipInputEventArgs>? OnInteractiveInput;
 
     /// <summary>
+    /// Raised when the user clicks the close button in the header bar.
+    /// </summary>
+    public event Action? CloseRequested;
+
+    /// <summary>
     /// Gets the native Win32 window handle (HWND).
     /// </summary>
     public IntPtr Hwnd => _hwnd;
@@ -558,80 +563,45 @@ public sealed class GhostPipWindowHost : IDisposable
         }
         catch { }
 
-        // If currently compact or medium (width <= 480), expand to large mode
-        if (_width <= 480)
+        int workW = Math.Max(320, monRight - monLeft);
+        int workH = Math.Max(180, monBottom - monTop);
+
+        if (!_isExpanded)
         {
             _savedCompactWidth = _width;
             _savedCompactHeight = _height;
             _savedCompactX = _x;
             _savedCompactY = _y;
 
-            int newWidth = Math.Max(640, _savedCompactWidth * 2);
-            int newHeight = Math.Max(360, (newWidth * 9) / 16);
-
-            // Expand strictly in place: keep current position
-            int newX = _x;
-            int newY = _y;
-
-            // Only nudge if the expanded window would exceed its current monitor boundary
-            if (newX + newWidth > monRight)
-            {
-                newX = monRight - newWidth;
-            }
-            if (newX < monLeft)
-            {
-                newX = monLeft;
-            }
-
-            if (newY + newHeight > monBottom)
-            {
-                newY = monBottom - newHeight;
-            }
-            if (newY < monTop)
-            {
-                newY = monTop;
-            }
-
-            _x = newX;
-            _y = newY;
-            _width = newWidth;
-            _height = newHeight;
+            // Fullscreen / maximize across current monitor work area
+            _x = monLeft;
+            _y = monTop;
+            _width = workW;
+            _height = workH;
             _isExpanded = true;
-
-            ApplyPositionAndSize(_x, _y, _width, _height);
-            PositionChanged?.Invoke(_x, _y);
-            BoundsChanged?.Invoke(_x, _y, _width, _height);
-            NativeMethods.InvalidateRect(_hwnd, IntPtr.Zero, false);
         }
         else
         {
-            // Restore to compact size in place
-            int restoreWidth = _savedCompactWidth > 0 ? _savedCompactWidth : 320;
-            int restoreHeight = _savedCompactHeight > 0 ? _savedCompactHeight : 180;
+            // Restore to saved compact size in place
+            int restoreWidth = _savedCompactWidth > 0 ? _savedCompactWidth : 480;
+            int restoreHeight = _savedCompactHeight > 0 ? _savedCompactHeight : 270;
             int restoreX = _savedCompactX;
             int restoreY = _savedCompactY;
 
-            // If no valid saved position on current monitor, keep current position
-            if (restoreX < monLeft || restoreX > monRight)
-            {
-                restoreX = _x;
-            }
-            if (restoreY < monTop || restoreY > monBottom)
-            {
-                restoreY = _y;
-            }
+            if (restoreX < monLeft || restoreX > monRight - 100) restoreX = monLeft + 50;
+            if (restoreY < monTop || restoreY > monBottom - 100) restoreY = monTop + 50;
 
             _x = restoreX;
             _y = restoreY;
             _width = restoreWidth;
             _height = restoreHeight;
             _isExpanded = false;
-
-            ApplyPositionAndSize(_x, _y, _width, _height);
-            PositionChanged?.Invoke(_x, _y);
-            BoundsChanged?.Invoke(_x, _y, _width, _height);
-            NativeMethods.InvalidateRect(_hwnd, IntPtr.Zero, false);
         }
+
+        ApplyPositionAndSize(_x, _y, _width, _height);
+        PositionChanged?.Invoke(_x, _y);
+        BoundsChanged?.Invoke(_x, _y, _width, _height);
+        NativeMethods.InvalidateRect(_hwnd, IntPtr.Zero, false);
     }
 
     private void ApplyPositionAndSize(int x, int y, int width, int height)
@@ -717,8 +687,8 @@ public sealed class GhostPipWindowHost : IDisposable
                 if (pt.Y <= border)
                     return new IntPtr(NativeMethods.HTTOP);
 
-                // 3. Header Action Buttons (Far right of header: Expand & Minimize buttons)
-                if (pt.Y < HeaderHeight && pt.X >= _width - 56)
+                // 3. Header Action Buttons (Far right of header: Minimize [ ─ ], Maximize [ 🗖 ], Close [ ✕ ])
+                if (pt.Y < HeaderHeight && pt.X >= _width - 96)
                 {
                     return new IntPtr(NativeMethods.HTCLIENT);
                 }
@@ -808,16 +778,23 @@ public sealed class GhostPipWindowHost : IDisposable
                     {
                         if (msg == NativeMethods.WM_LBUTTONDOWN)
                         {
-                            if (clientX >= _width - 28)
+                            if (clientX >= _width - 32)
                             {
-                                // Minimize button clicked
-                                NativeMethods.ShowWindow(hWnd, 6 /* SW_MINIMIZE */);
+                                // Close button [ ✕ ] -> Hide / close window
+                                CloseRequested?.Invoke();
+                                ApplyVisibility(false);
                                 return IntPtr.Zero;
                             }
-                            if (clientX >= _width - 56)
+                            if (clientX >= _width - 64)
                             {
-                                // Expand toggle button clicked
+                                // Maximize / Restore button [ 🗖 ]
                                 ToggleExpandCore();
+                                return IntPtr.Zero;
+                            }
+                            if (clientX >= _width - 96)
+                            {
+                                // Minimize / Arka plana atma button [ ─ ]
+                                NativeMethods.ShowWindow(hWnd, 6 /* SW_MINIMIZE */);
                                 return IntPtr.Zero;
                             }
                         }
@@ -899,7 +876,13 @@ public sealed class GhostPipWindowHost : IDisposable
                 if (!_clickThrough)
                 {
                     int vk = unchecked((int)(long)wParam);
-                    OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyDown, 0, 0, keyCode: vk));
+                    bool isCtrl = (NativeMethods.GetKeyState(0x11 /* VK_CONTROL */) & 0x8000) != 0;
+                    bool isAlt = (NativeMethods.GetKeyState(0x12 /* VK_MENU */) & 0x8000) != 0;
+
+                    if (isCtrl || isAlt || IsSpecialKey(vk))
+                    {
+                        OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyDown, 0, 0, keyCode: vk));
+                    }
                     return IntPtr.Zero;
                 }
                 break;
@@ -911,7 +894,13 @@ public sealed class GhostPipWindowHost : IDisposable
                 if (!_clickThrough)
                 {
                     int vk = unchecked((int)(long)wParam);
-                    OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyUp, 0, 0, keyCode: vk));
+                    bool isCtrl = (NativeMethods.GetKeyState(0x11 /* VK_CONTROL */) & 0x8000) != 0;
+                    bool isAlt = (NativeMethods.GetKeyState(0x12 /* VK_MENU */) & 0x8000) != 0;
+
+                    if (isCtrl || isAlt || IsSpecialKey(vk))
+                    {
+                        OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyUp, 0, 0, keyCode: vk));
+                    }
                     return IntPtr.Zero;
                 }
                 break;
@@ -922,7 +911,7 @@ public sealed class GhostPipWindowHost : IDisposable
                 if (!_clickThrough)
                 {
                     char c = (char)(long)wParam;
-                    if (c >= 32 || c == '\r' || c == '\n' || c == '\t' || c == '\b')
+                    if (c >= 32)
                     {
                         OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.Char, 0, 0, character: c));
                     }
@@ -1029,6 +1018,26 @@ public sealed class GhostPipWindowHost : IDisposable
         {
             _hwndHandle.Free();
         }
+    }
+
+    private static bool IsSpecialKey(int vk)
+    {
+        return vk switch
+        {
+            0x08 // Backspace
+            or 0x09 // Tab
+            or 0x0D // Enter (Return)
+            or 0x1B // Escape
+            or >= 0x10 and <= 0x12 // Shift, Control, Menu (Alt)
+            or 0x14 // Caps Lock
+            or >= 0x21 and <= 0x28 // Page Up, Page Down, End, Home, Left, Up, Right, Down
+            or 0x2D or 0x2E // Insert, Delete
+            or >= 0x5B and <= 0x5D // Left Win, Right Win, Apps
+            or >= 0x70 and <= 0x87 // F1 to F24
+            or 0x90 or 0x91 // Num Lock, Scroll Lock
+            => true,
+            _ => false
+        };
     }
 
     /// <summary>
