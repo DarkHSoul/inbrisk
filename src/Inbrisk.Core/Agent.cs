@@ -351,7 +351,12 @@ public sealed record ObservationBudget(
     /// <summary>Cap on total PNG bytes attached per observation.</summary>
     long MaxScreenshotBytes = 1_500_000,
     /// <summary>Cap on total attached pixels (w*h) per observation.</summary>
-    long MaxScreenshotPixels = 4_000_000)
+    long MaxScreenshotPixels = 4_000_000,
+    /// <summary>Drop passive UIA filler — elements with no actions, no name
+    /// and no value whose role isn't on the interactive/structural keep-list
+    /// (unnamed Pane/Group/Image/Custom nodes). On by default; the MCP layer
+    /// sets it false when detail=full asks for the unfiltered view.</summary>
+    bool PrunePassive = true)
 {
     public static readonly ObservationBudget Default = new();
 }

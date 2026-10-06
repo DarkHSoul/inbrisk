@@ -6,9 +6,35 @@ namespace Inbrisk.Runtime;
 
 /// <summary>Result of building one observation: the canonical record plus the
 /// attached frames keyed by FrameId — the grounding/transform source for
-/// coordinate validation. Empty when the observation is semantic-only.</summary>
+/// coordinate validation. Empty when the observation is semantic-only.
+/// <paramref name="Prune"/> — element-count/byte metrics for the passive-node
+/// pruner so tool layers can report how much noise was dropped.</summary>
 public sealed record BuiltObservation(AgentObservation Observation,
-    IReadOnlyDictionary<long, FrameRef> Frames);
+    IReadOnlyDictionary<long, FrameRef> Frames)
+{
+    /// <summary>Element-count/byte metrics for the passive-node pruner —
+    /// init property (not positional) so existing 2-arg deconstructions in
+    /// AgentOrchestrator keep compiling.</summary>
+    public PruneStats? Prune { get; init; }
+}
+
+/// <summary>Size accounting for one pass of <see cref="ObservationBuilder"/>'s
+/// element pruning — emitted to perf-trace.jsonl and carried on
+/// BuiltObservation for tool-layer reporting.</summary>
+public sealed record PruneStats(
+    /// <summary>Scene size before any filtering.</summary>
+    int RawElements,
+    /// <summary>Survived the geometry + relevance gates (pre-prune).</summary>
+    int CandidateElements,
+    /// <summary>Dropped by the passive-noise filter (unnamed, actionless,
+    /// valueless, non-structural role).</summary>
+    int PassiveDropped,
+    /// <summary>Dropped by the MaxElements/MaxChars caps.</summary>
+    int BudgetDropped,
+    /// <summary>Final printed element count.</summary>
+    int KeptElements,
+    /// <summary>Serialized-size estimate (chars) of the kept elements.</summary>
+    int ApproxChars);
 
 /// <summary>
 /// Turns the live desktop into a canonical AgentObservation:
@@ -24,6 +50,18 @@ public sealed class ObservationBuilder
         Role.RadioButton, Role.MenuItem, Role.ListItem, Role.TreeItem,
         Role.TabItem, Role.Hyperlink, Role.Slider, Role.Spinner, Role.DataItem,
         Role.Menu, Role.Tab,
+    };
+
+    /// <summary>Control-type allowlist for the pruned view — roles that
+    /// survive passive pruning even when unnamed/actionless. On top of the
+    /// interactive set it keeps Toggle (toggle-button-ish) and the item
+    /// containers List/Tree/Table so the flat list retains minimal structural
+    /// context for the actionable children they group. Everything else
+    /// (Pane, Group, Custom, Image, …) collapses unless it carries a name,
+    /// a value, or an action.</summary>
+    private static readonly HashSet<Role> PrunedViewKeep = new(Interactive)
+    {
+        Role.Toggle, Role.List, Role.Tree, Role.Table,
     };
 
     private readonly IWindowService _windows;
@@ -91,7 +129,7 @@ public sealed class ObservationBuilder
             ? d.Added.Concat(d.Changed).Select(e => e.StableKey).ToHashSet()
             : new HashSet<string>();
         var recent = recentElementRefs ?? (IReadOnlyCollection<string>)Array.Empty<string>();
-        var obsElements = Prune(elements, budget, changedKeys, recent, regions, target);
+        var (obsElements, pruneStats) = Prune(elements, budget, changedKeys, recent, regions, target);
 
         var (frames, raws) = AttachPixels(policy, target, obsElements, regions, budget,
             maxImageWidth, markElements);
@@ -109,7 +147,7 @@ public sealed class ObservationBuilder
             BaseObservationId: baseObs?.ObservationId);
         obs = obs with { Delta = baseObs == null ? null : DeltaBuilder.Compute(baseObs, obs, elements) };
         _prev = obs;
-        return new BuiltObservation(obs, raws);
+        return new BuiltObservation(obs, raws) { Prune = pruneStats };
     }
 
     /// <summary>Build the next observation asynchronously without blocking thread pool threads.</summary>
@@ -148,7 +186,7 @@ public sealed class ObservationBuilder
             ? d.Added.Concat(d.Changed).Select(e => e.StableKey).ToHashSet()
             : new HashSet<string>();
         var recent = recentElementRefs ?? (IReadOnlyCollection<string>)Array.Empty<string>();
-        var obsElements = Prune(elements, budget, changedKeys, recent, regions, target);
+        var (obsElements, pruneStats) = Prune(elements, budget, changedKeys, recent, regions, target);
 
         var (frames, raws) = AttachPixels(policy, target, obsElements, regions, budget,
             maxImageWidth, markElements);
@@ -166,7 +204,7 @@ public sealed class ObservationBuilder
             BaseObservationId: baseObs?.ObservationId);
         obs = obs with { Delta = baseObs == null ? null : DeltaBuilder.Compute(baseObs, obs, elements) };
         _prev = obs;
-        return new BuiltObservation(obs, raws);
+        return new BuiltObservation(obs, raws) { Prune = pruneStats };
     }
 
     /// <summary>Reset delta baseline (e.g. a new run).</summary>
@@ -202,7 +240,22 @@ public sealed class ObservationBuilder
         + (e.State?.Length ?? 0) + e.Source.Length + e.StableKey.Length
         + e.Actions.Sum(a => a.Length) + 64 /* bounds + separators */;
 
-    private static IReadOnlyList<ObsElement> Prune(IReadOnlyList<UiElement> elements,
+    /// <summary>Passive-noise predicate — shared by the observation pruner
+    /// and the MCP find text builder. An element is droppable when its role
+    /// isn't on the pruned-view allowlist AND it has no actionable verbs AND
+    /// no name AND no text value: the classic unnamed Pane/Group/Image
+    /// filler that floods the context without giving the model anything it
+    /// can reference or act on. Named Text keeps its content via the name
+    /// check; named containers survive as minimal structural context.</summary>
+    public static bool IsPassiveNoise(UiElement e) =>
+        !PrunedViewKeep.Contains(e.Role)
+        && e.Actions.Count == 0
+        && string.IsNullOrWhiteSpace(e.Name)
+        && !(e.Props.TryGetValue("value", out var v)
+            && v?.ToString() is { Length: > 0 });
+
+    private static (List<ObsElement> List, PruneStats Stats) Prune(
+        IReadOnlyList<UiElement> elements,
         ObservationBudget b, HashSet<string> changedKeys,
         IReadOnlyCollection<string> recentRefs, IReadOnlyList<RectPx> regions,
         long? targetHwnd)
@@ -214,12 +267,23 @@ public sealed class ObservationBuilder
             .Select(x => (x.El, x.Key,
                 Score: Relevance(x.El, x.Key, changedKeys, recentRefs, regions, targetHwnd)))
             .Where(x => x.Score > 0 || x.El.Name != null)
-            .OrderByDescending(x => x.Score)
-            .ThenBy(x => x.El.Bounds.Y).ThenBy(x => x.El.Bounds.X);
+            .ToList();
+
+        // Passive pruning — collapsed nodes carry no identity the model could
+        // reference anyway. Elements the loop recently acted on or that just
+        // changed stay regardless of how inert they look.
+        var kept = b.PrunePassive
+            ? scored.Where(x => !IsPassiveNoise(x.El)
+                    || recentRefs.Contains(x.El.Id)
+                    || changedKeys.Contains(x.Key))
+                .ToList()
+            : scored;
 
         var list = new List<ObsElement>(b.MaxElements);
         var chars = 0;
-        foreach (var x in scored)
+        foreach (var x in kept
+            .OrderByDescending(x => x.Score)
+            .ThenBy(x => x.El.Bounds.Y).ThenBy(x => x.El.Bounds.X))
         {
             var o = ToObs(x.El);
             var c = Chars(o);
@@ -227,7 +291,26 @@ public sealed class ObservationBuilder
             chars += c;
             list.Add(o);
         }
-        return list;
+
+        var stats = new PruneStats(elements.Count, scored.Count,
+            scored.Count - kept.Count, kept.Count - list.Count,
+            list.Count, chars);
+        PerfLog.Write(new
+        {
+            kind = "observation.prune",
+            at = DateTimeOffset.Now,
+            traceId = PerfTrace.CurrentId,
+            hwnd = targetHwnd,
+            enabled = b.PrunePassive,
+            raw = stats.RawElements,
+            candidates = stats.CandidateElements,
+            passiveDropped = stats.PassiveDropped,
+            budgetDropped = stats.BudgetDropped,
+            kept = stats.KeptElements,
+            approxChars = stats.ApproxChars,
+            approxBytes = stats.ApproxChars * 2, // ContextStats convention
+        });
+        return (list, stats);
     }
 
     private static ObsElement ToObs(UiElement e)
