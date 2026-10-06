@@ -61,7 +61,16 @@ public sealed record WaitCondition(
     long? Hwnd = null,
     int? Pid = null,
     bool StopOnUnexpectedDialog = true,
-    IReadOnlyList<RectPx>? IgnoreRegions = null);
+    IReadOnlyList<RectPx>? IgnoreRegions = null,
+    /// <summary>UIA AutomationId selector — populated by "map:app.element"
+    /// expansion (TryExpandMapCondition); many map entries are
+    /// automationId-only (e.g. calculator buttons).</summary>
+    string? AutomationId = null,
+    /// <summary>ClassName selector — populated by "map:app.element" expansion.</summary>
+    string? ClassName = null,
+    /// <summary>Exact value-property selector — populated by map expansion.
+    /// Distinct from ExpectedValue, which is a wait-until expectation.</summary>
+    string? ValueEquals = null);
 
 /// <summary>
 /// wait_for_* primitives driven by events first, polling as backstop:
@@ -301,6 +310,20 @@ public sealed class WaitService
         double startMs = 0;
         double? firstChangeMs = null;
 
+        // "map:app.element" queries expand into the map's selector condition
+        // here so every Query→WaitCondition caller (MCP computer_wait_for,
+        // run wait_for/wait_for_gone, until.appears/disappears/value/state)
+        // shares it. A bad key fails fast — waiting on an unexpandable
+        // selector could only ever time out.
+        if (cond.Name?.StartsWith(UiMap.Prefix, StringComparison.OrdinalIgnoreCase) == true)
+        {
+            if (!TryExpandMapCondition(cond, out var expanded, out var mapErr))
+                return new WaitResult(false, mapErr!, sw.Elapsed,
+                    Timeline: new CompletionTimeline(startMs, null, null),
+                    TelemetrySnapshot: Telemetry);
+            cond = expanded;
+        }
+
         var candidateWindowEvent = true; // initial iteration checks dialog
         var lastDialogCheck = DateTimeOffset.MinValue;
 
@@ -371,6 +394,9 @@ public sealed class WaitService
                         Pid: cond.Pid,
                         Role: cond.Role,
                         Name: cond.Name,
+                        AutomationId: cond.AutomationId,
+                        ClassName: cond.ClassName,
+                        ValueEquals: cond.ValueEquals,
                         FirstOnly: true));
                     if (found.Count == 0)
                     {
@@ -389,6 +415,9 @@ public sealed class WaitService
                     Pid: cond.Pid,
                     Role: cond.Role,
                     Name: cond.Name,
+                    AutomationId: cond.AutomationId,
+                    ClassName: cond.ClassName,
+                    ValueEquals: cond.ValueEquals,
                     ScopeElementId: cond.ScopeElementId,
                     MaxResults: cond.MinCount ?? 20);
 
@@ -462,6 +491,86 @@ public sealed class WaitService
         {
             lease?.Dispose();
         }
+    }
+
+    /// <summary>Expand a "map:app.element" wait query into the same
+    /// name/role/automationId/className/value condition the target resolver
+    /// produces for a map selector (UiMap covers the built-in table plus
+    /// user overlay files). Explicit condition fields win over map seeds;
+    /// the map's process seed narrows the wait to that app's process only
+    /// when the caller pinned no window/pid/scope of its own.</summary>
+    public bool TryExpandMapCondition(WaitCondition cond,
+        out WaitCondition expanded, out string? error)
+    {
+        expanded = cond;
+        error = null;
+        if (!UiMap.TryParseKey(cond.Name, out var appKey, out var logical))
+        {
+            error = $"invalid map selector '{cond.Name}' — expected " +
+                "\"map:app.element\" (e.g. \"map:notepad.document\", " +
+                "\"map:calculator.equals\")";
+            return false;
+        }
+        if (!UiMap.TryGet($"{appKey}.{logical}", out var app, out var sel) || sel == null)
+        {
+            error = $"unknown ui-map key '{appKey}.{logical}'. " +
+                UiMap.DescribeAvailable(appKey);
+            return false;
+        }
+        var role = cond.Role;
+        if (role == null && sel.EffectiveRole is { } roleName)
+        {
+            if (!Enum.TryParse<Role>(roleName, true, out var parsed))
+            {
+                error = $"ui-map key '{appKey}.{logical}' names unknown role '{roleName}'";
+                return false;
+            }
+            role = parsed;
+        }
+        // Scope to the mapped app's process when the caller gave no scope of
+        // its own — a global find could match a same-named element elsewhere.
+        int? pid = cond.Pid;
+        if (pid == null && cond.Hwnd == null && cond.ScopeElementId == null &&
+            app?.Process is { } proc)
+            pid = PidForProcess(proc);
+        expanded = cond with
+        {
+            // FindSpec.Name is already a case-insensitive substring match —
+            // name and nameContains share one native condition, exactly like
+            // the resolver's (target.Name ?? target.NameContains) push-down.
+            Name = sel.Name ?? sel.NameContains,
+            NameContains = cond.NameContains ?? sel.NameContains,
+            Role = role,
+            AutomationId = cond.AutomationId ?? sel.AutomationId,
+            ClassName = cond.ClassName ?? sel.ClassName,
+            ValueEquals = cond.ValueEquals ?? sel.Value,
+            Pid = pid,
+        };
+        return true;
+    }
+
+    /// <summary>First window pid for a process name (".exe"-insensitive;
+    /// exact match preferred, prefix as fallback — mirrors the resolver's
+    /// process matching). Null when the process has no window yet — the
+    /// caller then waits unscoped rather than failing a still-launching app.</summary>
+    private int? PidForProcess(string process)
+    {
+        if (_windows == null) return null;
+        try
+        {
+            var q = process.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                ? process[..^4] : process;
+            static string Norm(string? p) =>
+                p != null && p.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                    ? p[..^4] : p ?? "";
+            var wins = _windows.ListWindows();
+            var exact = wins.FirstOrDefault(w =>
+                string.Equals(Norm(w.ProcessName), q, StringComparison.OrdinalIgnoreCase));
+            if (exact != null) return exact.Pid;
+            return wins.FirstOrDefault(w =>
+                Norm(w.ProcessName).StartsWith(q, StringComparison.OrdinalIgnoreCase))?.Pid;
+        }
+        catch { return null; }
     }
 
     /// <summary>Wait until a ChangeMonitor reports change started

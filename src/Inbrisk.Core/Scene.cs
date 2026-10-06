@@ -44,6 +44,47 @@ public sealed record TextSpan(
     BackendId Source = BackendId.Ocr);
 
 /// <summary>
+/// One OCR pass: the words found (desktop-space bounds), the engine that ran,
+/// the image size actually fed to the engine (post-downscale), wall time, and
+/// an optional warning (unsupported-language fallback, timeout, engine
+/// failure). WinRT OcrWord exposes no per-word confidence —
+/// TextSpan.Confidence stays null.
+/// </summary>
+public sealed record OcrResult(
+    IReadOnlyList<TextSpan> Words,
+    double ElapsedMs,
+    string Engine,
+    string Language,
+    int ImageWidth,
+    int ImageHeight,
+    string? RequestedLanguage = null,
+    string? Warning = null)
+{
+    public bool TimedOut => Warning?.Contains("timed out") == true;
+}
+
+/// <summary>
+/// OCR backend contract. Implementations take raw BGRA frames (or capture a
+/// window/region themselves when wired with capture services) and return
+/// words already mapped to desktop space. Platform-neutral so the runtime
+/// layer can consume it without referencing a WinRT assembly.
+/// </summary>
+public interface IOcrService
+{
+    bool Available { get; }
+    /// <summary>BCP-47 tag of the default (profile-language) engine.</summary>
+    string Language { get; }
+    /// <summary>Recognize text in an already-captured frame.</summary>
+    OcrResult Recognize(RawFrame frame, string? language = null, TimeSpan? timeout = null);
+    /// <summary>Capture the window's visible bounds and recognize. Throws
+    /// NotFound when the window is gone, CaptureFailed when minimized/off-
+    /// desktop, Unsupported when no capture services are wired.</summary>
+    OcrResult RecognizeWindow(long hwnd, string? language = null, TimeSpan? timeout = null);
+    /// <summary>Capture a desktop-space rect and recognize.</summary>
+    OcrResult RecognizeRegion(RectPx region, string? language = null, TimeSpan? timeout = null);
+}
+
+/// <summary>
 /// What a vision/grounding provider sees. Elements are produced in the frame's
 /// image space and carry confidence; conversion to desktop space happens only
 /// through FrameTransform/CoordinateMapper during scene merge or grounding.

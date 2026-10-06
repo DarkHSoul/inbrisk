@@ -22,6 +22,54 @@ public sealed record ObsContext(
     /// semantics). MCP sessions pass their minted-observation set.</summary>
     IReadOnlySet<long>? ValidObservationIds = null);
 
+// --------------------- OCR fallback resolution -----------------------
+
+/// <summary>A request to locate rendered text inside a window via OCR —
+/// the semantic fallback when the UIA tree can't see the target.</summary>
+public sealed record OcrResolveRequest(
+    /// <summary>Text to locate — a word or short phrase (e.g. the spec's
+    /// ocrText, or name/nameContains when the target opted into OCR).</summary>
+    string Text,
+    /// <summary>Window to capture; null → current foreground window.</summary>
+    long? Hwnd = null,
+    /// <summary>BCP-47 recognizer language (e.g. "en-US"); null = default.</summary>
+    string? Language = null,
+    /// <summary>Cap on candidates reported back on ambiguity.</summary>
+    int MaxCandidates = 8,
+    /// <summary>Per-recognition timeout; null = engine default.</summary>
+    TimeSpan? Timeout = null);
+
+/// <summary>One OCR'd candidate that matched the query, in desktop space.</summary>
+public sealed record OcrMatch(
+    string Text, RectPx Bounds, double Score, double? Confidence)
+{
+    public (int X, int Y) Center => Bounds.Center;
+}
+
+/// <summary>
+/// Synthetic resolution produced by the OCR fallback: the matched text's
+/// center point in desktop space plus its match provenance. Consumable
+/// anywhere a point target is accepted.
+/// </summary>
+public sealed record OcrResolution(
+    int X, int Y,
+    string MatchedText,
+    RectPx Bounds,
+    double Score,
+    double? Confidence,
+    long Hwnd,
+    int WordCount,
+    int MatchCount,
+    string Language)
+{
+    /// <summary>Executor-ready point target.</summary>
+    public TargetRef ToTargetRef() => TargetRef.At(X, Y);
+
+    /// <summary>Direct desktop point — FrameId 0 carries no frame binding,
+    /// so ImageToDesktop passes the coordinates through unchanged.</summary>
+    public ImagePoint ToImagePoint() => new(X, Y, FrameId: 0);
+}
+
 /// <summary>
 /// Canonical action → validated execution. The chain:
 ///   schema → target exists → frame freshness/geometry → safety (in Executor)
@@ -36,15 +84,20 @@ public sealed class ActionResolver
     private readonly WaitService _waits;
     private readonly IWindowService _windows;
     private readonly AutoVerifier _verifier;
+    private readonly ICaptureService? _capture;
+    private readonly IOcrService? _ocr;
 
     public ActionResolver(ElementRegistry registry, Executor executor,
-        WaitService waits, IWindowService windows, AutoVerifier verifier)
+        WaitService waits, IWindowService windows, AutoVerifier verifier,
+        ICaptureService? capture = null, IOcrService? ocr = null)
     {
         _registry = registry;
         _executor = executor;
         _waits = waits;
         _windows = windows;
         _verifier = verifier;
+        _capture = capture;
+        _ocr = ocr;
     }
 
     public StepOutcome Execute(AgentAction a, ObsContext ctx, ActionContext actx)
@@ -67,8 +120,14 @@ public sealed class ActionResolver
                         string.IsNullOrWhiteSpace(a.ExpectedState) && string.IsNullOrWhiteSpace(a.ExpectedValue) && !a.Gone)
                         return Malformed(sw, "wait_for requires query or condition");
 
+                    // For a "map:app.element" query the map's process seed is
+                    // the scope — the implicit active-window fallback must not
+                    // trap the wait in an unrelated focused window. An explicit
+                    // hwnd/pid/element scope still wins over the map seed.
+                    var isMapQuery = a.Query?.StartsWith(UiMap.Prefix,
+                        StringComparison.OrdinalIgnoreCase) == true;
                     var scopeHwnd = a.Hwnd ??
-                        (a.Pid == null && a.ScopeElementId == null &&
+                        (!isMapQuery && a.Pid == null && a.ScopeElementId == null &&
                          ctx.ActiveHwnd is > 0 ? ctx.ActiveHwnd : null);
 
                     var cond = new WaitCondition(
@@ -81,6 +140,20 @@ public sealed class ActionResolver
                         Hwnd: scopeHwnd,
                         Pid: a.Pid,
                         StopOnUnexpectedDialog: a.StopOnUnexpectedDialog);
+
+                    // A "map:app.element" query expands to the map's selector
+                    // condition up front so a bad key is a structured resolver
+                    // error, not an opaque wait timeout. ForCondition re-checks
+                    // the prefix, so direct WaitService callers get it too.
+                    if (cond.Name?.StartsWith(UiMap.Prefix, StringComparison.OrdinalIgnoreCase) == true)
+                    {
+                        if (!_waits.TryExpandMapCondition(cond, out var expanded, out var mapErr))
+                            return Done(sw,
+                                UiMap.TryParseKey(cond.Name, out _, out _)
+                                    ? OutcomeKind.TargetNotFound : OutcomeKind.Malformed,
+                                "wait_for", mapErr, false);
+                        cond = expanded;
+                    }
 
                     var r = _waits.ForCondition(cond, a.Ms ?? 5000, actx.Ct);
                     if (r.InterruptedByDialog)
@@ -250,7 +323,7 @@ public sealed class ActionResolver
             }
         }
         return new ActionIntent(kind.Value, target ?? TargetRef.At(0, 0)
-            with { }, args);
+            with { }, args, Silent: a.Silent);
     }
 
     /// <summary>Element id → TargetRef; unknown id is malformed, stale is
@@ -343,6 +416,353 @@ public sealed class ActionResolver
         return fref.Raw.Transform.ImageToDesktop(p.X, p.Y);
     }
 
+    /// <summary>
+    /// OCR fallback targeting: capture the target window's frame, recognize
+    /// its words, match <see cref="OcrResolveRequest.Text"/> (exact →
+    /// case-insensitive contains → fuzzy) and return a synthetic point
+    /// resolution — the matched text's center — that downstream click/type
+    /// paths consume as a point target.
+    ///
+    /// Runs ONLY when asked: the caller decides when UIA resolution failed
+    /// or the spec opted into OCR (ocrText / ocr:true) — nothing here
+    /// triggers OCR implicitly. On multiple equally-scored matches the call
+    /// refuses with <see cref="OutcomeKind.AmbiguousTarget"/> and the tied
+    /// candidates (bounded by MaxCandidates); on zero matches it fails with
+    /// <see cref="OutcomeKind.TargetNotFound"/> plus the OCR'd word count.
+    /// </summary>
+    public OcrResolution? ResolveOcrTarget(OcrResolveRequest req,
+        out string? error, out OutcomeKind rejectKind,
+        out IReadOnlyList<OcrMatch> candidates)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var words = 0;
+        OcrResolution? res = null;
+        string? err = null;
+        string? warn = null;
+        var kind = OutcomeKind.Malformed;
+        var cands = (IReadOnlyList<OcrMatch>)Array.Empty<OcrMatch>();
+        try
+        {
+            res = ResolveOcrCore(req, out err, out kind, out var c,
+                out words, out warn);
+            cands = c;
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            err = e.Message;
+            kind = OutcomeKind.Failed;
+        }
+        finally
+        {
+            error = err;
+            rejectKind = kind;
+            candidates = cands;
+            // ocr.resolve — one JSONL event per call: latency, recognizer
+            // yield, match spread and the winner (or reject classification).
+            PerfLog.Write(new
+            {
+                kind = "ocr.resolve",
+                run = PerfTrace.CurrentId,
+                hwnd = req.Hwnd,
+                text = req.Text,
+                lang = req.Language ?? _ocr?.Language,
+                ms = sw.ElapsedMilliseconds,
+                words,
+                matches = cands.Count,
+                chosen = res?.MatchedText,
+                outcome = res != null ? "resolved" : kind.ToString(),
+                warn,
+            });
+        }
+        return res;
+    }
+
+    private OcrResolution? ResolveOcrCore(OcrResolveRequest req,
+        out string? error, out OutcomeKind rejectKind,
+        out IReadOnlyList<OcrMatch> candidates, out int words,
+        out string? warning)
+    {
+        error = null;
+        rejectKind = OutcomeKind.Malformed;
+        candidates = Array.Empty<OcrMatch>();
+        words = 0;
+        warning = null;
+
+        var text = req.Text?.Trim();
+        if (string.IsNullOrEmpty(text))
+        { error = "OCR resolution requires non-empty text"; return null; }
+        if (_ocr == null)
+        {
+            rejectKind = OutcomeKind.Failed;
+            error = "OCR resolution is not wired on this runtime " +
+                    "(no OCR service)";
+            return null;
+        }
+        if (!_ocr.Available)
+        {
+            rejectKind = OutcomeKind.Failed;
+            error = "OCR engine unavailable — no recognizer language installed";
+            return null;
+        }
+
+        var hwnd = req.Hwnd ?? _windows.GetForegroundWindow()?.Hwnd;
+        if (hwnd is not { } h)
+        {
+            rejectKind = OutcomeKind.TargetNotFound;
+            error = "no window to OCR — pass hwnd or focus a window first";
+            return null;
+        }
+        var win = _windows.GetWindow(h);
+        if (win == null)
+        {
+            rejectKind = OutcomeKind.WindowLost;
+            error = $"window 0x{h:X} is gone";
+            return null;
+        }
+        if (win.State == WindowState.Minimized)
+        {
+            rejectKind = OutcomeKind.CaptureUnavailable;
+            error = $"window '{win.Title}' (0x{h:X}) is minimized — nothing to OCR";
+            return null;
+        }
+        // clamp to the visible desktop — bounds partially offscreen capture
+        // black edges, fully offscreen captures nothing
+        var region = win.Bounds.Intersect(_windows.GetVirtualDesktopBounds());
+        if (region.IsEmpty)
+        {
+            rejectKind = OutcomeKind.CaptureUnavailable;
+            error = $"window '{win.Title}' (0x{h:X}) has no visible area";
+            return null;
+        }
+
+        OcrResult result;
+        if (_capture != null)
+        {
+            // self-contained path: capture the clamped window bounds and run
+            // the engine on the frame — works even when the OCR service was
+            // built without its own capture wiring
+            RawFrame frame;
+            try
+            {
+                using (PerfTrace.Stage("ocr.capture"))
+                {
+                    var raw = _capture.CaptureRaw(region);
+                    // stamp the owning hwnd — image-space actions derived
+                    // from this frame can raise the right window before input
+                    frame = raw with
+                    { Transform = raw.Transform with { SourceHwnd = h } };
+                }
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                rejectKind = OutcomeKind.CaptureUnavailable;
+                error = $"window capture failed: {e.Message}";
+                return null;
+            }
+            using (PerfTrace.Stage("ocr.recognize"))
+                result = _ocr.Recognize(frame, req.Language, req.Timeout);
+        }
+        else
+        {
+            // no direct capture — the service captures the window itself
+            // (throws InbriskException NotFound/CaptureFailed/Unsupported)
+            try
+            {
+                using (PerfTrace.Stage("ocr.recognize"))
+                    result = _ocr.RecognizeWindow(h, req.Language, req.Timeout);
+            }
+            catch (InbriskException ie)
+            {
+                rejectKind = ie.Code switch
+                {
+                    ErrorCode.NotFound => OutcomeKind.WindowLost,
+                    ErrorCode.CaptureFailed => OutcomeKind.CaptureUnavailable,
+                    _ => OutcomeKind.Failed,
+                };
+                error = $"OCR capture failed: {ie.Message}";
+                return null;
+            }
+        }
+        var spans = result.Words;
+        words = spans.Count;
+        warning = result.Warning;
+
+        var scored = ScoreOcrCandidates(spans, text);
+        var maxList = Math.Clamp(req.MaxCandidates, 1, 32);
+        if (scored.Count == 0)
+        {
+            rejectKind = OutcomeKind.TargetNotFound;
+            error = $"OCR matched nothing for \"{Trunc(text)}\" — " +
+                    $"{words} word(s) recognized in '{win.Title}' (0x{h:X})" +
+                    (warning != null ? $" [{warning}]" : "");
+            return null;
+        }
+
+        var top = scored[0].Score;
+        var tied = scored.Where(m => m.Score == top).ToList();
+        if (tied.Count > 1)
+        {
+            rejectKind = OutcomeKind.AmbiguousTarget;
+            candidates = tied.Take(maxList).ToList();
+            var list = string.Join(", ", candidates.Select(m =>
+                $"\"{m.Text}\" @{m.Bounds}"));
+            var more = tied.Count > candidates.Count
+                ? $" (+{tied.Count - candidates.Count} more)" : "";
+            error = $"OCR target \"{Trunc(text)}\" is ambiguous — " +
+                    $"{tied.Count} equal matches: {list}{more}";
+            return null;
+        }
+
+        candidates = scored.Take(maxList).ToList();
+        var best = scored[0];
+        var c = best.Bounds.Center;
+        return new OcrResolution(c.X, c.Y, best.Text, best.Bounds, best.Score,
+            best.Confidence, h, words, scored.Count, result.Language);
+    }
+
+    /// <summary>Word spans → scored candidates. Multi-word queries also
+    /// match consecutive same-line spans joined with spaces — the engine
+    /// emits one span per rendered word, so phrases live across spans.
+    /// Ordering: score desc, then visual order (top→bottom, left→right) —
+    /// fully deterministic, matching the UIA resolver's tie-break.</summary>
+    private static List<OcrMatch> ScoreOcrCandidates(
+        IReadOnlyList<TextSpan> spans, string query)
+    {
+        var queryWords = query.Split(' ',
+            StringSplitOptions.RemoveEmptyEntries).Length;
+
+        var units = new List<(string Text, RectPx Bounds, double? Confidence)>(
+            spans.Count);
+        foreach (var s in spans)
+        {
+            var t = s.Text.Trim();
+            if (t.Length > 0) units.Add((t, s.Bounds, s.Confidence));
+        }
+
+        if (queryWords > 1)
+        {
+            foreach (var line in GroupOcrLines(spans))
+            {
+                for (var i = 0; i < line.Count; i++)
+                {
+                    var maxW = Math.Min(queryWords, line.Count - i);
+                    for (var n = 2; n <= maxW; n++)
+                    {
+                        var slice = line.GetRange(i, n);
+                        units.Add((string.Join(' ',
+                                slice.Select(w => w.Text.Trim())),
+                            UnionOcrBounds(slice), slice[0].Confidence));
+                    }
+                }
+            }
+        }
+
+        var scored = new List<OcrMatch>(units.Count);
+        foreach (var u in units)
+        {
+            var s = ScoreOcrCandidate(u.Text, query);
+            if (s > 0) scored.Add(new OcrMatch(u.Text, u.Bounds, s, u.Confidence));
+        }
+        // ~same text at ~same bounds = one candidate (identical rule to the
+        // UIA resolver's indistinguishable-candidate dedupe)
+        return scored
+            .GroupBy(m => (m.Text, m.Bounds.X / 4, m.Bounds.Y / 4,
+                m.Bounds.Width / 4, m.Bounds.Height / 4))
+            .Select(g => g.OrderByDescending(m => m.Score).First())
+            .OrderByDescending(m => m.Score)
+            .ThenBy(m => m.Bounds.Y).ThenBy(m => m.Bounds.X)
+            .ThenBy(m => m.Bounds.Width).ThenBy(m => m.Text)
+            .ToList();
+    }
+
+    /// <summary>Cluster word spans into visual lines: sorted by vertical
+    /// center, a word joins the current line while its center stays within
+    /// ~60% of its height of the line's running center.</summary>
+    private static List<List<TextSpan>> GroupOcrLines(IReadOnlyList<TextSpan> spans)
+    {
+        var sorted = spans
+            .OrderBy(s => s.Bounds.Y + s.Bounds.Height / 2.0)
+            .ThenBy(s => s.Bounds.X).ToList();
+        var lines = new List<List<TextSpan>>();
+        var centers = new List<double>();
+        foreach (var s in sorted)
+        {
+            var cy = s.Bounds.Y + s.Bounds.Height / 2.0;
+            var tol = Math.Max(4.0, s.Bounds.Height * 0.6);
+            if (lines.Count > 0 && Math.Abs(cy - centers[^1]) <= tol)
+            {
+                var l = lines[^1];
+                centers[^1] = (centers[^1] * l.Count + cy) / (l.Count + 1);
+                l.Add(s);
+            }
+            else
+            {
+                lines.Add([s]);
+                centers.Add(cy);
+            }
+        }
+        foreach (var l in lines)
+            l.Sort((a, b) => a.Bounds.X.CompareTo(b.Bounds.X));
+        return lines;
+    }
+
+    private static RectPx UnionOcrBounds(IReadOnlyList<TextSpan> ws)
+    {
+        var x = ws.Min(w => w.Bounds.X);
+        var y = ws.Min(w => w.Bounds.Y);
+        var r = ws.Max(w => w.Bounds.Right);
+        var b = ws.Max(w => w.Bounds.Bottom);
+        return new RectPx(x, y, r - x, b - y);
+    }
+
+    /// <summary>exact → case-insensitive contains → fuzzy score. Tier gaps
+    /// keep an exact hit above every contains and contains above fuzzy, so
+    /// ordering alone decides the match class.</summary>
+    private static double ScoreOcrCandidate(string candidate, string query)
+    {
+        if (string.Equals(candidate, query, StringComparison.Ordinal)) return 100;
+        if (string.Equals(candidate, query, StringComparison.OrdinalIgnoreCase))
+            return 95;
+        if (candidate.Contains(query, StringComparison.OrdinalIgnoreCase))
+            // longer candidate beyond the query → weaker containment
+            return 60 + 25.0 * query.Length / candidate.Length;
+        if (candidate.Length >= 3 &&
+            query.Contains(candidate, StringComparison.OrdinalIgnoreCase))
+            // the word is a fragment of a multi-word query (OCR split/merge)
+            return 45 + 15.0 * candidate.Length / query.Length;
+        // fuzzy: normalized edit similarity. A length delta alone caps the
+        // reachable similarity — skip the DP when it can't clear the floor.
+        var maxLen = Math.Max(candidate.Length, query.Length);
+        if (Math.Abs(candidate.Length - query.Length) > maxLen * 0.4) return 0;
+        var sim = 1.0 - (double)Levenshtein(candidate, query) / maxLen;
+        return sim >= 0.6 ? sim * 40 : 0;
+    }
+
+    private static int Levenshtein(string a, string b)
+    {
+        if (a.Length == 0) return b.Length;
+        if (b.Length == 0) return a.Length;
+        var prev = new int[b.Length + 1];
+        var cur = new int[b.Length + 1];
+        for (var j = 0; j <= b.Length; j++) prev[j] = j;
+        for (var i = 1; i <= a.Length; i++)
+        {
+            cur[0] = i;
+            for (var j = 1; j <= b.Length; j++)
+            {
+                var cost = char.ToUpperInvariant(a[i - 1]) ==
+                    char.ToUpperInvariant(b[j - 1]) ? 0 : 1;
+                cur[j] = Math.Min(Math.Min(cur[j - 1] + 1, prev[j] + 1),
+                    prev[j - 1] + cost);
+            }
+            (prev, cur) = (cur, prev);
+        }
+        return prev[b.Length];
+    }
+
+    private static string Trunc(string s, int max = 60) =>
+        s.Length <= max ? s : s[..max] + "…";
+
     private static StepOutcome Malformed(System.Diagnostics.Stopwatch sw, string why) =>
         new(OutcomeKind.Malformed, false, "validation", why, (int)sw.ElapsedMilliseconds);
 
@@ -364,6 +784,7 @@ public sealed class ActionResolver
         { Error: ErrorCode.PolicyDenied } => OutcomeKind.PolicyDenied,
         { Error: ErrorCode.ConfirmationRequired } => OutcomeKind.ConfirmationDenied,
         { Error: ErrorCode.Busy } => OutcomeKind.ConcurrencyConflict,
+        { Error: ErrorCode.Unsupported } => OutcomeKind.NotSupported,
         _ => OutcomeKind.Failed,
     };
 }
