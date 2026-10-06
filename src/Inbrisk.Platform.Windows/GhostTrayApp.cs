@@ -552,7 +552,7 @@ public sealed class GhostTrayApp : IDisposable
         }
     }
 
-    private void ShowContextMenu()
+    public void ShowContextMenu()
     {
         if (_hwnd == IntPtr.Zero) return;
 

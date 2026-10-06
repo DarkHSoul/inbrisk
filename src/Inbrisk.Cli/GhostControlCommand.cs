@@ -14,6 +14,7 @@ using Inbrisk.Cli.Ui;
 using Inbrisk.Core;
 using Inbrisk.Mcp;
 using Inbrisk.Platform.Windows;
+using Inbrisk.Platform.Windows.Hud;
 using Inbrisk.Runtime;
 
 namespace Inbrisk.Cli;
@@ -606,6 +607,7 @@ public static class GhostControlCommand
         GhostKeyboardForwarder? keyboardForwarder = null;
         GhostIpcServer? controlServer = null;
         GhostWorkerDaemon? localWorker = null;
+        ActivityHudService? hud = null;
 
         try
         {
@@ -723,6 +725,29 @@ public static class GhostControlCommand
                 LogSuccess("System Tray icon active in Windows taskbar notification area.", options);
             }
 
+            // 4b. Initialize "Inbrisk Hazır" Taskbar Winbar HUD Pill
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                try
+                {
+                    var userSettings = UserSettings.Load();
+                    hud = new ActivityHudService(
+                        enabled: true,
+                        animationsEnabled: userSettings.AnimationsEnabled,
+                        alwaysVisible: true,
+                        hudDockGapDip: userSettings.HudDockGapDip);
+                    hud.Start();
+                    hud.SetStandby("Inbrisk Hazır");
+                    hud.OnClick = () => trayApp.OpenSettings();
+                    hud.OnRightClick = () => trayApp.ShowContextMenu();
+                    LogSuccess("Inbrisk Hazır Winbar HUD pill active on taskbar.", options);
+                }
+                catch (Exception ex)
+                {
+                    LogWarning($"Could not initialize Inbrisk Hazır Winbar HUD: {ex.Message}", options);
+                }
+            }
+
             // 5. Initialize Keyboard Forwarder & Global Hotkey Listener
             try
             {
@@ -791,6 +816,11 @@ public static class GhostControlCommand
             if (keyboardForwarder != null)
             {
                 try { keyboardForwarder.Dispose(); } catch { }
+            }
+
+            if (hud != null)
+            {
+                try { hud.Dispose(); } catch { }
             }
 
             if (trayApp != null)

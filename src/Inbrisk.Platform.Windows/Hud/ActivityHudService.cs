@@ -110,6 +110,7 @@ public sealed class ActivityHudService : IDisposable
     public IntPtr Hwnd => _hwnd;
     public static string? ActiveHudText { get; internal set; }
     public Action? OnClick { get; set; }
+    public Action? OnRightClick { get; set; }
 
     public ActivityHudService(bool enabled = true, bool animationsEnabled = true, bool alwaysVisible = false, int hudDockGapDip = -1)
     {
@@ -703,6 +704,12 @@ public sealed class ActivityHudService : IDisposable
                 owner.EndDrag(owner._dragMoved);
             return IntPtr.Zero;
         }
+        if (msg is NativeMethods.WM_RBUTTONUP or NativeMethods.WM_CONTEXTMENU)
+        {
+            var owner = OwnerOf(hwnd);
+            owner?.ShowContextMenu();
+            return IntPtr.Zero;
+        }
         if (msg == NativeMethods.WM_DISPLAYCHANGE)
         {
             var owner = OwnerOf(hwnd);
@@ -726,6 +733,45 @@ public sealed class ActivityHudService : IDisposable
             Process.Start(new ProcessStartInfo(exe, "control") { UseShellExecute = true });
         }
         catch { }
+    }
+
+    public void ShowContextMenu()
+    {
+        if (OnRightClick != null)
+        {
+            try { OnRightClick.Invoke(); return; }
+            catch { }
+        }
+
+        if (_hwnd == IntPtr.Zero) return;
+
+        NativeMethods.GetCursorPos(out var pt);
+        var hMenu = NativeMethods.CreatePopupMenu();
+
+        NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | NativeMethods.MF_DISABLED, (UIntPtr)0, "🟢 Inbrisk: Hazır");
+        NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
+
+        const uint cmdSettings = 3001;
+        const uint cmdControl = 3002;
+
+        NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)cmdSettings, "⚙️ Ayarlar (Settings)...");
+        NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)cmdControl, "🖥️ Inbrisk Kontrol Paneli");
+
+        NativeMethods.SetForegroundWindow(_hwnd);
+        var cmd = NativeMethods.TrackPopupMenuEx(
+            hMenu,
+            NativeMethods.TPM_RETURNCMD | NativeMethods.TPM_RIGHTBUTTON,
+            pt.X, pt.Y,
+            _hwnd,
+            IntPtr.Zero);
+
+        NativeMethods.PostMessageW(_hwnd, NativeMethods.WM_NULL, IntPtr.Zero, IntPtr.Zero);
+        NativeMethods.DestroyMenu(hMenu);
+
+        if (cmd == cmdSettings || cmd == cmdControl)
+        {
+            HandleClick();
+        }
     }
 
     private static ActivityHudService? OwnerOf(IntPtr hwnd)
