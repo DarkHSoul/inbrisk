@@ -131,39 +131,57 @@ public static class McpHost
             Environment.GetEnvironmentVariable("INBRISK_RESUME_HOTKEY") ?? userSettings.ResumeHotkey);
 
         var tray = new TrayIconService(userSettings);
+        // tray callbacks run on the tray pump thread — a fault must never
+        // kill that thread (or the process). Each handler is self-contained.
         tray.OnOpenSettings = () =>
         {
-            var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
-            if (!File.Exists(exe))
-                exe = Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
-            Process.Start(new ProcessStartInfo(exe, "control") { UseShellExecute = true });
+            try
+            {
+                var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
+                if (!File.Exists(exe))
+                    exe = Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
+                Process.Start(new ProcessStartInfo(exe, "control") { UseShellExecute = true });
+            }
+            catch { }
         };
-        tray.OnEmergencyStop = () => control.TriggerLocalPanic("tray icon");
-        tray.OnResume = () => control.TriggerLocalResume("tray icon");
+        tray.OnEmergencyStop = () => { try { control.TriggerLocalPanic("tray icon"); } catch { } };
+        tray.OnResume = () => { try { control.TriggerLocalResume("tray icon"); } catch { } };
         tray.OnToggleHud = enabled =>
         {
-            var s = Inbrisk.Core.UserSettings.Load();
-            s.HudEnabled = enabled;
-            s.Save();
+            try
+            {
+                var s = Inbrisk.Core.UserSettings.Load();
+                s.HudEnabled = enabled;
+                s.Save();
+            }
+            catch { }
         };
         tray.OnTogglePerimeter = enabled =>
         {
-            var s = Inbrisk.Core.UserSettings.Load();
-            s.PerimeterEnabled = enabled;
-            s.Save();
+            try
+            {
+                var s = Inbrisk.Core.UserSettings.Load();
+                s.PerimeterEnabled = enabled;
+                s.Save();
+            }
+            catch { }
         };
         tray.OnQuit = () => Environment.Exit(0);
         tray.Start();
 
         control.StateChanged += s =>
         {
-            tray.UpdateStatus(
-                mcpConnected: true,
-                clientName: "Host",
-                working: false,
-                emergency: s == ComputerControlState.EmergencyStopped,
-                hudEnabled: Inbrisk.Core.UserSettings.Load().HudEnabled,
-                perimeterEnabled: Inbrisk.Core.UserSettings.Load().PerimeterEnabled);
+            try
+            {
+                tray.UpdateStatus(
+                    mcpConnected: true,
+                    clientName: "Host",
+                    working: false,
+                    emergency: s == ComputerControlState.EmergencyStopped,
+                    hudEnabled: Inbrisk.Core.UserSettings.Load().HudEnabled,
+                    perimeterEnabled: Inbrisk.Core.UserSettings.Load().PerimeterEnabled);
+            }
+            catch { }
         };
 
         builder.Services.AddSingleton(control);
@@ -224,6 +242,11 @@ public static class McpHost
             f.AddCallToolFilter(next => async (req, ct) =>
             {
                 var session = req.Services?.GetService<McpSession>();
+                // bind the server→client push channel once the JSON-RPC
+                // session exists — lets the session stream window/delta
+                // events as MCP notifications during long-running calls
+                session?.BindNotifications((m, p, c) =>
+                    req.Server.SendNotificationAsync(m, p, cancellationToken: c));
                 using var token = session?.Rt.Activity.BeginActivity(req.Params?.Name, session?.SessionId);
                 return await next(req, ct);
             });

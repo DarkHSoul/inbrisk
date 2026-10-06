@@ -233,12 +233,17 @@ public sealed class McpSession : IDisposable
         // AutoConfirm: the MCP client's explicit tool call IS the
         // confirmation — the client is the brain. Deny-classified actions
         // (elevated targets, password fields, deny-listed processes,
-        // kill-switch) still refuse regardless.
+        // kill-switch) still refuse regardless. F04: AutoConfirm never
+        // satisfies DANGEROUS classes (input into shell/terminal hosts,
+        // destructive close chords) — Executor routes those through
+        // SafetyPolicy.LocalConsent / a local Confirmer only, so the model
+        // cannot self-approve them.
         Rt = new InbriskRuntime(new InbriskOptions(AutoConfirm: true,
             StartEvents: startEvents,
-            TelemetryPath: telemetryPath ?? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "inbrisk", "mcp-telemetry.jsonl"),
+            // F32: audit trail lives under %ProgramData%\Inbrisk\audit
+            // (ACL'd, hash-chained); the data-dir copy is a readable mirror.
+            TelemetryPath: telemetryPath ?? AuditLog.Path("mcp-telemetry.jsonl"),
+            TelemetryMirrorPath: AuditLog.MirrorPath("mcp-telemetry.jsonl"),
             HwndMetadataCache: HwndMetadata,
             MonitorTopologyCache: MonitorCache,
             VdmHolder: VdmHolder));
@@ -280,6 +285,17 @@ public sealed class McpSession : IDisposable
             sched.OnWorkerReplacementRejected = () => Telemetry.IncUiaWorkerReplacementRejected();
             sched.OnSyncOverAsyncFallback = () => Telemetry.IncSyncOverAsyncFallback();
         }
+
+        // Warm the session's platform services in the background — first-touch
+        // costs (UIA COM thread, GDI+, WGC probe, window enum) would otherwise
+        // serialize into the first tool call. Read-only; skipped while
+        // emergency-stopped so a stopped session stays fully inert.
+        if (Control.State != ComputerControlState.EmergencyStopped)
+            _ = Task.Run(() =>
+            {
+                try { Rt.WarmUp(); }
+                catch { /* warm-up is best-effort — never fault an unobserved task */ }
+            });
     }
 
     /// <summary>Session monitor for wait_for_change/stable — created lazily
@@ -328,12 +344,14 @@ public sealed class McpSession : IDisposable
     /// <summary>Build the canonical observation, keep its frames in the
     /// session registry for later coordinate validation.</summary>
     public BuiltObservation Observe(long? hwndHint, ObservationBudget budget,
-        VisualAttachPolicy policy, long? baseSnapshotId = null)
+        VisualAttachPolicy policy, long? baseSnapshotId = null,
+        int? maxImageWidth = null, bool markElements = false)
     {
         using var _act = Rt.Activity.BeginActivity(); // observing = using the computer
         var baseObs = baseSnapshotId.HasValue ? GetObservation(baseSnapshotId.Value) : null;
         var built = Obs.Build(hwndHint ?? ScopeHwnd, budget, policy, _monitor,
-            PrevOutcome, _recentRefs, baseSnapshot: baseObs);
+            PrevOutcome, _recentRefs, baseSnapshot: baseObs,
+            maxImageWidth: maxImageWidth, markElements: markElements);
         foreach (var kv in built.Frames)
         {
             Frames[kv.Key] = kv.Value;
@@ -358,12 +376,14 @@ public sealed class McpSession : IDisposable
     }
 
     public async Task<BuiltObservation> ObserveAsync(long? hwndHint, ObservationBudget budget,
-        VisualAttachPolicy policy, long? baseSnapshotId = null, CancellationToken ct = default)
+        VisualAttachPolicy policy, long? baseSnapshotId = null, CancellationToken ct = default,
+        int? maxImageWidth = null, bool markElements = false)
     {
         using var _act = Rt.Activity.BeginActivity();
         var baseObs = baseSnapshotId.HasValue ? GetObservation(baseSnapshotId.Value) : null;
         var built = await Obs.BuildAsync(hwndHint ?? ScopeHwnd, budget, policy, _monitor,
-            PrevOutcome, _recentRefs, baseSnapshot: baseObs, ct: ct).ConfigureAwait(false);
+            PrevOutcome, _recentRefs, baseSnapshot: baseObs, ct: ct,
+            maxImageWidth: maxImageWidth, markElements: markElements).ConfigureAwait(false);
         foreach (var kv in built.Frames)
         {
             Frames[kv.Key] = kv.Value;
@@ -402,13 +422,40 @@ public sealed class McpSession : IDisposable
         return _shotTimes.Count;
     }
 
+    /// <summary>Last screenshot per session — repeated captures of the same
+    /// target diff against it; pixel-identical frames reuse the encoded PNG
+    /// (the encoder is deterministic, so identical pixels ⇒ identical bytes).</summary>
+    private (string Key, RawFrame Raw, byte[] Png, long FrameId)? _lastShot;
+
+    /// <summary>Compare a fresh frame against the previous screenshot of the
+    /// same target key. When the pixels are identical the previous PNG is
+    /// returned for reuse, skipping the encode entirely.</summary>
+    public (bool Unchanged, long? PrevFrameId, byte[]? ReusablePng,
+        RectPx? ChangedBounds) CompareScreenshot(string key, RawFrame raw)
+    {
+        if (_lastShot is not { } p || p.Key != key)
+            return (false, null, null, null);
+        var bbox = raw.ChangedBounds(p.Raw);
+        return bbox == null
+            ? (true, p.FrameId, p.Png, null)
+            : (false, p.FrameId, null, bbox);
+    }
+
+    /// <summary>Record the frame that was just minted for a screenshot so the
+    /// next same-target capture can diff against it.</summary>
+    public void NoteScreenshotFrame(string key, RawFrame raw, byte[] png, long frameId) =>
+        _lastShot = (key, raw, png, frameId);
+
     /// <summary>Mint a standalone screenshot frame into the session registry —
-    /// a coordinate click can later reference this frameId.</summary>
-    public (FrameRef Ref, long ObsId) MintFrame(RawFrame raw, long? hwnd)
+    /// a coordinate click can later reference this frameId. Pass
+    /// <paramref name="png"/> when the caller already encoded this frame so
+    /// the PNG isn't produced twice.</summary>
+    public (FrameRef Ref, long ObsId) MintFrame(RawFrame raw, long? hwnd,
+        byte[]? png = null)
     {
         using var _act = Rt.Activity.BeginActivity();
         var meta = new ObsFrameRef(FrameIds.Next(), raw.Width, raw.Height,
-            raw.Transform.SourceRect, VisualAttach.WindowFrame, raw.ToPng(),
+            raw.Transform.SourceRect, VisualAttach.WindowFrame, png ?? raw.ToPng(),
             hwnd, DateTimeOffset.Now,
             hwnd is { } h ? Rt.Window(h)?.Bounds : null);
         var fref = new FrameRef(raw, meta);
@@ -462,7 +509,82 @@ public sealed class McpSession : IDisposable
         _recentRefs.Clear();
     }
 
+    // ---- server→client push channel -------------------------------------
+    // Bound by McpHost's request filter once the JSON-RPC session exists
+    // (req.Server.SendNotificationAsync). Null in tests/headless — every
+    // push is then a no-op. Notifications are fire-and-forget and must
+    // never break the event pipeline, so NotifyAsync swallows send errors.
+
+    /// <summary>MCP notification method used for pushed desktop deltas.</summary>
+    public const string DesktopEventNotification = "inbrisk/desktop_event";
+
+    private volatile Func<string, object?, CancellationToken, Task>? _notify;
+
+    /// <summary>Install the server→client sender (called from the host's
+    /// request filter; idempotent). Pass null to detach.</summary>
+    public void BindNotifications(
+        Func<string, object?, CancellationToken, Task>? sender) => _notify = sender;
+
+    /// <summary>Whether a live JSON-RPC channel is bound for pushes.</summary>
+    public bool NotificationsBound => _notify != null;
+
+    /// <summary>Send a server→client notification. Never throws, no-ops
+    /// when unbound — safe to fire-and-forget from event handlers.</summary>
+    public async Task NotifyAsync(string method, object? payload,
+        CancellationToken ct = default)
+    {
+        var n = _notify;
+        if (n == null) return;
+        try { await n(method, payload, ct).ConfigureAwait(false); }
+        catch { /* a dead/closed channel must not fault event routing */ }
+    }
+
+    // window-lifecycle push throttle: same (kind,hwnd) at most once per
+    // 400ms, and a global 100ms minimum gap so a burst of dialog
+    // create/destroy churn can't flood the client's notification queue
+    private long _lastNotifyTicks;
+    private readonly Dictionary<(EventKind Kind, long Hwnd), long> _notifyDedupe = new();
+
+    private void PushWindowEvent(ObservedEvent e)
+    {
+        var now = DateTimeOffset.UtcNow.Ticks;
+        var key = (e.Kind, e.Hwnd ?? 0);
+        lock (_notifyDedupe)
+        {
+            if (_notifyDedupe.TryGetValue(key, out var last) &&
+                now - last < TimeSpan.TicksPerMillisecond * 400)
+                return;
+            if (now - Interlocked.Read(ref _lastNotifyTicks) <
+                TimeSpan.TicksPerMillisecond * 100)
+                return;
+            _notifyDedupe[key] = now;
+            if (_notifyDedupe.Count > 64) _notifyDedupe.Clear();
+        }
+        Interlocked.Exchange(ref _lastNotifyTicks, now);
+        var win = e.Hwnd is { } h ? Rt?.Window(h) : null;
+        _ = NotifyAsync(DesktopEventNotification, new
+        {
+            kind = e.Kind.ToString(),
+            hwnd = e.Hwnd is { } hh ? $"0x{hh:X}" : null,
+            title = win?.Title,
+            pid = e.Pid ?? win?.Pid,
+            process = win?.ProcessName,
+            at = e.At,
+        });
+    }
+
     private void OnEvent(ObservedEvent e)
+    {
+        // Runs on event-source threads (WinEvent pump, UIA callbacks) — a
+        // fault here must never escape back into the raiser's thread.
+        try
+        {
+            OnEventCore(e);
+        }
+        catch { /* event routing is best-effort — never kill the source thread */ }
+    }
+
+    private void OnEventCore(ObservedEvent e)
     {
         if (e.Kind is EventKind.StructureChanged or EventKind.NameChanged or EventKind.WindowClosed)
         {
@@ -484,6 +606,12 @@ public sealed class McpSession : IDisposable
             var win = Rt?.Window(e.Hwnd.Value);
             DynamicToolset.UpdateForegroundContext(win?.ProcessName, win?.Title, e.At);
         }
+
+        // stream window-level changes to the client so long-running plans
+        // surface dialogs/focus moves without waiting for the tool result
+        if (_notify != null && e.Kind is EventKind.WindowOpened
+            or EventKind.WindowClosed or EventKind.ForegroundChanged)
+            PushWindowEvent(e);
     }
 
     private int _disposed;

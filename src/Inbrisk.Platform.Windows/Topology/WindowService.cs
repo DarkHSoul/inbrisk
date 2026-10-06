@@ -388,6 +388,52 @@ public sealed class WindowService : IWindowService
         return false;
     }
 
+    /// <summary>PIDs that must never be terminated by the agent: this MCP
+    /// server process plus every ancestor up the parent chain to the session
+    /// root (terminal, IDE, shell). Killing any of them ends the AI host
+    /// session. Snapshot taken once at startup — a process's own ancestry is
+    /// fixed for its lifetime.</summary>
+    public static IReadOnlyCollection<int> AgentHostAndAncestorPids => ProtectedPids;
+
+    /// <summary>Is <paramref name="pid"/> the MCP server process itself or one
+    /// of its ancestors? This is a raw pid check — it applies to processes that
+    /// own no windows (console hosts, launcher shells) and is NOT weakened by
+    /// the File-Explorer-folder carve-out in <see cref="IsWindowProtected"/>:
+    /// closing one Explorer folder window is safe, killing explorer.exe is not.</summary>
+    public static bool IsAgentHostOrAncestorPid(int pid, out string? reason)
+    {
+        if (pid > 0 && ProtectedPids.Contains(pid))
+        {
+            reason = $"agent host process or terminal/IDE ancestor (pid={pid})";
+            return true;
+        }
+        reason = null;
+        return false;
+    }
+
+    /// <summary>Known shared process hosts that must NEVER be Process.Kill'd —
+    /// terminating them tears down every window/app they host (UWP frames,
+    /// shell experiences). Unlike <see cref="IsProcessProtected"/> this does
+    /// NOT block a graceful WM_CLOSE of an individual hosted window; it only
+    /// vetoes hard termination.</summary>
+    public static bool IsSharedMultiWindowProcess(string? processName, out string? reason)
+    {
+        reason = null;
+        if (string.IsNullOrWhiteSpace(processName)) return false;
+        var proc = processName.Trim().ToLowerInvariant();
+        if (!proc.EndsWith(".exe")) proc += ".exe";
+
+        if (proc is "applicationframehost.exe" or "shellexperiencehost.exe"
+            or "startmenuexperiencehost.exe" or "searchhost.exe" or "searchapp.exe"
+            or "sihost.exe" or "textinputhost.exe")
+        {
+            reason = $"shared shell/UWP host process ('{proc}') — killing it would close every window it hosts";
+            return true;
+        }
+
+        return false;
+    }
+
     public bool IsWindowProtected(long hwnd, out string? reason)
     {
         reason = null;
