@@ -78,6 +78,21 @@ public sealed class TaskRecipeStore : ITaskRecipeStore
         Save(updated);
     }
 
+    /// <summary>Sanitize a caller-supplied recipe name with the same rule
+    /// Save/Get apply; null when nothing filename-usable remains (empty or
+    /// every character mapped to a placeholder).</summary>
+    public static string? SanitizeName(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return null;
+        var safe = Sanitize(name.Trim());
+        return safe.Length == 0 || safe.All(c => c is '_' or '.') ? null : safe;
+    }
+
+    /// <summary>On-disk path a recipe of this name occupies (after
+    /// sanitization) — whether or not the file exists yet.</summary>
+    public string PathFor(string name) =>
+        Path.Combine(_dir, $"{Sanitize(name.Trim())}.json");
+
     private static string Sanitize(string name)
     {
         var invalids = Path.GetInvalidFileNameChars();
