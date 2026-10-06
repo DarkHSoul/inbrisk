@@ -14,7 +14,10 @@ try:
 except Exception:
     pass
 
-PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "project-dc8f4996-b16a-4462-911")
+# F37: no hardcoded project id — the caller's own GCP project comes from env.
+PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT")
+if not PROJECT_ID:
+    sys.exit("GOOGLE_CLOUD_PROJECT env var is required (your GCP project id).")
 # Vertex AI publisher models use regions like us-central1, not global
 LOCATION = "us-central1"
 MODEL = "gemini-2.5-flash"

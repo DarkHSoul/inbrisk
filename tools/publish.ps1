@@ -56,6 +56,43 @@ $zip = Join-Path $rel "Inbrisk-$($Rid.Replace('win-','')).zip"
 if (Test-Path $zip) { Remove-Item $zip }
 Compress-Archive -Path $exe -DestinationPath $zip
 
+# --------------------------------------------------------------------------
+# F31 opt-in signing hooks — DISABLED by default; no cert/key exists yet.
+#
+# Authenticode (signtool): set ONE of these before running:
+#   $env:INBRISK_SIGN_SHA1 = "<cert thumbprint in the cert store>"
+#   $env:INBRISK_SIGN_PFX  = "C:\path\to\codesign.pfx"
+#   $env:INBRISK_SIGN_PFX_PASSWORD = "..."   (only with INBRISK_SIGN_PFX)
+# Signing happens BEFORE the manifest hashes below so provenance covers the
+# shipped bytes.
+$signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty Source -First 1
+if (-not $signtool) {
+    $signtool = @(
+        "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe",
+        "${env:ProgramFiles(x86)}\Windows Kits\10\App Certification Kit\signtool.exe"
+    ) | ForEach-Object { Resolve-Path $_ -ErrorAction SilentlyContinue } |
+        Select-Object -ExpandProperty Path -First 1
+}
+if (($env:INBRISK_SIGN_SHA1 -or $env:INBRISK_SIGN_PFX) -and $signtool) {
+    $signArgs = @("sign", "/fd", "sha256",
+        "/tr", "http://timestamp.digicert.com", "/td", "sha256")
+    if ($env:INBRISK_SIGN_SHA1) { $signArgs += @("/sha1", $env:INBRISK_SIGN_SHA1) }
+    if ($env:INBRISK_SIGN_PFX) {
+        $signArgs += @("/f", $env:INBRISK_SIGN_PFX)
+        if ($env:INBRISK_SIGN_PFX_PASSWORD) { $signArgs += @("/p", $env:INBRISK_SIGN_PFX_PASSWORD) }
+    }
+    foreach ($artifact in @($exe, (Join-Path $rel "InbriskSetup.exe"), $zip)) {
+        if (Test-Path $artifact) {
+            Write-Host "Authenticode signing $artifact"
+            & $signtool @signArgs $artifact | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed on $artifact" }
+        }
+    }
+} elseif ($env:INBRISK_SIGN_SHA1 -or $env:INBRISK_SIGN_PFX) {
+    Write-Warning "signing requested but signtool.exe not found — artifacts stay unsigned"
+}
+
 $commit = try { (git -C $root rev-parse HEAD 2>$null).Trim() } catch { $null }
 if ([string]::IsNullOrWhiteSpace($commit)) { $commit = "unknown" }
 
@@ -85,6 +122,30 @@ $manifest = [ordered]@{
     }
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $rel "manifest.json") -Encoding utf8
+
+# F31: detached manifest signature for `inbrisk update` — the updater verifies
+# manifest.json against the public key embedded via UpdateSigning.EmbeddedPublicKeyPem.
+# Opt-in: set $env:INBRISK_MANIFEST_KEY to an RSA private key (.pem). Requires
+# openssl on PATH. Produces manifest.json.sig next to the manifest; ship both.
+if ($env:INBRISK_MANIFEST_KEY) {
+    $openssl = Get-Command openssl.exe -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty Source -First 1
+    if ($openssl) {
+        & $openssl dgst -sha256 -sign $env:INBRISK_MANIFEST_KEY `
+            -out (Join-Path $rel "manifest.json.sig") `
+            (Join-Path $rel "manifest.json")
+        if ($LASTEXITCODE -ne 0) { throw "manifest signing failed" }
+        Write-Host "manifest.json.sig written (detached RSA/SHA-256 signature)"
+    } else {
+        Write-Warning "INBRISK_MANIFEST_KEY set but openssl not found — manifest unsigned"
+    }
+}
+# Key generation for release signing (run once, guard the private key):
+#   openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out update-signing-private.pem
+#   openssl rsa -in update-signing-private.pem -pubout -out update-signing-public.pem
+# then paste update-signing-public.pem into src/Inbrisk.Setup/UpdateSigning.cs
+# (EmbeddedPublicKeyPem) and sign manifests with:
+#   openssl dgst -sha256 -sign update-signing-private.pem -out manifest.json.sig manifest.json
 
 Write-Host ""
 Write-Host "Release artifacts in $rel :"

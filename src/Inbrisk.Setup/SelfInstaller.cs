@@ -276,7 +276,10 @@ public static class SelfInstaller
         string? Sha256, string? InstallerSha256, string? MinWindowsBuild,
         // release-manifest fields: payloadUrl/payloadSha256 (zip), so one
         // manifest serves both humans and the updater
-        string? PayloadUrl, string? PayloadSha256);
+        string? PayloadUrl, string? PayloadSha256,
+        // F31: explicit detached-signature location. When absent the updater
+        // looks for "<manifest>.sig" next to the manifest itself.
+        string? SignatureUrl = null);
 
     public sealed record UpdateResult(bool Ok, string Message,
         bool Deferred = false);
@@ -285,7 +288,12 @@ public static class SelfInstaller
     /// Update from a manifest (JSON: {version, url, sha256}). The feed URL is
     /// explicit (--manifest or INBRISK_UPDATE_MANIFEST) — Inbrisk ships no
     /// default endpoint yet. SHA-256 verification is mandatory; an unsigned
-    /// or unverifiable payload is refused.
+    /// or unverifiable payload is refused. F31: the manifest itself must be
+    /// RSA-signed — a hash inside an unsigned manifest proves nothing, since
+    /// whoever swaps the payload can swap the manifest. The detached
+    /// signature lives at manifest.signatureUrl or "&lt;manifest&gt;.sig";
+    /// release builds verify it against the embedded public key
+    /// (UpdateSigning). Dev builds without a key accept unsigned manifests.
     /// </summary>
     public static async Task<UpdateResult> UpdateAsync(string? manifestUri)
     {
@@ -297,31 +305,104 @@ public static class SelfInstaller
 
         try
         {
-            string manifestJson;
+            byte[] manifestBytes;
             string? manifestDir = null;
-            if (Uri.TryCreate(manifestUri, UriKind.Absolute, out var u) &&
-                (u.Scheme == "https" || u.Scheme == "http"))
+            var remoteFeed = Uri.TryCreate(manifestUri, UriKind.Absolute, out var u) &&
+                (u.Scheme == "https" || u.Scheme == "http");
+            if (remoteFeed)
             {
-                if (u.Scheme != "https")
+                if (u!.Scheme != "https")
                     return new(false, "refusing insecure http update feed");
                 using var http = new HttpClient();
-                manifestJson = await http.GetStringAsync(u);
+                manifestBytes = await http.GetByteArrayAsync(u);
                 manifestDir = u.GetLeftPart(UriPartial.Path)
                     .TrimEnd('/') + "/";
             }
             else
             {
-                manifestJson = File.ReadAllText(manifestUri);
+                manifestBytes = File.ReadAllBytes(manifestUri);
                 manifestDir = Path.GetDirectoryName(Path.GetFullPath(manifestUri));
             }
 
-            var m = JsonSerializer.Deserialize<UpdateManifest>(manifestJson,
+            var m = JsonSerializer.Deserialize<UpdateManifest>(manifestBytes,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
             var payloadUrl = m?.Url ?? m?.PayloadUrl;
             var payloadSha = m?.Sha256 ?? m?.PayloadSha256;
             if (m == null || string.IsNullOrEmpty(payloadUrl) ||
                 string.IsNullOrEmpty(payloadSha))
                 return new(false, "manifest missing url/sha256 — refusing update");
+
+            // ---- F31: verify the manifest signature before trusting it ----
+            // Detached signature over the exact manifest bytes: explicit
+            // signatureUrl, else "<manifest>.sig" alongside the manifest.
+            var sigUri = m!.SignatureUrl ?? manifestUri + ".sig";
+            if (manifestDir != null && !Uri.TryCreate(sigUri, UriKind.Absolute, out _)
+                && !Path.IsPathRooted(sigUri))
+                sigUri = Path.Combine(manifestDir, sigUri);
+            byte[]? sigBytes = null;
+            try
+            {
+                if (Uri.TryCreate(sigUri, UriKind.Absolute, out var su) &&
+                    (su.Scheme == "https" || su.Scheme == "http"))
+                {
+                    if (su.Scheme != "https")
+                        return new(false, "refusing insecure http signature URL");
+                    using var http = new HttpClient();
+                    using var resp = await http.GetAsync(su);
+                    if (resp.IsSuccessStatusCode)
+                        sigBytes = await resp.Content.ReadAsByteArrayAsync();
+                }
+                else if (File.Exists(sigUri))
+                {
+                    sigBytes = File.ReadAllBytes(sigUri);
+                }
+            }
+            catch { /* absent .sig is handled by the policy below */ }
+            // .sig may hold raw signature bytes or base64/hex text — normalize.
+            if (sigBytes is { Length: > 0 })
+            {
+                var txt = System.Text.Encoding.UTF8.GetString(sigBytes).Trim();
+                if (!txt.Any(c => c > 127))
+                {
+                    try { sigBytes = Convert.FromBase64String(txt); }
+                    catch
+                    {
+                        try
+                        {
+                            sigBytes = Convert.FromHexString(
+                                txt.StartsWith("0x") ? txt[2..] : txt);
+                        }
+                        catch { /* keep raw bytes */ }
+                    }
+                }
+            }
+
+            bool unsignedDevFeed;
+            using (var key = UpdateSigning.LoadPublicKey())
+            {
+                if (key != null)
+                {
+                    if (sigBytes == null || sigBytes.Length == 0)
+                        return new(false,
+                            "manifest signature missing (.sig) — refusing unsigned update");
+                    if (!UpdateSigning.VerifyManifest(manifestBytes, sigBytes, key))
+                        return new(false,
+                            "manifest signature INVALID — refusing update " +
+                            "(payload never downloaded)");
+                    unsignedDevFeed = false;
+                }
+                else
+                {
+                    // No verification key in this build: a signature we cannot
+                    // check proves nothing, so treat a signed feed as hostile.
+                    if (sigBytes != null && sigBytes.Length > 0)
+                        return new(false,
+                            "manifest carries a signature but this build has no " +
+                            "verification key — refusing");
+                    unsignedDevFeed = true;
+                }
+            }
+
             // relative payload path resolves against the manifest location
             if (manifestDir != null && !Uri.TryCreate(payloadUrl, UriKind.Absolute, out _)
                 && !Path.IsPathRooted(payloadUrl))
@@ -371,7 +452,8 @@ public static class SelfInstaller
                     JsonSerializer.Serialize(new { version = m.Version, staging }));
                 return new(true,
                     $"update {m.Version} staged — will apply when no MCP session is active " +
-                    "(restart the MCP host to finish)", Deferred: true);
+                    "(restart the MCP host to finish)" +
+                    (unsignedDevFeed ? " (unsigned manifest — dev feed)" : ""), Deferred: true);
             }
 
             var backupDir = installDir + ".old";
@@ -390,7 +472,9 @@ public static class SelfInstaller
                 if (!Directory.Exists(installDir)) Directory.Move(backupDir, installDir);
                 throw;
             }
-            return new(true, $"updated to {m.Version} (previous at {backupDir})");
+            return new(true,
+                $"updated to {m.Version} (previous at {backupDir})" +
+                (unsignedDevFeed ? " (unsigned manifest — dev feed)" : ""));
         }
         catch (Exception e)
         {

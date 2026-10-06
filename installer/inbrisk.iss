@@ -33,6 +33,14 @@ CloseApplications=no
 RestartApplications=no
 DisableProgramGroupPage=yes
 
+; --- opt-in Authenticode signing (F31) --------------------------------------
+; No code-signing certificate exists yet. When one is provisioned, sign the
+; compiler output AND the uninstaller by defining a sign tool on the ISCC
+; command line and uncommenting the two directives below:
+;   iscc /Sinbrisk="signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /sha1 $q%INBRISK_SIGN_SHA1%$q $f" inbrisk.iss
+;SignTool=inbrisk
+;SignedUninstaller=yes
+
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "turkish"; MessagesFile: "compiler:Languages\Turkish.isl"
