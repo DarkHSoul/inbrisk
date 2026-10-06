@@ -197,6 +197,30 @@ public sealed class GhostDesktopInput : IDisposable
     private const uint WM_MBUTTONDBLCLK = 0x0209;
     private const uint WM_MOUSEWHEEL = 0x020A;
     private const uint WM_MOUSEHWHEEL = 0x020E;
+    private const uint WM_NCHITTEST = 0x0084;
+    private const uint WM_CLOSE = 0x0010;
+
+    // Non-Client Hit Test Codes
+    private const int HTNOWHERE = 0;
+    private const int HTCLIENT = 1;
+    private const int HTCAPTION = 2;
+    private const int HTMINBUTTON = 8;
+    private const int HTMAXBUTTON = 9;
+    private const int HTLEFT = 10;
+    private const int HTRIGHT = 11;
+    private const int HTTOP = 12;
+    private const int HTTOPLEFT = 13;
+    private const int HTTOPRIGHT = 14;
+    private const int HTBOTTOM = 15;
+    private const int HTBOTTOMLEFT = 16;
+    private const int HTBOTTOMRIGHT = 17;
+    private const int HTCLOSE = 20;
+
+    // SetWindowPos Flags
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOMOVE = 0x0002;
+    private const uint SWP_NOZORDER = 0x0004;
+    private const uint SWP_NOACTIVATE = 0x0010;
 
     // Mouse Key Flags (WParam)
     private const uint MK_LBUTTON = 0x0001;
@@ -317,6 +341,28 @@ public sealed class GhostDesktopInput : IDisposable
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern short VkKeyScanW(char ch);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsZoomed(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SendMessageTimeoutW(
+            IntPtr hWnd,
+            uint Msg,
+            IntPtr wParam,
+            IntPtr lParam,
+            uint fuFlags,
+            uint uTimeout,
+            out IntPtr lpdwResult);
     }
 
     #endregion
@@ -336,6 +382,14 @@ public sealed class GhostDesktopInput : IDisposable
     private int _lastMouseX;
     private int _lastMouseY;
     private IntPtr _lastTargetHwnd = IntPtr.Zero;
+
+    // Interactive Ghost Window Dragging & Resizing State
+    private bool _isDraggingWindow;
+    private IntPtr _dragHwnd = IntPtr.Zero;
+    private int _dragHitTest;
+    private int _dragStartMouseX;
+    private int _dragStartMouseY;
+    private RECT _dragStartWindowRect;
 
     #endregion
 
@@ -567,10 +621,76 @@ public sealed class GhostDesktopInput : IDisposable
     {
         RunOnGhostThread(() =>
         {
-            IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt);
             _lastMouseX = desktopX;
             _lastMouseY = desktopY;
 
+            if (_isDraggingWindow && _dragHwnd != IntPtr.Zero && Win32.IsWindow(_dragHwnd))
+            {
+                int deltaX = desktopX - _dragStartMouseX;
+                int deltaY = desktopY - _dragStartMouseY;
+
+                int newX = _dragStartWindowRect.Left;
+                int newY = _dragStartWindowRect.Top;
+                int newW = _dragStartWindowRect.Right - _dragStartWindowRect.Left;
+                int newH = _dragStartWindowRect.Bottom - _dragStartWindowRect.Top;
+
+                if (_dragHitTest == HTCAPTION)
+                {
+                    newX += deltaX;
+                    newY += deltaY;
+                }
+                else
+                {
+                    switch (_dragHitTest)
+                    {
+                        case HTRIGHT:
+                            newW = Math.Max(160, newW + deltaX);
+                            break;
+                        case HTBOTTOM:
+                            newH = Math.Max(80, newH + deltaY);
+                            break;
+                        case HTBOTTOMRIGHT:
+                            newW = Math.Max(160, newW + deltaX);
+                            newH = Math.Max(80, newH + deltaY);
+                            break;
+                        case HTLEFT:
+                            int cdx = Math.Min(deltaX, newW - 160);
+                            newX += cdx;
+                            newW -= cdx;
+                            break;
+                        case HTTOP:
+                            int cdy = Math.Min(deltaY, newH - 80);
+                            newY += cdy;
+                            newH -= cdy;
+                            break;
+                        case HTTOPLEFT:
+                            int cdx1 = Math.Min(deltaX, newW - 160);
+                            int cdy1 = Math.Min(deltaY, newH - 80);
+                            newX += cdx1;
+                            newW -= cdx1;
+                            newY += cdy1;
+                            newH -= cdy1;
+                            break;
+                        case HTTOPRIGHT:
+                            int cdy2 = Math.Min(deltaY, newH - 80);
+                            newY += cdy2;
+                            newH -= cdy2;
+                            newW = Math.Max(160, newW + deltaX);
+                            break;
+                        case HTBOTTOMLEFT:
+                            int cdx2 = Math.Min(deltaX, newW - 160);
+                            newX += cdx2;
+                            newW -= cdx2;
+                            newH = Math.Max(80, newH + deltaY);
+                            break;
+                    }
+                }
+
+                Win32.SetWindowPos(_dragHwnd, IntPtr.Zero, newX, newY, newW, newH, SWP_NOZORDER | SWP_NOACTIVATE);
+                return;
+            }
+
+            IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt);
             if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
             {
                 _lastTargetHwnd = hwnd;
@@ -591,9 +711,52 @@ public sealed class GhostDesktopInput : IDisposable
     {
         RunOnGhostThread(() =>
         {
-            IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt);
             _lastMouseX = desktopX;
             _lastMouseY = desktopY;
+
+            IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt, out var hitTopHwnd);
+
+            if (button == MouseButton.Left && hitTopHwnd != IntPtr.Zero && hitTopHwnd != Win32.GetDesktopWindow())
+            {
+                int hitTest = GetHitTest(hitTopHwnd, desktopX, desktopY);
+
+                if (hitTest == HTCAPTION || hitTest == HTRIGHT || hitTest == HTBOTTOM ||
+                    hitTest == HTBOTTOMRIGHT || hitTest == HTLEFT || hitTest == HTTOP ||
+                    hitTest == HTTOPLEFT || hitTest == HTTOPRIGHT || hitTest == HTBOTTOMLEFT)
+                {
+                    _lastTargetHwnd = hitTopHwnd;
+                    _isDraggingWindow = true;
+                    _dragHwnd = hitTopHwnd;
+                    _dragHitTest = hitTest;
+                    _dragStartMouseX = desktopX;
+                    _dragStartMouseY = desktopY;
+                    Win32.GetWindowRect(hitTopHwnd, out _dragStartWindowRect);
+
+                    Win32.SetForegroundWindow(hitTopHwnd);
+                    Win32.SetActiveWindow(hitTopHwnd);
+                    Win32.SetFocus(hitTopHwnd);
+                    Win32.PostMessageW(hitTopHwnd, WM_ACTIVATE, (IntPtr)1 /* WA_ACTIVE */, IntPtr.Zero);
+                    return;
+                }
+
+                if (hitTest == HTCLOSE)
+                {
+                    Win32.PostMessageW(hitTopHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                    return;
+                }
+
+                if (hitTest == HTMINBUTTON)
+                {
+                    Win32.ShowWindow(hitTopHwnd, 6 /* SW_MINIMIZE */);
+                    return;
+                }
+
+                if (hitTest == HTMAXBUTTON)
+                {
+                    ToggleMaximize(hitTopHwnd);
+                    return;
+                }
+            }
 
             if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
             {
@@ -642,10 +805,16 @@ public sealed class GhostDesktopInput : IDisposable
     {
         RunOnGhostThread(() =>
         {
-            IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt);
             _lastMouseX = desktopX;
             _lastMouseY = desktopY;
 
+            if (_isDraggingWindow)
+            {
+                _isDraggingWindow = false;
+                _dragHwnd = IntPtr.Zero;
+            }
+
+            IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt);
             if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
             {
                 _lastTargetHwnd = hwnd;
@@ -690,6 +859,20 @@ public sealed class GhostDesktopInput : IDisposable
     /// <param name="doubleClick">Whether to perform a double-click gesture.</param>
     public void SendMouseClick(int desktopX, int desktopY, MouseButton button = MouseButton.Left, bool doubleClick = false)
     {
+        if (doubleClick && button == MouseButton.Left)
+        {
+            IntPtr hwndHit = GetWindowAtPoint(desktopX, desktopY, out _, out var hitTopHwnd);
+            if (hitTopHwnd != IntPtr.Zero && hitTopHwnd != Win32.GetDesktopWindow())
+            {
+                int hitTest = GetHitTest(hitTopHwnd, desktopX, desktopY);
+                if (hitTest == HTCAPTION)
+                {
+                    ToggleMaximize(hitTopHwnd);
+                    return;
+                }
+            }
+        }
+
         SendMouseMove(desktopX, desktopY);
         SendMouseDown(desktopX, desktopY, button);
         Thread.Sleep(15);
@@ -1204,14 +1387,18 @@ public sealed class GhostDesktopInput : IDisposable
     /// Resolves the specific target HWND and computes client coordinates for a given ghost desktop point.
     /// Enumerates visible windows specifically on the isolated ghost desktop (_hDesktop) in Z-order.
     /// </summary>
-    private IntPtr GetWindowAtPoint(int desktopX, int desktopY, out POINT clientPt)
+    private IntPtr GetWindowAtPoint(int desktopX, int desktopY, out POINT clientPt) =>
+        GetWindowAtPoint(desktopX, desktopY, out clientPt, out _);
+
+    private IntPtr GetWindowAtPoint(int desktopX, int desktopY, out POINT clientPt, out IntPtr hitTopHwnd)
     {
         EnsureDesktopAttached();
 
-        IntPtr hitTopHwnd = IntPtr.Zero;
+        hitTopHwnd = IntPtr.Zero;
 
         if (_hDesktop != IntPtr.Zero)
         {
+            IntPtr found = IntPtr.Zero;
             Win32.EnumDesktopWindows(_hDesktop, (hWnd, lParam) =>
             {
                 if (hWnd == IntPtr.Zero || !Win32.IsWindow(hWnd) || !Win32.IsWindowVisible(hWnd) || Win32.IsIconic(hWnd))
@@ -1249,12 +1436,13 @@ public sealed class GhostDesktopInput : IDisposable
                 if (desktopX >= rect.Left && desktopX < rect.Right &&
                     desktopY >= rect.Top && desktopY < rect.Bottom)
                 {
-                    hitTopHwnd = hWnd;
+                    found = hWnd;
                     return false; // Found topmost hit!
                 }
 
                 return true;
             }, IntPtr.Zero);
+            hitTopHwnd = found;
         }
 
         if (hitTopHwnd == IntPtr.Zero)
@@ -1288,6 +1476,46 @@ public sealed class GhostDesktopInput : IDisposable
 
         clientPt = curPt;
         return targetHwnd;
+    }
+
+    private static int GetHitTest(IntPtr hwnd, int screenX, int screenY)
+    {
+        if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd)) return HTNOWHERE;
+
+        IntPtr lParam = unchecked((IntPtr)((((uint)screenY & 0xFFFF) << 16) | ((uint)screenX & 0xFFFF)));
+        if (Win32.SendMessageTimeoutW(hwnd, WM_NCHITTEST, IntPtr.Zero, lParam, 2 /* SMTO_ABORTIFHUNG */, 80, out IntPtr res) != IntPtr.Zero)
+        {
+            int h = res.ToInt32();
+            if (h != 0 && h != -1) return h;
+        }
+
+        if (Win32.GetWindowRect(hwnd, out RECT rc))
+        {
+            if (screenX >= rc.Left && screenX < rc.Right &&
+                screenY >= rc.Top && screenY < rc.Top + 32)
+            {
+                if (screenX >= rc.Right - 36) return HTCLOSE;
+                if (screenX >= rc.Right - 72) return HTMAXBUTTON;
+                if (screenX >= rc.Right - 108) return HTMINBUTTON;
+                return HTCAPTION;
+            }
+            return HTCLIENT;
+        }
+
+        return HTCLIENT;
+    }
+
+    private static void ToggleMaximize(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd)) return;
+        if (Win32.IsZoomed(hwnd))
+        {
+            Win32.ShowWindow(hwnd, 9 /* SW_RESTORE */);
+        }
+        else
+        {
+            Win32.ShowWindow(hwnd, 3 /* SW_MAXIMIZE */);
+        }
     }
 
     /// <summary>
@@ -1403,6 +1631,9 @@ public sealed class GhostDesktopInput : IDisposable
     {
         RunOnGhostThread(() =>
         {
+            _isDraggingWindow = false;
+            _dragHwnd = IntPtr.Zero;
+
             if (_heldMouseKeys != 0)
             {
                 int x = _lastMouseX;
