@@ -1,6 +1,6 @@
 ---
 name: inbrisk
-description: Control and automate Windows desktop applications (Notepad, browsers, Explorer, UWP apps, etc.) through the inbrisk C#/.NET MCP server (computer_* tools). Prefer computer_run plans for multi-step work.
+description: Control and automate Windows desktop applications (Notepad, browsers, Explorer, UWP apps, etc.) through the inbrisk C#/.NET MCP server (computer_* tools). Batch-first: for 2+ steps always use computer_run/computer_batch, never chains of single-action calls.
 ---
 
 # Inbrisk Windows Desktop Control (C# MCP)
@@ -11,6 +11,60 @@ The old Rust workspace is **archived** at `../inbrisk-rust` — `inbrisk-cli.exe
 
 Connect via the MCP server named `inbrisk` (installed:
 `%LOCALAPPDATA%\Programs\Inbrisk\inbrisk.exe mcp`).
+
+## Batch-First contract (mandatory)
+
+**For any task needing 2+ UI actions you MUST use `computer_run` or
+`computer_batch` — never a sequence of single `computer_click` /
+`computer_type` / `computer_hotkey` / `computer_invoke` calls.** Every
+single-action call costs a full LLM round trip; a batch or plan does the
+same work server-side in one call and returns one delta report.
+Single-action tools are reserved for genuinely isolated one-off actions —
+e.g. one click whose follow-up depends on reasoning over what you read
+back, not on a known sequence.
+
+### When to use which
+
+- **`computer_run`** — the full plan engine. Use whenever the flow needs
+  conditions (`ifExists`/`ifNotExists`/`ifEnabled`/`ifValue`), iteration
+  (`scan`/`for_each`), `find{as:"x"}` element bindings, state waits
+  (`wait_for*`), checkpoints/human handoff, or pause/resume via `runId`.
+- **`computer_batch`** — compact form for simple linear click/type/key
+  sequences with no conditions or bindings. `set:[…]` fills several form
+  fields in one shot (mutually exclusive with `steps`); `until` waits for
+  an outcome afterwards; `read` pulls element values back in the same call.
+- **`computer_do`** — one-shot launch/focus + click + type + hotkey
+  (`{app, click, type, hotkey, submit}`). For "open X and do Y" with no
+  branching.
+- **Single-action tools** (`computer_click`, `computer_type`,
+  `computer_hotkey`, …) — only for a truly isolated action, or when the
+  next step genuinely cannot be predicted without observing first.
+
+### Minimal correct call shapes
+
+⚠ `computer_batch` and `computer_run` use **different step field names**.
+Batch steps are compact — `do`/`t`/`v`/`role`/`keys` — NOT
+`action`/`target`/`text`:
+
+`computer_batch` — linear sequence:
+```json
+{"steps":[{"do":"click","t":"Save"},{"do":"type","v":"x","role":"edit"},{"do":"hotkey","keys":"ctrl+s"}]}
+```
+
+`computer_batch` — multi-field form via `set`:
+```json
+{"set":[{"target":"File name:","value":"report.txt"},{"target":"Encoding:","value":"UTF-8","role":"ComboBox"}]}
+```
+
+`computer_run` — full RunStep schema (`action`/`target`/`elementId`/`as`/…):
+```json
+{"steps":[{"action":"launch","app":"notepad","waitFor":"window"},{"action":"find","as":"doc","target":{"process":"notepad","role":"document"}},{"action":"set_value","elementId":"$doc","text":"hi"}]}
+```
+
+`computer_do` — one-shot:
+```json
+{"app":"notepad","type":"hello world","hotkey":"ctrl+s"}
+```
 
 ## Default workflow
 

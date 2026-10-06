@@ -16,7 +16,7 @@ pauses the run — resume with the returned `runId` (bindings preserved).
 
 ```json
 {"steps": [
-  {"action":"launch","app":"notepad","waitFor":"window","timeoutMs":15000},
+  {"action":"launch","app":"notepad","waitFor":"window","timeout":15000},
   {"action":"find","as":"doc","target":{"process":"notepad","role":"document"}},
   {"action":"set_value","elementId":"$doc","text":"hello"},
   {"action":"hotkey","keys":"ctrl+s"},
@@ -35,6 +35,15 @@ pauses the run — resume with the returned `runId` (bindings preserved).
 ]}
 ```
 
+## UI-map selectors (`map:`)
+
+Any `target` may reference the permanent UI map instead of hand-written
+selectors: `{"target":{"map":"app.element"}}`, or `map:app.element` inside a
+string target (e.g. computer_batch `t`, computer_find `name`). Covers
+notepad/calculator/explorer/taskmgr/mspaint — e.g. `map:notepad.document`,
+`map:calculator.equals`. Explicit target fields override map defaults;
+entries may be `verify`-flagged, so fall back to observe if one misses.
+
 ## Conditional skips
 
 `ifExists`/`ifNotExists`/`ifEnabled`/`ifValue` skip a step without failing —
@@ -42,6 +51,10 @@ use them for "only click if the dialog exists" logic.
 
 ## Do NOT
 
-- Don't chain N single-tool calls when a plan expresses the same flow.
+- Don't chain N single-tool calls when a plan expresses the same flow —
+  this is a hard rule (see SKILL.md "Batch-First contract"). When the
+  sequence is simple and linear with no conditions/bindings,
+  `computer_batch` (compact `do`/`t`/`v` steps, or `set` for forms) is
+  the lighter-weight alternative to `computer_run`.
 - Don't re-observe after every step — the `delta` reports what changed.
 - Don't use raw coordinates when an `elementId`/semantic target exists.
