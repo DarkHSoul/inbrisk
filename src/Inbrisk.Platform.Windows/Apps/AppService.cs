@@ -62,6 +62,21 @@ public sealed class AppService : IAppService, IDisposable
     private DateTime _packagesCacheTime = DateTime.MinValue;
     private readonly object _packagesLock = new();
 
+    // Launch-wait caches: a top-level-window snapshot invalidated by ANY
+    // event-buffer generation bump (window events) plus a short TTL, and a
+    // process-name set refreshed at most every 250ms — a full EnumWindows /
+    // GetProcesses on every poll slice is what made waits expensive.
+    private const long WindowSnapshotTtlMs = 120;
+    private IReadOnlyList<WindowInfo>? _windowSnapshot;
+    private long _windowSnapshotGen = -1;
+    private long _windowSnapshotTicks;
+    private readonly object _windowSnapshotLock = new();
+
+    private const long ProcNameTtlMs = 250;
+    private HashSet<string>? _procNameSnapshot;
+    private long _procNameTicks;
+    private readonly object _procNameLock = new();
+
     public static int CatalogFullScanCount;
     public static int MemoryCacheHitCount;
     public static int FilesystemEntriesScanned;
@@ -124,12 +139,23 @@ public sealed class AppService : IAppService, IDisposable
             clock: clock,
             telemetry: _catalogService.Telemetry);
 
+        // Background cold build: the first launch resolves from a warm
+        // snapshot instead of paying a synchronous filesystem/registry/
+        // WinRT scan. GetSnapshot is single-flight — a launch landing
+        // mid-build awaits the same refresh, never a duplicate scan.
+        _ = Task.Run(() =>
+        {
+            try { _catalogService.GetSnapshot(); }
+            catch { /* warm-up is best-effort; resolution falls back */ }
+        });
     }
 
     internal void InvalidateCache()
     {
         lock (_appsLock) _cachedApps = null;
         lock (_packagesLock) _cachedPackages = null;
+        lock (_windowSnapshotLock) _windowSnapshot = null;
+        lock (_procNameLock) _procNameSnapshot = null;
         _resolveCache.Clear();
         _catalogService.Invalidate();
         _launchCache.InvalidateAll();
@@ -146,6 +172,82 @@ public sealed class AppService : IAppService, IDisposable
     // ------------------------------------------------------------------
 
     public LaunchResult Launch(LaunchSpec spec, CancellationToken ct = default)
+    {
+        // Self-contained perf record: computer_launch is not wrapped by a
+        // PerfTrace at the MCP layer, so begin one only when the launch is
+        // not already inside a trace (e.g. a computer_run step).
+        var ownTrace = PerfTrace.TryCurrent == null
+            ? PerfTrace.Begin("computer_launch",
+                spec.App ?? spec.Executable ?? spec.Path ?? spec.Aumid ??
+                spec.Uri ?? "app")
+            : null;
+        var timings = new LaunchTimings();
+        var wall = Stopwatch.StartNew();
+        LaunchResult? result = null;
+        try
+        {
+            result = LaunchCore(spec, ct, timings);
+            return result;
+        }
+        finally
+        {
+            timings.TotalMs = wall.ElapsedMilliseconds;
+            EmitLaunchPerf(spec, result, timings);
+            ownTrace?.Dispose();
+        }
+    }
+
+    /// <summary>Per-call launch stage timings — emitted as one "launch"
+    /// record into perf-trace.jsonl so p50 before/after is measurable.</summary>
+    private sealed class LaunchTimings
+    {
+        public long ResolveMs;
+        public long SpawnMs;
+        public long WindowWaitMs;
+        public long TotalMs;
+    }
+
+    private void EmitLaunchPerf(LaunchSpec spec, LaunchResult? r,
+        LaunchTimings t)
+    {
+        try
+        {
+            var cur = PerfTrace.TryCurrent;
+            if (cur != null)
+            {
+                cur.Set("launch.resolveMs", t.ResolveMs);
+                cur.Set("launch.spawnMs", t.SpawnMs);
+                cur.Set("launch.windowWaitMs", t.WindowWaitMs);
+                cur.Set("launch.totalMs", t.TotalMs);
+                cur.Set("launch.state", r?.LaunchState);
+                cur.Set("launch.method", r?.Method?.ToString());
+            }
+            PerfLog.Write(new
+            {
+                kind = "launch",
+                at = DateTimeOffset.Now,
+                app = r?.ResolvedName ?? spec.App ?? spec.Executable ??
+                    spec.Path ?? spec.Aumid ?? spec.Uri,
+                method = r?.Method?.ToString(),
+                identifier = r?.ResolvedIdentifier,
+                state = r?.LaunchState,
+                success = r?.Success ?? false,
+                error = r?.Error,
+                pid = r?.Pid,
+                reused = r?.LaunchState == "AlreadyRunning",
+                resolveMs = t.ResolveMs,
+                spawnMs = t.SpawnMs,
+                windowWaitMs = t.WindowWaitMs,
+                launchMs = r?.LaunchMs,
+                readyMs = r?.ReadyMs,
+                totalMs = t.TotalMs,
+            });
+        }
+        catch { /* telemetry must never break a launch */ }
+    }
+
+    private LaunchResult LaunchCore(LaunchSpec spec, CancellationToken ct,
+        LaunchTimings timings)
     {
         ct.ThrowIfCancellationRequested();
         var total = Stopwatch.StartNew();
@@ -316,6 +418,7 @@ public sealed class AppService : IAppService, IDisposable
 
         // ---- spawn ----
         var spawnMs = total.ElapsedMilliseconds;
+        timings.ResolveMs = spawnMs; // everything before spawn = resolve + reuse check
         int? spawnedPid;
         try
         {
@@ -330,7 +433,12 @@ public sealed class AppService : IAppService, IDisposable
                 var profileDir = Path.Combine(Path.GetTempPath(), $"inbrisk_debug_profile_{spec.DebugPort.Value}");
                 effectiveArgs.Add($"--user-data-dir={profileDir}");
             }
-            spawnedPid = (Spawner ?? SpawnReal)(chosen, effectiveArgs.Count > 0 ? effectiveArgs : null);
+            var spawnSw = Stopwatch.StartNew();
+            using (PerfTrace.Stage("launch.spawn"))
+            {
+                spawnedPid = (Spawner ?? SpawnReal)(chosen, effectiveArgs.Count > 0 ? effectiveArgs : null);
+            }
+            timings.SpawnMs = spawnSw.ElapsedMilliseconds;
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception e)
@@ -341,8 +449,10 @@ public sealed class AppService : IAppService, IDisposable
         }
 
         // ---- readiness ----
+        var waitSw = Stopwatch.StartNew();
         var ready = WaitReady(chosen, spawnedPid, readiness.Value,
             spec.TimeoutMs, ct, total, spec.App);
+        timings.WindowWaitMs = waitSw.ElapsedMilliseconds;
         if (ready.error != null)
             return Fail(ready.error, ready.detail, total,
                 resolvedName: chosen.DisplayName,
@@ -500,6 +610,117 @@ public sealed class AppService : IAppService, IDisposable
 
         var found = new List<ResolvedApp>();
 
+        // Registered-app sources are served from the cached catalog
+        // snapshot — background-built / warm-loaded from disk — instead of
+        // rescanning Start Menu .lnk COM parses, the App Paths registry,
+        // and every package manifest on each query. The PackageEnumerator
+        // test seam bypasses the catalog so injected fakes always apply.
+        if (PackageEnumerator == null &&
+            TryCatalogEntries() is { } catEntries)
+        {
+            foreach (var e in catEntries) ScoreCatalogEntry(e, app, norm, found);
+        }
+        else
+        {
+            ResolveAllLiveSources(app, norm, found);
+        }
+
+        // executable on PATH / well-known dirs
+        if (ResolveExecutable(app) is { } exeHit)
+            found.Add(exeHit);
+
+        // registered URI scheme as a last resort — never invented, only
+        // used when the scheme actually exists in the registry
+        if (SchemeRegistered(app))
+            found.Add(new ResolvedApp(LaunchMethod.Protocol, app + ":", app,
+                [app], 10));
+
+        // filesystem last resort — engines/dev tools register nowhere;
+        // a bounded exe-name scan finds UnrealEditor under Epic Games.
+        // All hits score equal: UnrealPak.exe is NOT UnrealEditor.exe —
+        // several distinct exes → AmbiguousApplication, never a blind pick
+        if (found.Count == 0)
+            foreach (var exe in ScanExeByName(norm))
+                found.Add(new ResolvedApp(LaunchMethod.Executable, exe,
+                    Path.GetFileNameWithoutExtension(exe),
+                    [Path.GetFileNameWithoutExtension(exe)], 25));
+
+        _resolveCache[norm] = (found, DateTime.UtcNow);
+        return found;
+    }
+
+    /// <summary>The persisted catalog's scored entries — null when no
+    /// snapshot is available (cold build failed/timed out), in which case
+    /// resolution falls back to live source scans.</summary>
+    private IReadOnlyList<AppCatalogEntryDto>? TryCatalogEntries()
+    {
+        try { return _catalogService.GetSnapshot().Entries; }
+        catch { return null; }
+    }
+
+    /// <summary>Score one catalog entry exactly as the live-source loops
+    /// did: Start Menu scores the display name (target stem joins ExeHints
+    /// for reuse/window matching), App Paths the exe-name key, packages the
+    /// display name + PFN + exe hints. Per-method score bonus preserved.</summary>
+    private static void ScoreCatalogEntry(AppCatalogEntryDto e, string app,
+        string norm, List<ResolvedApp> found)
+    {
+        switch (e.Method)
+        {
+            case LaunchMethod.StartMenu:
+            {
+                var s = Score(e.Name, app, Norm(e.Name), norm);
+                if (s <= 0) break;
+                var exes = new List<string> { e.Name };
+                if (e.TargetStem is { } tgtStem)
+                {
+                    exes.Add(tgtStem);
+                    if (tgtStem.Contains("launcher", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var baseStem = System.Text.RegularExpressions.Regex.Replace(tgtStem, @"[-_]?launcher", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                        if (!string.IsNullOrWhiteSpace(baseStem)) exes.Add(baseStem);
+                    }
+                }
+                var parts = e.Name.Split(new[] { ' ', '-', '_', '.' }, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length > 1 && parts[0].Length >= 3)
+                {
+                    exes.Add(parts[0]);
+                }
+                found.Add(new ResolvedApp(LaunchMethod.StartMenu, e.Identifier,
+                    e.Name,
+                    exes.Distinct(StringComparer.OrdinalIgnoreCase).ToArray(),
+                    s + 5));
+                break;
+            }
+            case LaunchMethod.AppPath:
+            {
+                var s = Score(e.Name, app, Norm(e.Name), norm);
+                if (s > 0)
+                    found.Add(new ResolvedApp(LaunchMethod.AppPath, e.Identifier,
+                        e.Name,
+                        e.ExeHints.Length > 0 ? e.ExeHints : [e.Name], s + 4));
+                break;
+            }
+            case LaunchMethod.Aumid:
+            {
+                var s = Math.Max(Score(e.Name, app, Norm(e.Name), norm),
+                    Score(e.Identifier, app, Norm(e.Identifier), norm));
+                foreach (var hint in e.ExeHints)
+                    s = Math.Max(s, Score(hint, app, Norm(hint), norm));
+                if (s > 0)
+                    found.Add(new ResolvedApp(LaunchMethod.Aumid, e.Identifier,
+                        e.Name, e.ExeHints, s + 3));
+                break;
+            }
+        }
+    }
+
+    /// <summary>Live source scans — used when the catalog snapshot is
+    /// unavailable, and always when the PackageEnumerator test seam is set
+    /// so injected fake packages resolve deterministically.</summary>
+    private void ResolveAllLiveSources(string app, string norm,
+        List<ResolvedApp> found)
+    {
         // Start Menu shortcuts — filename carries the display name.
         // The shortcut's TARGET exe joins ExeHints: "File Explorer.lnk"
         // launches explorer.exe, so running-instance reuse and post-spawn
@@ -556,29 +777,6 @@ public sealed class AppService : IAppService, IDisposable
                 found.Add(new ResolvedApp(LaunchMethod.Aumid, pkg.Identifier,
                     pkg.DisplayName, pkg.ExeHints, s + 3));
         }
-
-        // executable on PATH / well-known dirs
-        if (ResolveExecutable(app) is { } exeHit)
-            found.Add(exeHit);
-
-        // registered URI scheme as a last resort — never invented, only
-        // used when the scheme actually exists in the registry
-        if (SchemeRegistered(app))
-            found.Add(new ResolvedApp(LaunchMethod.Protocol, app + ":", app,
-                [app], 10));
-
-        // filesystem last resort — engines/dev tools register nowhere;
-        // a bounded exe-name scan finds UnrealEditor under Epic Games.
-        // All hits score equal: UnrealPak.exe is NOT UnrealEditor.exe —
-        // several distinct exes → AmbiguousApplication, never a blind pick
-        if (found.Count == 0)
-            foreach (var exe in ScanExeByName(norm))
-                found.Add(new ResolvedApp(LaunchMethod.Executable, exe,
-                    Path.GetFileNameWithoutExtension(exe),
-                    [Path.GetFileNameWithoutExtension(exe)], 25));
-
-        _resolveCache[norm] = (found, DateTime.UtcNow);
-        return found;
     }
 
     /// <summary>Public filesystem fallback used by computer_apps when the
@@ -1076,7 +1274,7 @@ public sealed class AppService : IAppService, IDisposable
     {
         var norm = Norm(displayName);
         var hints = (exeHints ?? []).Select(Norm).ToList();
-        var wins = _windows.ListWindows();
+        var wins = SnapshotWindows();
         return wins
             .Where(w =>
             {
@@ -1150,6 +1348,7 @@ public sealed class AppService : IAppService, IDisposable
         if (readiness == LaunchReadiness.None)
             return (null, null, "Started", spawnedPid, null, null, null);
 
+        using var _waitStage = PerfTrace.Stage("launch.windowWait");
         var deadline = total.ElapsedMilliseconds + timeoutMs;
         var rawHints = new List<string>(app.ExeHints) { app.DisplayName };
         if (!string.IsNullOrEmpty(requestedName))
@@ -1279,7 +1478,7 @@ public sealed class AppService : IAppService, IDisposable
         }
 
         // debugging telemetry: what windows were visible at the deadline
-        var seen = _windows.ListWindows()
+        var seen = SnapshotWindows()
             .Where(w => !w.Bounds.IsEmpty)
             .Select(w => $"{w.ProcessName} \"{w.Title}\" pid={w.Pid}")
             .Take(12);
@@ -1312,7 +1511,7 @@ public sealed class AppService : IAppService, IDisposable
     private WindowInfo? MatchWindow(int? pid, List<string> hints,
         string? spawnedName, string displayName, string? requestedName = null)
     {
-        var wins = _windows.ListWindows()
+        var wins = SnapshotWindows()
             .Where(w => !w.Bounds.IsEmpty && !string.IsNullOrEmpty(w.Title) &&
                         !IsShellSurface(w.Hwnd))
             .ToList();
@@ -1320,6 +1519,20 @@ public sealed class AppService : IAppService, IDisposable
         {
             var byPid = wins.Where(w => w.Pid == p).ToList();
             if (byPid.Count > 0) return BestWindow(byPid);
+
+            // Exact UWP attribution — an ApplicationFrameHost frame is
+            // owned by the shared host pid, but the app process pid
+            // returned by IApplicationActivationManager owns a descendant
+            // window inside the frame. Pid-exact beats title heuristics,
+            // and the reported pid becomes the real app pid.
+            var hosted = wins
+                .Where(w => NormProc(w.ProcessName) == "applicationframehost" &&
+                            HostedProcessId(w.Hwnd) == p)
+                .ToList();
+            if (hosted.Count > 0 &&
+                BestWindow(hosted) is { } frame)
+                return frame with { Pid = p };
+
             // spawned pid may be a launcher that exited or handed off —
             // fall through to name/title matching
         }
@@ -1380,16 +1593,81 @@ public sealed class AppService : IAppService, IDisposable
     private bool ProcessByName(List<string> hints, string? spawnedName)
     {
         if (ProcessAliveChecker != null) return false;
+        var names = ProcessNameSnapshot();
+        if (names == null) return false;
+        return (spawnedName != null && names.Contains(spawnedName)) ||
+            names.Overlaps(hints);
+    }
+
+    /// <summary>Normalized process-name set, refreshed at most every 250 ms
+    /// — GetProcesses() per 150 ms poll slice was the wait path's hot spot.</summary>
+    private HashSet<string>? ProcessNameSnapshot()
+    {
+        var now = Environment.TickCount64;
+        lock (_procNameLock)
+        {
+            if (_procNameSnapshot != null &&
+                now - _procNameTicks < ProcNameTtlMs)
+                return _procNameSnapshot;
+            try
+            {
+                var set = new HashSet<string>(StringComparer.Ordinal);
+                foreach (var p in Process.GetProcesses())
+                {
+                    set.Add(NormProc(p.ProcessName));
+                    p.Dispose();
+                }
+                _procNameSnapshot = set;
+                _procNameTicks = now;
+                return set;
+            }
+            catch { return null; }
+        }
+    }
+
+    /// <summary>Top-level window list with a short TTL keyed to the
+    /// event-buffer generation — any window event invalidates immediately,
+    /// so bursts and repeated polls share one EnumWindows. Without an
+    /// event source the cache is bypassed entirely (exact for tests).</summary>
+    private IReadOnlyList<WindowInfo> SnapshotWindows()
+    {
+        if (_eventBuffer == null) return _windows.ListWindows();
+        var gen = _eventBuffer.CurrentGeneration;
+        var now = Environment.TickCount64;
+        lock (_windowSnapshotLock)
+        {
+            if (_windowSnapshot != null &&
+                gen == _windowSnapshotGen &&
+                now - _windowSnapshotTicks < WindowSnapshotTtlMs)
+                return _windowSnapshot;
+            var wins = _windows.ListWindows();
+            _windowSnapshot = wins;
+            _windowSnapshotGen = gen;
+            _windowSnapshotTicks = now;
+            return wins;
+        }
+    }
+
+    /// <summary>The real application pid hosted inside an
+    /// ApplicationFrameHost frame window — the first descendant owned by a
+    /// different process (the packaged app's content window). 0 when the
+    /// frame hosts nothing.</summary>
+    private static int HostedProcessId(long frameHwnd)
+    {
+        var frame = new IntPtr(frameHwnd);
+        Native.NativeMethods.GetWindowThreadProcessId(frame, out var framePid);
+        var hosted = 0;
         try
         {
-            foreach (var p in Process.GetProcesses())
+            EnumChildWindows(frame, (child, _) =>
             {
-                var n = NormProc(p.ProcessName);
-                if (n == spawnedName || hints.Contains(n)) return true;
-            }
+                Native.NativeMethods.GetWindowThreadProcessId(child, out var pid);
+                if (pid != 0 && pid != framePid) { hosted = pid; return false; }
+                return true;
+            }, IntPtr.Zero);
         }
         catch { }
-        return false;
+        return hosted;
     }
 
     private static bool DebugPortReachable(int port)
@@ -1433,6 +1711,11 @@ public sealed class AppService : IAppService, IDisposable
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern bool IsHungAppWindow(IntPtr hWnd);
+
+    private delegate bool EnumChildProc(IntPtr hWnd, IntPtr lParam);
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool EnumChildWindows(IntPtr hWndParent,
+        EnumChildProc lpEnumFunc, IntPtr lParam);
 
     private static bool IsHung(long hwnd)
     {

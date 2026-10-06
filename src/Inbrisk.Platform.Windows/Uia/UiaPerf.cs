@@ -21,6 +21,7 @@ public static class UiaPerf
 
     [ThreadStatic] private static int _liveReads;
     [ThreadStatic] private static int _cachedReads;
+    [ThreadStatic] private static int _comOps;
 
     /// <summary>One live (cross-process) UIA property/pattern read.</summary>
     public static void LiveRead() => _liveReads++;
@@ -28,11 +29,18 @@ public static class UiaPerf
     /// <summary>One locally-cached property/pattern read (no COM round trip).</summary>
     public static void CachedRead() => _cachedReads++;
 
-    /// <summary>Snapshot and reset the per-thread read counters.</summary>
-    public static (int Live, int Cached) TakeReads()
+    /// <summary>One cross-process UIA *call* that is not a property/pattern
+    /// read: FindAll/FindFirst(BuildCache), BuildUpdatedCache,
+    /// ElementFromHandle, GetRootElement, tree-walker navigation,
+    /// FindItemByProperty, Realize and pattern action methods
+    /// (Invoke/SetValue/SetFocus/…).</summary>
+    public static void ComCall() => _comOps++;
+
+    /// <summary>Snapshot and reset the per-thread counters.</summary>
+    public static (int Live, int Cached, int Ops) TakeReads()
     {
-        var t = (_liveReads, _cachedReads);
-        _liveReads = 0; _cachedReads = 0;
+        var t = (_liveReads, _cachedReads, _comOps);
+        _liveReads = 0; _cachedReads = 0; _comOps = 0;
         return t;
     }
 

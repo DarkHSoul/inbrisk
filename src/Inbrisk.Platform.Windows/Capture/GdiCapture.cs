@@ -94,6 +94,15 @@ public sealed class GdiCapture : ICaptureService
         finally { bmp.UnlockBits(data); }
     }
 
+    /// <summary>Pays the one-time GDI+ startup cost (gdiplus.dll init, JIT)
+    /// without touching the screen — a tiny offscreen bitmap only.</summary>
+    public void WarmUp()
+    {
+        using var bmp = new Bitmap(2, 2);
+        using var g = Graphics.FromImage(bmp);
+        g.Clear(Color.Transparent);
+    }
+
     /// <summary>Continuous session entry point for GDI-only paths — the router
     /// in CaptureService is the public factory.</summary>
     public ICaptureSession CreateSession(CaptureTarget target) =>

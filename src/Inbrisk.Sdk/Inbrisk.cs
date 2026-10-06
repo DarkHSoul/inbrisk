@@ -31,7 +31,11 @@ public sealed record InbriskOptions(
     VirtualDesktopManagerHolder? VdmHolder = null,
     ApplicationCatalogService? CatalogService = null,
     LaunchResolutionCache? LaunchCache = null,
-    ITargetHighlightService? TargetHighlight = null);
+    ITargetHighlightService? TargetHighlight = null,
+    /// <summary>F32: byte-identical second copy of the audit log, kept at the
+    /// agent-readable data-dir location for tools/UI. Never the source of
+    /// truth — divergence from the primary is a tamper signal.</summary>
+    string? TelemetryMirrorPath = null);
 
 /// <summary>
 /// The Unified Computer API. Composition root: wires platform services into
@@ -131,7 +135,7 @@ public sealed class InbriskRuntime : IDisposable
         _registry = new ElementRegistry(_agentBackends, _store);
 
         if (opt.TelemetryPath != null)
-            _telemetry = new JsonlTelemetrySink(opt.TelemetryPath);
+            _telemetry = new JsonlTelemetrySink(opt.TelemetryPath, opt.TelemetryMirrorPath);
 
         _activity = new ComputerControlActivityService(opt.IndicatorIdleGraceMs);
         var indicatorOff = Environment.GetEnvironmentVariable("INBRISK_INDICATOR")
@@ -170,6 +174,11 @@ public sealed class InbriskRuntime : IDisposable
             _eventBuffer.Add(e);
             if (e is { Kind: EventKind.WindowClosed, Hwnd: { } h })
                 _registry.InvalidateWindow(h);
+            // drop the backend's live COM handles too — structure churn or
+            // destroy/show can orphan them silently
+            if (e.Hwnd is { } bh && e.Kind is EventKind.WindowClosed
+                    or EventKind.WindowShown or EventKind.StructureChanged)
+                _uiaBackend.InvalidateWindow(bh);
         };
 
         // Readiness probe: a window counts as usable only when its UIA
@@ -192,7 +201,8 @@ public sealed class InbriskRuntime : IDisposable
             launchCache: opt.LaunchCache);
 
         _executor = new Executor(_windows, _integrity, _input, _capture,
-            _agentBackends, _registry, _policy, _telemetry, _activity);
+            _agentBackends, _registry, _policy, _telemetry, _activity,
+            eventWaiter: _eventBuffer);
         _wait = new WaitService(s => Find(s), _capture, _events, _registry, _windows, _subscriptionManager);
 
         _events.Event += e =>
@@ -200,10 +210,27 @@ public sealed class InbriskRuntime : IDisposable
             _eventBuffer.Add(e);
             if (e is { Kind: EventKind.WindowClosed, Hwnd: { } h })
                 _registry.InvalidateWindow(h);
+            if (e.Hwnd is { } bh && e.Kind is EventKind.WindowClosed
+                    or EventKind.WindowShown or EventKind.StructureChanged)
+                _uiaBackend.InvalidateWindow(bh);
             lock (_monitors)
                 foreach (var m in _monitors) m.FeedSemantic(e);
         };
         if (opt.StartEvents) _events.Start();
+    }
+
+    /// <summary>Pay this runtime's one-time service activation costs off the
+    /// critical path of the first tool call: the UIA dispatcher thread + COM
+    /// object, capture plumbing (GDI+/WGC probe), and window enumeration.
+    /// Read-only — captures nothing, injects no input. Intended to be called
+    /// on a background thread right after construction.</summary>
+    public void WarmUp()
+    {
+        try { _ = _uiaDispatch.Run(uia => uia.GetRootElement() != null,
+            timeoutMs: 3000); } catch { }
+        try { _capture.WarmUp(); } catch { }
+        try { _ = _windows.ListWindows(); } catch { }
+        try { _ = _windows.GetVirtualDesktopBounds(); } catch { }
     }
 
     // ---- topology ----

@@ -58,10 +58,17 @@ public sealed class ObservationBuilder
     /// <paramref name="recentElementRefs"/> — element ids acted on in recent
     /// steps; they rank higher so the model keeps seeing its own context.
     /// <paramref name="baseSnapshot"/> — optional base observation to diff against (defaults to previous observation).</summary>
+    /// <param name="maxImageWidth">Optional cap on attached frame width —
+    /// wider captures are bilinear-downscaled; the FrameTransform keeps the
+    /// same desktop source rect so coordinate mapping stays correct.</param>
+    /// <param name="markElements">Draw numbered marks at interactive element
+    /// centers on attached frames; mark i = the (i+1)-th element in the
+    /// observation's printed element list.</param>
     public BuiltObservation Build(long? hwndHint, ObservationBudget budget,
         VisualAttachPolicy policy, ChangeMonitor? monitor, StepOutcome? prevOutcome,
         IReadOnlyCollection<string>? recentElementRefs = null,
-        AgentObservation? baseSnapshot = null)
+        AgentObservation? baseSnapshot = null,
+        int? maxImageWidth = null, bool markElements = false)
     {
         var fg = _windows.GetForegroundWindow();
         var target = hwndHint ?? fg?.Hwnd;
@@ -86,7 +93,8 @@ public sealed class ObservationBuilder
         var recent = recentElementRefs ?? (IReadOnlyCollection<string>)Array.Empty<string>();
         var obsElements = Prune(elements, budget, changedKeys, recent, regions, target);
 
-        var (frames, raws) = AttachPixels(policy, target, obsElements, regions, budget);
+        var (frames, raws) = AttachPixels(policy, target, obsElements, regions, budget,
+            maxImageWidth, markElements);
 
         var backend = monitor?.Session.Backend.ToString()
             ?? (frames.Count > 0 ? "oneshot" : "none");
@@ -109,7 +117,8 @@ public sealed class ObservationBuilder
         VisualAttachPolicy policy, ChangeMonitor? monitor, StepOutcome? prevOutcome,
         IReadOnlyCollection<string>? recentElementRefs = null,
         AgentObservation? baseSnapshot = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int? maxImageWidth = null, bool markElements = false)
     {
         var fg = _windows.GetForegroundWindow();
         var target = hwndHint ?? fg?.Hwnd;
@@ -141,7 +150,8 @@ public sealed class ObservationBuilder
         var recent = recentElementRefs ?? (IReadOnlyCollection<string>)Array.Empty<string>();
         var obsElements = Prune(elements, budget, changedKeys, recent, regions, target);
 
-        var (frames, raws) = AttachPixels(policy, target, obsElements, regions, budget);
+        var (frames, raws) = AttachPixels(policy, target, obsElements, regions, budget,
+            maxImageWidth, markElements);
 
         var backend = monitor?.Session.Backend.ToString()
             ?? (frames.Count > 0 ? "oneshot" : "none");
@@ -269,7 +279,8 @@ public sealed class ObservationBuilder
     /// identity and geometry before clicking.</summary>
     private (List<ObsFrameRef>, Dictionary<long, FrameRef>) AttachPixels(
         VisualAttachPolicy policy, long? target, IReadOnlyList<ObsElement> elements,
-        IReadOnlyList<RectPx> regions, ObservationBudget b)
+        IReadOnlyList<RectPx> regions, ObservationBudget b,
+        int? maxImageWidth = null, bool markElements = false)
     {
         var frames = new List<ObsFrameRef>();
         var raws = new Dictionary<long, FrameRef>();
@@ -295,6 +306,13 @@ public sealed class ObservationBuilder
         void Capture(CaptureTarget ct, VisualAttach kind, long? hwnd)
         {
             var raw = _captureRaw(ct);
+            if (maxImageWidth is { } mw && mw > 0 && raw.Width > mw)
+                raw = raw.ScaledToMaxWidth(mw);
+            if (markElements)
+            {
+                var marks = CollectMarks(raw.Transform, elements);
+                if (marks.Count > 0) raw.DrawMarks(marks);
+            }
             var png = raw.ToPng();
             if (!UnderBudget(raw, png)) return; // budget exhausted — skip frame
             var id = Interlocked.Increment(ref _frameSeq);
@@ -367,6 +385,24 @@ public sealed class ObservationBuilder
 
     private static bool InteractiveRole(string role) =>
         Enum.TryParse<Role>(role, out var r) && Interactive.Contains(r);
+
+    /// <summary>Set-of-mark overlay list for a frame: interactive elements
+    /// whose desktop-space center lands inside the captured rect. The index is
+    /// 1-based into the observation's printed element order.</summary>
+    private static List<(int Index, RectPx Bounds)> CollectMarks(
+        FrameTransform t, IReadOnlyList<ObsElement> elements)
+    {
+        var marks = new List<(int, RectPx)>(60);
+        for (var i = 0; i < elements.Count && marks.Count < 60; i++)
+        {
+            var e = elements[i];
+            if (e.Actions.Count == 0 && !InteractiveRole(e.Role)) continue;
+            var (cx, cy) = e.Bounds.Center;
+            if (!t.SourceRect.Contains(cx, cy)) continue;
+            marks.Add((i + 1, e.Bounds));
+        }
+        return marks;
+    }
 
     private static RectPx Clamp(RectPx r, RectPx? within, int maxW, int maxH)
     {

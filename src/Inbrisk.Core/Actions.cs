@@ -74,7 +74,11 @@ public sealed record ActionResult(
     string? ErrorMessage = null,
     /// <summary>Why this action counts as verified — auditable proof,
     /// e.g. PropertyChanged ToggleState_Off→On or ValueReadback "hello".</summary>
-    VerifyEvidence? Evidence = null);
+    VerifyEvidence? Evidence = null,
+    /// <summary>What changed on the desktop as a consequence of this
+    /// action — opened/closed windows, dialogs, focus moves, target-element
+    /// state. Null only when delta collection wasn't wired (e.g. tests).</summary>
+    ActionDelta? Delta = null);
 
 /// <summary>Per-call execution context — carries cancellation, the run's
 /// confirmer and correlation ids without touching process-global state.

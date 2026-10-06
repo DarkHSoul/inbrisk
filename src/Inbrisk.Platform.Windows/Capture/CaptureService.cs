@@ -32,6 +32,16 @@ public sealed class CaptureService : ICaptureService
 
     public RawFrame CaptureRaw(RectPx region) => _gdi.CaptureRaw(region);
 
+    /// <summary>Background first-touch of capture plumbing: GDI+ init plus the
+    /// WGC capability probe (warms the WinRT/D3D activation path without
+    /// opening a session or reading pixels).</summary>
+    public void WarmUp()
+    {
+        try { _gdi.WarmUp(); } catch { }
+        try { _ = global::Windows.Graphics.Capture.GraphicsCaptureSession.IsSupported(); }
+        catch { }
+    }
+
     public double DiffFraction(RectPx region, int sampleScale = 8) =>
         _gdi.DiffFraction(region, sampleScale);
 

@@ -164,7 +164,11 @@ public sealed record StepOutcome(
     string? Detail,
     int DurationMs,
     VerifyEvidence? Evidence = null,
-    TargetDiagnosis? Diagnosis = null);
+    TargetDiagnosis? Diagnosis = null,
+    /// <summary>What the action changed on the desktop (opened/closed
+    /// windows, dialogs, focus, target-element state) — lets the model
+    /// skip a mandatory re-observe.</summary>
+    ActionDelta? Delta = null);
 
 /// <summary>Size accounting for one observation — adapters use this for
 /// provider-specific trimming/billing decisions.</summary>

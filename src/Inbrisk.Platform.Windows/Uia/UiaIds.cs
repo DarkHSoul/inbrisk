@@ -21,6 +21,7 @@ internal static class UiaIds
     public const int IsOffscreenProperty = 30022;
     public const int IsControlElementProperty = 30095;
     public const int ValueValueProperty = 30045;
+    public const int ValueIsReadOnlyProperty = 30046;
     public const int SelectionItemIsSelectedProperty = 30079;
     public const int ExpandCollapseStateProperty = 30070;
     public const int ToggleStateProperty = 30086;
