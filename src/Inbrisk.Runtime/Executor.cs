@@ -20,6 +20,7 @@ public sealed class Executor
     private readonly Verifier _verifier;
     private readonly ITelemetrySink? _telemetry;
     private readonly ComputerControlActivityService? _activity;
+    private readonly ActionDeltaCollector _delta;
     private int _seq;
     private long _mutationVersion;
 
@@ -40,7 +41,8 @@ public sealed class Executor
         ElementRegistry registry,
         SafetyPolicy policy,
         ITelemetrySink? telemetry = null,
-        ComputerControlActivityService? activity = null)
+        ComputerControlActivityService? activity = null,
+        IEventWaiter? eventWaiter = null)
     {
         _windows = windows;
         _integrity = integrity;
@@ -52,8 +54,13 @@ public sealed class Executor
         _telemetry = telemetry;
         _activity = activity;
         _verifier = new Verifier(windows, capture);
+        _delta = new ActionDeltaCollector(windows, eventWaiter, _backends);
     }
 
+    /// <summary>Public entry — wraps PerformCore with pre/post desktop
+    /// delta collection so EVERY result (guard rejections included)
+    /// carries what the action changed. Delta gathering lives here, not in
+    /// the step engine, so MCP tools, run steps and agent steps all get it.</summary>
     public ActionResult Perform(ActionIntent intent, ActionContext? ctx = null)
     {
         // every action — MCP tool, run step, agent step, CLI — marks the
@@ -63,6 +70,19 @@ public sealed class Executor
         // still have mutated the desktop, and stale snapshots must never
         // serve a post-action verification
         Interlocked.Increment(ref _mutationVersion);
+        var deltaScope = _delta.Begin();
+        var r = PerformCore(intent, ctx, deltaScope);
+        if (r.Delta != null) return r; // act path already completed the scope
+        // guard/policy rejections and mid-act exceptions land here — an
+        // exception can still have partially mutated the desktop, so only
+        // "guard"/"policy" methods (pre-act exits) skip the settle wait
+        return r with { Delta = deltaScope.Complete(r, target: null,
+            settle: r.Method is not ("guard" or "policy")) };
+    }
+
+    private ActionResult PerformCore(ActionIntent intent, ActionContext? ctx,
+        ActionDeltaCollector.Scope deltaScope)
+    {
         var sw = Stopwatch.StartNew();
         var attempts = new List<Attempt>();
         string? elementId = null;
@@ -137,6 +157,16 @@ public sealed class Executor
                 window = _windows.GetForegroundWindow();
                 if (window != null) targetDesc = $"foreground window '{window.Title}'";
             }
+            // keyboard input without a resolved element (point target, or
+            // no target at all) is delivered to whatever has focus —
+            // the policy/danger checks must evaluate THAT window
+            if (window == null && element == null && intent.Kind is ActionKind.KeyPress
+                or ActionKind.Hotkey or ActionKind.TypeText)
+            {
+                window = _windows.GetForegroundWindow();
+                if (window != null && targetDesc == "")
+                    targetDesc = $"foreground window '{window.Title}'";
+            }
 
             // --- guard: integrity level ---
             bool elevated;
@@ -157,23 +187,49 @@ public sealed class Executor
                     sw, ErrorCode.PolicyDenied, "action denied by safety policy");
             if (cls == SafetyClass.Confirm)
             {
-                // a run-scoped confirmer wins over global AutoConfirm — an
-                // explicit per-run policy is always more specific
-                var confirmer = ctx?.Confirmer ?? _policy.Confirmer;
-                if (confirmer == null)
+                // F04: dangerous classes (shell/terminal input, destructive
+                // close chords) are never satisfiable by AutoConfirm — a
+                // boolean the model supplies inside its own tool call is
+                // self-approval, not consent. Only a consent hook installed
+                // by local code may approve: LocalConsent (the reserved
+                // trusted-UI hook) or the run/policy Confirmer, neither of
+                // which is reachable through the MCP JSON-RPC request path.
+                if (_policy.IsDangerous(intent, element, window))
                 {
-                    if (!_policy.AutoConfirm)
+                    var consent = _policy.LocalConsent ?? ctx?.Confirmer ?? _policy.Confirmer;
+                    bool localOk;
+                    try { localOk = consent?.Invoke(intent, element, window) == true; }
+                    catch { localOk = false; }
+                    if (!localOk)
                         return Finish(false, null, "policy", attempts, VerifyResult.NotRequested,
                             sw, ErrorCode.ConfirmationRequired,
-                            "action requires confirmation (AutoConfirm=false)");
-                }
-                else if (confirmer(intent, element, window))
+                            "dangerous action requires a LOCAL confirmation the " +
+                            "client cannot supply — approve on this machine via the " +
+                            "Inbrisk control UI (AutoConfirm/tool-call flags are " +
+                            "ignored for dangerous classes)");
                     attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
-                        "approved by confirmer", TimeSpan.Zero));
+                        "approved by local consent", TimeSpan.Zero));
+                }
                 else
-                    return Finish(false, null, "policy", attempts, VerifyResult.NotRequested,
-                        sw, ErrorCode.ConfirmationRequired,
-                        "action denied by run confirmer");
+                {
+                    // a run-scoped confirmer wins over global AutoConfirm — an
+                    // explicit per-run policy is always more specific
+                    var confirmer = ctx?.Confirmer ?? _policy.Confirmer;
+                    if (confirmer == null)
+                    {
+                        if (!_policy.AutoConfirm)
+                            return Finish(false, null, "policy", attempts, VerifyResult.NotRequested,
+                                sw, ErrorCode.ConfirmationRequired,
+                                "action requires confirmation (AutoConfirm=false)");
+                    }
+                    else if (confirmer(intent, element, window))
+                        attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
+                            "approved by confirmer", TimeSpan.Zero));
+                    else
+                        return Finish(false, null, "policy", attempts, VerifyResult.NotRequested,
+                            sw, ErrorCode.ConfirmationRequired,
+                            "action denied by run confirmer");
+                }
             }
 
             ct.ThrowIfCancellationRequested();
@@ -216,7 +272,9 @@ public sealed class Executor
                     (verify, evidence) = PostVerify(intent, element);
 
             var final = result with { Verification = verify, Attempts = attempts,
-                Evidence = evidence ?? result.Evidence };
+                Evidence = evidence ?? result.Evidence,
+                Delta = deltaScope.Complete(result, element,
+                    settle: result.Success || result.Attempts.Any(a => a.Success)) };
             if (verify == VerifyResult.Failed)
                 final = final with { Success = false, Error = ErrorCode.Internal,
                     ErrorMessage = (final.ErrorMessage is { } em ? em + " — " : "") +
@@ -284,12 +342,9 @@ public sealed class Executor
                 or ActionKind.Collapse or ActionKind.FocusElement or ActionKind.ScrollIntoView
                 when element != null:
             {
-                if (element.Props.TryGetValue("enabled", out var isEn) && isEn is false or 0 && intent.Kind != ActionKind.FocusElement)
-                {
-                    return new ActionResult(false, null, "guard", attempts,
-                        VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Disabled,
-                        $"element {element.Id} ('{element.Name}') is disabled; cannot perform {intent.Kind}");
-                }
+                if (intent.Kind != ActionKind.FocusElement &&
+                    GuardElementTargetable(intent, element, attempts, sw) is { } denied)
+                    return denied;
                 var backend = _backends.First(b => b.Id == element.Handle.Backend);
                 var native = backend.PerformNative(element, intent, ct);
                 if (native != null)
@@ -361,6 +416,9 @@ public sealed class Executor
 
             case ActionKind.TypeText:
             {
+                if (element != null &&
+                    GuardKeyboardTargetable(intent, element, attempts, sw) is { } typeDenied)
+                    return typeDenied;
                 if (window != null) GuardFocus(window, attempts);
                 if (element != null) FocusElement(element, attempts, ct);
                 else EnsureHoverInWindow(window, attempts);
@@ -371,6 +429,9 @@ public sealed class Executor
 
             case ActionKind.KeyPress:
             {
+                if (element != null &&
+                    GuardKeyboardTargetable(intent, element, attempts, sw) is { } keyDenied)
+                    return keyDenied;
                 if (window != null) GuardFocus(window, attempts);
                 if (element != null) FocusElement(element, attempts);
                 else EnsureHoverInWindow(window, attempts);
@@ -391,6 +452,9 @@ public sealed class Executor
 
             case ActionKind.Hotkey:
             {
+                if (element != null &&
+                    GuardKeyboardTargetable(intent, element, attempts, sw) is { } hotDenied)
+                    return hotDenied;
                 if (window != null) GuardFocus(window, attempts);
                 if (element != null) FocusElement(element, attempts);
                 else EnsureHoverInWindow(window, attempts);
@@ -498,6 +562,39 @@ public sealed class Executor
 
     private static string? Prop(UiElement e, string name) =>
         e.Props.GetValueOrDefault(name)?.ToString();
+
+    /// <summary>Shared targetability pre-check for every element-targeted
+    /// action — the same guard Click applies. A disabled element can never
+    /// take focus, so skipping this let TypeText/KeyPress/Hotkey dispatch
+    /// keystrokes that leaked into whatever element actually held focus
+    /// (wrong-target input). An offscreen element likewise cannot be
+    /// focused for keyboard delivery; the caller must scroll it into view
+    /// and re-resolve first.</summary>
+    private ActionResult? GuardElementTargetable(ActionIntent intent,
+        UiElement element, List<Attempt> attempts, Stopwatch sw)
+    {
+        if (element.Props.TryGetValue("enabled", out var isEn) && isEn is false or 0)
+            return new ActionResult(false, null, "guard", attempts,
+                VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Disabled,
+                $"element {element.Id} ('{element.Name}') is disabled; cannot perform {intent.Kind}");
+        return null;
+    }
+
+    /// <summary>Keyboard delivery requires a focusable target. Mirrors the
+    /// offscreen rule Click applies to its coordinate fallback — focus
+    /// cannot be moved to an element the provider reports offscreen.</summary>
+    private ActionResult? GuardKeyboardTargetable(ActionIntent intent,
+        UiElement element, List<Attempt> attempts, Stopwatch sw)
+    {
+        if (GuardElementTargetable(intent, element, attempts, sw) is { } d)
+            return d;
+        if (element.Props.TryGetValue("offscreen", out var isOff) && isOff is true or 1)
+            return new ActionResult(false, null, "none", attempts,
+                VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Unsupported,
+                $"element {element.Id} is offscreen — scroll it into view, " +
+                $"re-observe, then perform {intent.Kind} again");
+        return null;
+    }
 
     private void FocusElement(UiElement element, List<Attempt> attempts, CancellationToken ct = default)
     {

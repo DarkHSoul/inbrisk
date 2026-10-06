@@ -93,6 +93,12 @@ public sealed class EmergencyControl : IDisposable
     private readonly IEmergencyHotkeyRegistrar _registrar;
     private Mutex? _ownerMutex;
     private Timer? _markerWatch;
+    // F18: while stopped, the authority parks a background thread holding a
+    // named kernel mutex (EmergencyGate.StoppedMutexName). Mutex ownership
+    // is thread-scoped — no other process can release or delete it — so
+    // deleting the stop-marker file can no longer clear the panic state.
+    private Thread? _stopMutexHolder;
+    private ManualResetEventSlim? _stopMutexRelease;
     private ComputerControlState _state = ComputerControlState.EmergencyStopped;
     private bool _stoppedByPanic;
     private bool _peerAuthority;   // another inbrisk process owns the hotkey
@@ -114,9 +120,11 @@ public sealed class EmergencyControl : IDisposable
         }
     }
 
-    private readonly string _telemetryPath = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "inbrisk", "mcp-emergency.jsonl");
+    // F32: emergency-control transitions are part of the tamper-evident
+    // audit trail — ACL'd ProgramData location, hash-chained lines, plus an
+    // agent-readable mirror under the data dir.
+    private readonly string _telemetryPath = AuditLog.Path("mcp-emergency.jsonl");
+    private readonly string? _mirrorPath = AuditLog.MirrorPath("mcp-emergency.jsonl");
     /// <summary>Stop state survives reconnect/process restart — a new MCP
     /// session must never bypass a panic stop.</summary>
     public string StopMarkerPath { get; } = EmergencyGate.MarkerPath;
@@ -160,7 +168,7 @@ public sealed class EmergencyControl : IDisposable
             else
                 lock (_gate) _peerAuthority = DetectPeerAuthority();
 
-            var stoppedMarker = File.Exists(StopMarkerPath);
+            var stoppedMarker = EmergencyGate.IsStopped;
             lock (_gate)
             {
                 _stoppedByPanic = stoppedMarker;
@@ -203,8 +211,9 @@ public sealed class EmergencyControl : IDisposable
                 return _epoch.Token;
             if (!(_registrar.PanicAvailable || _peerAuthority))
                 return null;
-            // belt-and-suspenders: marker may have appeared between watcher ticks
-            if (File.Exists(StopMarkerPath)) return null;
+            // belt-and-suspenders: marker may have appeared between watcher
+            // ticks; the held-mutex backstop covers a deleted marker (F18)
+            if (EmergencyGate.IsStopped) return null;
             return _epoch.Token;
         }
     }
@@ -225,10 +234,27 @@ public sealed class EmergencyControl : IDisposable
         catch (ArgumentException) { return false; }
     }
 
-    /// <summary>Peers mirror the authority's panic/resume through the marker.</summary>
+    /// <summary>Peers mirror the authority's panic/resume. The stopped
+    /// signal is marker-file OR held-mutex: a deleted file alone is NOT a
+    /// resume — only the authority's local gesture releases the mutex
+    /// (F18). If we are the authority and the marker vanished while the
+    /// mutex is still held, rewrite it so late-joining processes stay
+    /// stopped.</summary>
     private void SyncMarker()
     {
-        if (File.Exists(StopMarkerPath)) ApplyStop("peer panic marker");
+        var markerExists = File.Exists(StopMarkerPath);
+        var mutexHeld = EmergencyGate.StoppedMutexHeld() == true;
+        if (mutexHeld && !markerExists)
+        {
+            lock (_gate)
+            {
+                if (_registrar.PanicAvailable && _stoppedByPanic && !_disposed)
+                    try { File.WriteAllText(StopMarkerPath,
+                        DateTimeOffset.UtcNow.ToString("O")); }
+                    catch { /* marker heal is best-effort — the mutex still latches the stop */ }
+            }
+        }
+        if (markerExists || mutexHeld) ApplyStop("peer panic marker", recheckMarker: true);
         else ApplyResume("peer resume marker");
 
         // Recoverable stop: the panic chord was held by another process at
@@ -315,7 +341,7 @@ public sealed class EmergencyControl : IDisposable
                 _peerAuthority = DetectPeerAuthority();
             }
             if ((_registrar.PanicAvailable || _peerAuthority) &&
-                !File.Exists(StopMarkerPath))
+                !EmergencyGate.IsStopped)
             {
                 _epoch.Dispose();
                 _epoch = new CancellationTokenSource();
@@ -327,15 +353,63 @@ public sealed class EmergencyControl : IDisposable
             Log("Emergency hotkey reacquired — computer control enabled");
     }
 
-    private void ApplyStop(string source)
+    /// <summary>Acquire and park the emergency-stop mutex on a background
+    /// thread (authority only). The thread keeps the mutex owned until
+    /// <see cref="ReleaseStoppedMutexLocked"/> signals resume — nothing
+    /// outside this process can release it, which is what makes the stop
+    /// survive deletion of the marker file.</summary>
+    private void TryHoldStoppedMutexLocked()
+    {
+        if (_stopMutexHolder != null || _testMode ||
+            !_registrar.PanicAvailable) return;
+        var release = new ManualResetEventSlim(false);
+        var holder = new Thread(() =>
+        {
+            try
+            {
+                using var m = new Mutex(false, EmergencyGate.StoppedMutexName);
+                try { m.WaitOne(); }
+                catch (AbandonedMutexException) { /* abandoned = acquired */ }
+                release.Wait();
+                try { m.ReleaseMutex(); } catch { }
+            }
+            catch { /* hold is best-effort; the marker file remains the broadcast */ }
+        })
+        { IsBackground = true, Name = "inbrisk-estop-hold" };
+        _stopMutexRelease = release;
+        _stopMutexHolder = holder;
+        holder.Start();
+    }
+
+    /// <summary>Signal the holder thread to release the mutex and wait for
+    /// the release to complete, so a marker/mutex recheck immediately
+    /// after this lock cannot observe a half-resumed state.</summary>
+    private void ReleaseStoppedMutexLocked()
+    {
+        var holder = _stopMutexHolder;
+        var release = _stopMutexRelease;
+        _stopMutexHolder = null;
+        _stopMutexRelease = null;
+        if (holder == null) return;
+        try { release?.Set(); } catch { }
+        try { holder.Join(250); } catch { }
+    }
+
+    private void ApplyStop(string source, bool recheckMarker = false)
     {
         IInputService[] inputs;
         lock (_gate)
         {
             if (_stoppedByPanic || _disposed) return;
+            // A watcher tick can observe a stale "stopped" signal (marker
+            // still on disk / mutex still held) while a local resume is
+            // mid-flight; re-verify under the lock so the resume gesture
+            // is never silently overwritten back to stopped.
+            if (recheckMarker && !EmergencyGate.IsStopped) return;
             _state = ComputerControlState.EmergencyStopped;
             _stoppedByPanic = true;
             _epoch.Cancel();
+            TryHoldStoppedMutexLocked();
             inputs = _inputs.ToArray();
         }
         try { File.WriteAllText(StopMarkerPath, DateTimeOffset.UtcNow.ToString("O")); }
@@ -357,6 +431,9 @@ public sealed class EmergencyControl : IDisposable
         {
             try { File.Delete(StopMarkerPath); }
             catch (Exception e) { Log($"stop marker delete failed: {e.Message}"); }
+            // F18: release the held stop mutex under the same lock so peers
+            // never observe "file gone, mutex still held" as a new stop.
+            ReleaseStoppedMutexLocked();
 
             if (_disposed) return;
             // SyncMarker invokes this every 150ms while no marker exists —
@@ -393,11 +470,20 @@ public sealed class EmergencyControl : IDisposable
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_telemetryPath)!);
+            var record = JsonSerializer.SerializeToNode(new { at = DateTimeOffset.UtcNow,
+                category = "emergency_control", state = State.ToString(),
+                message, panicHotkey = PanicHotkey, resumeHotkey = ResumeHotkey })!.AsObject();
             lock (_gate)
-                File.AppendAllText(_telemetryPath,
-                    JsonSerializer.Serialize(new { at = DateTimeOffset.UtcNow,
-                        category = "emergency_control", state = State.ToString(),
-                        message, panicHotkey = PanicHotkey, resumeHotkey = ResumeHotkey }) + "\n");
+            {
+                var line = AuditLog.ChainLine(record, AuditLog.LastChainHash(_telemetryPath));
+                File.AppendAllText(_telemetryPath, line + "\n");
+                try
+                {
+                    if (_mirrorPath != null)
+                        File.AppendAllText(_mirrorPath, line + "\n");
+                }
+                catch { /* best-effort mirror */ }
+            }
         }
         catch (Exception e) { Console.Error.WriteLine($"Inbrisk emergency telemetry failed: {e.Message}"); }
     }
@@ -409,6 +495,7 @@ public sealed class EmergencyControl : IDisposable
             _state = ComputerControlState.EmergencyStopped;
             _disposed = true;
             try { _epoch.Cancel(); } catch (ObjectDisposedException) { }
+            ReleaseStoppedMutexLocked();
             foreach (var input in _inputs)
                 try { input.ReleaseAll(); } catch { }
             _inputs.Clear();

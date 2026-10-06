@@ -103,6 +103,21 @@ public sealed class UiaReadScheduler : IDisposable
     private int _workerReplacementRejectedCount;
     private volatile bool _isDisposed;
 
+    /// <summary>Bounds the mutation barrier's drain wait on in-flight
+    /// reads. Reads are caller-bounded at ~10s (ScheduleReadAsync), but a
+    /// timed-out read leaves its worker abandoned mid-COM-call and
+    /// ActiveReads stays elevated until that call returns — possibly
+    /// never. Past this bound a pending mutation proceeds anyway
+    /// (overlap is recorded via ReadWriteOverlapCount); 15s covers the
+    /// maximum legitimate read window plus margin.</summary>
+    private const int ReadDrainTimeoutMs = 15_000;
+
+    /// <summary>Bounds the mutation write-gate wait. A scope is
+    /// legitimately held for a whole action chain (waits included), so
+    /// this is generous — but a leaked or permanently stuck holder must
+    /// surface as Busy, not hang every future mutation on the PID.</summary>
+    private const int WriteGateTimeoutMs = 120_000;
+
     public int MaxConcurrencyPerProcess { get; set; } = 2;
     public int MaxGlobalWorkers { get; set; } = 8;
     public int MaxAbandonedWorkers { get; set; } = 8;
@@ -306,7 +321,21 @@ public sealed class UiaReadScheduler : IDisposable
 
         try
         {
-            await lane.WriteGate.WaitAsync(ct).ConfigureAwait(false);
+            // Bounded: a scope is legitimately held for a whole action
+            // chain (incl. waits), so the bound is generous — but a leaked
+            // or permanently-stuck holder must error as Busy, not hang
+            // every future mutation on the PID forever (ct may be None via
+            // NotifyMutationStarting's sync-over-async path).
+            await lane.WriteGate.WaitAsync(TimeSpan.FromMilliseconds(WriteGateTimeoutMs), ct).ConfigureAwait(false);
+        }
+        catch (TimeoutException)
+        {
+            branchCtx.HeldProcessBarriers--;
+            Inbrisk.Core.LockOrderTracker.CurrentContext = parentCtx;
+            Interlocked.Decrement(ref lane.PendingWrites);
+            OnWriteDequeued?.Invoke();
+            throw new InbriskException(ErrorCode.Busy,
+                $"UIA mutation write-gate for PID {pid} did not free within {WriteGateTimeoutMs}ms");
         }
         catch
         {
@@ -331,8 +360,17 @@ public sealed class UiaReadScheduler : IDisposable
         {
             try
             {
-                await drainTask.WaitAsync(ct).ConfigureAwait(false);
+                // Bounded: a timed-out read leaves its worker abandoned
+                // mid-COM-call — ScheduleReadAsync poisons the lane, but
+                // ActiveReads only drops when the worker's finally runs,
+                // i.e. when the (possibly stuck) call returns. An
+                // unbounded drain wait can therefore never converge and
+                // hangs every mutation on this PID. Past the bound the
+                // read is treated as abandoned and the write proceeds;
+                // the overlap is recorded via ReadWriteOverlapCount below.
+                await drainTask.WaitAsync(TimeSpan.FromMilliseconds(ReadDrainTimeoutMs), ct).ConfigureAwait(false);
             }
+            catch (TimeoutException) { /* proceed — see note above */ }
             catch
             {
                 branchCtx.HeldProcessBarriers--;
@@ -671,6 +709,20 @@ public sealed class UiaReadScheduler : IDisposable
     }
 
     private void EvictIdleLanes(object? state)
+    {
+        // Timer boundary: an unhandled timer-callback exception kills the
+        // process — eviction is best-effort, next tick retries.
+        try
+        {
+            EvictIdleLanesCore();
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"inbrisk UIA lane eviction failed: {e}");
+        }
+    }
+
+    private void EvictIdleLanesCore()
     {
         if (_isDisposed) return;
         var now = DateTimeOffset.UtcNow;

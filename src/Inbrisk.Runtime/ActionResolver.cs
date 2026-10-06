@@ -159,7 +159,8 @@ public sealed class ActionResolver
         using (PerfTrace.Stage("executor"))
             r = _executor.Perform(intent, actx);
         var outcome = new StepOutcome(MapOutcome(r), r.Success, r.Method,
-            r.ErrorMessage, (int)sw.ElapsedMilliseconds, r.Evidence);
+            r.ErrorMessage, (int)sw.ElapsedMilliseconds, r.Evidence,
+            Delta: r.Delta);
 
         // executor success but no explicit VerifySpec → try auto-verification
         if (outcome.Kind == OutcomeKind.Unverified)
@@ -169,7 +170,8 @@ public sealed class ActionResolver
                 auto = _verifier.Verify(a, pre, r, window, actx.Ct);
             if (auto != null)
                 outcome = auto with
-                { Method = r.Method, DurationMs = (int)sw.ElapsedMilliseconds };
+                { Method = r.Method, DurationMs = (int)sw.ElapsedMilliseconds,
+                    Delta = r.Delta };
         }
         return outcome;
     }

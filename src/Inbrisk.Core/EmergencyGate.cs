@@ -29,6 +29,42 @@ public static class EmergencyGate
     public static string OwnerPath => Path.Combine(
         Path.GetDirectoryName(MarkerPath)!, "emergency-owner.json");
 
+    /// <summary>Named mutex a stopped authority thread holds for the whole
+    /// stop duration. Unlike the marker file, a held mutex CANNOT be
+    /// deleted or released by another same-user process — mutex ownership
+    /// is thread-scoped, so clearing it requires the holding process to
+    /// resume (local gesture) or exit. Scoped by marker path only so every
+    /// process checks the same object. This is the agent-undeletable
+    /// backstop for F18: an automation that deletes the marker file finds
+    /// the stop still latched here.</summary>
+    public static string StoppedMutexName =>
+        @"Global\InbriskEmergencyStopped-" +
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(
+                MarkerPath.ToLowerInvariant())))[..8];
+
+    /// <summary>Is the emergency-stop mutex currently held by a live
+    /// process? Tri-state like <see cref="MutexAuthorityHeld"/>: true =
+    /// held (a stopped authority exists), false = exists but unowned,
+    /// null = never created or could not be opened.</summary>
+    public static bool? StoppedMutexHeld()
+    {
+        try
+        {
+            using var m = Mutex.OpenExisting(StoppedMutexName);
+            try
+            {
+                var free = m.WaitOne(0);
+                if (free) m.ReleaseMutex();
+                return !free;
+            }
+            catch (AbandonedMutexException)
+            { try { m.ReleaseMutex(); } catch { } return false; }
+        }
+        catch (WaitHandleCannotBeOpenedException) { return null; }
+        catch { return null; }
+    }
+
     /// <summary>Named mutex the authority holds while it owns the panic
     /// hotkey — the fallback authority signal for processes running older
     /// binaries that never wrote an owner record. Scoped by chord + marker
@@ -65,8 +101,13 @@ public static class EmergencyGate
 
     /// <summary>A local panic stop is latched. Mutating computer actions
     /// must refuse while this is true — in EVERY process, not only the one
-    /// holding the panic hotkey (CLI one-shots included).</summary>
-    public static bool IsStopped => File.Exists(MarkerPath);
+    /// holding the panic hotkey (CLI one-shots included). The check is
+    /// marker-file OR held-mutex: the marker covers processes whose
+    /// authority predates the mutex and late-joiners, the mutex keeps the
+    /// stop latched even after the marker file is deleted (F18) — a held
+    /// kernel object cannot be removed by another process.</summary>
+    public static bool IsStopped =>
+        File.Exists(MarkerPath) || StoppedMutexHeld() == true;
 
     /// <summary>Who currently owns the panic hotkey (the authority).</summary>
     public sealed record OwnerInfo(int Pid, DateTime StartTimeUtc,
