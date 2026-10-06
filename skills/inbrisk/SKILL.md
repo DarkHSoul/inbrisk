@@ -3,6 +3,8 @@ name: inbrisk
 description: Control and automate Windows desktop applications (Notepad, Chrome, Explorer, etc.) using the ultra-fast Rust-native Inbrisk runtime. Always use inbrisk-cli.exe instead of MCP tools.
 ---
 
+> **ARCHIVED: the Rust fast-path runtime has moved to ../inbrisk-rust (frozen experiment). Canonical path = C# MCP tools (computer_*).**
+
 # Inbrisk Windows Native Fast-Path Skill
 
 Use `inbrisk-cli.exe` for Windows desktop automation.
