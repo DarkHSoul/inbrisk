@@ -1,0 +1,623 @@
+{
+ "label": "csharp-baseline",
+ "date": "2026-10-06",
+ "env": {
+  "os": "Windows-11-10.0.26200-SP0",
+  "python": "3.12.10",
+  "machine": "DESKTOP-LMFAO",
+  "driver": "python stdio JSON-RPC (newline-delimited)",
+  "preExistingInbriskProcesses": "[\n    {\n        \"ProcessId\":  19256,\n        \"Name\":  \"inbrisk-bridge.exe\",\n        \"ExecutablePath\":  \"C:\\\\Users\\\\Ahmet\\\\AppData\\\\Local\\\\inbrisk\\\\bin\\\\inbrisk-bridge.exe\"\n    },\n    {\n        \"ProcessId\":  12924,\n        \"Name\":  \"inbrisk.exe\",\n        \"ExecutablePath\":  null\n    },\n    {\n        \"ProcessId\":  19964,\n        \"Name\":  \"inbrisk-desktop.exe\",\n        \"ExecutablePath\":  null\n    },\n    {\n        \"ProcessId\":  19836,\n        \"Name\":  \"inbrisk.exe\",\n        \"ExecutablePath\":  \"C:\\\\Users\\\\Ahmet\\\\AppData\\\\Local\\\\Programs\\\\Inbrisk\\\\inbrisk.exe\"\n    },\n    {\n        \"ProcessId\":  19692,\n        \"Name\":  \"inbrisk-mcp.exe\",\n        \"ExecutablePath\":  null\n    }\n]"
+ },
+ "binary": {
+  "servingCommand": "dotnet C:\\Users\\Ahmet\\Documents\\inbrisk\\src\\Inbrisk.Cli\\bin\\Release\\net8.0-windows10.0.19041.0\\inbrisk.dll mcp",
+  "note": "inbrisk.exe apphost denied LocalAppData writes under the agent sandbox (untrusted image \u2014 verified for both direct spawn and WMI-spawn); dotnet.exe is allowlisted so the identical managed assemblies are hosted directly.",
+  "exePath": "C:\\Users\\Ahmet\\Documents\\inbrisk\\src\\Inbrisk.Cli\\bin\\Release\\net8.0-windows10.0.19041.0\\inbrisk.exe",
+  "publishExePath": "C:\\Users\\Ahmet\\Documents\\inbrisk\\src\\Inbrisk.Cli\\bin\\Release\\net8.0-windows10.0.19041.0\\win-x64\\publish\\inbrisk.exe",
+  "daemonReused": false,
+  "daemonNote": "No inbrisk-runtime-* named pipe existed at bench time; `inbrisk.exe mcp` runs McpHost in-process (Program.cs \u2192 McpHost.RunAsync). ThinStdioProxy is only the inbrisk-mcp.exe entrypoint.",
+  "serverInfo": {
+   "name": "inbrisk",
+   "version": "0.5.0+4271b3f4c7a85779a642ba8cbc1f8cf3bee8f675"
+  },
+  "protocolVersion": "2025-03-26",
+  "instructionsBytes": 2593
+ },
+ "coldStart": {
+  "note": "spawn \u2192 initialize result ms; in-process server (dotnet host + JIT + DI boot), no daemon reuse",
+  "spawnToInitializeMs": {
+   "n": 5,
+   "min": 491.5,
+   "p50": 496.9,
+   "p95": 501.7,
+   "max": 501.7
+  },
+  "samples": [
+   496.9,
+   496.8,
+   498.6,
+   501.7,
+   491.5
+  ]
+ },
+ "toolsListFull": {
+  "toolCount": 54,
+  "responseBytes": 115455,
+  "names": [
+   "browser_browse",
+   "browser_capture",
+   "browser_click",
+   "browser_content",
+   "browser_evaluate",
+   "browser_screenshot",
+   "browser_snapshot",
+   "browser_tabs",
+   "browser_type",
+   "computer_adapter",
+   "computer_app_restart",
+   "computer_app_shutdown",
+   "computer_app_status",
+   "computer_apps",
+   "computer_batch",
+   "computer_cancel_task",
+   "computer_capabilities",
+   "computer_click",
+   "computer_close_window",
+   "computer_do",
+   "computer_drag",
+   "computer_find",
+   "computer_focus_window",
+   "computer_hotkey",
+   "computer_inspect",
+   "computer_invoke",
+   "computer_key",
+   "computer_launch",
+   "computer_leases_status",
+   "computer_list_adapters",
+   "computer_list_recipes",
+   "computer_observe",
+   "computer_pause_run",
+   "computer_read",
+   "computer_reset_input",
+   "computer_resume_run",
+   "computer_run",
+   "computer_run_recipe",
+   "computer_save_recipe",
+   "computer_screen_memory",
+   "computer_screenshot",
+   "computer_scroll",
+   "computer_scroll_into_view",
+   "computer_set_value",
+   "computer_toolset",
+   "computer_type",
+   "computer_ui_open_settings",
+   "computer_ui_set",
+   "computer_ui_status",
+   "computer_wait",
+   "computer_wait_for",
+   "computer_wait_for_change",
+   "computer_wait_for_stable",
+   "computer_windows"
+  ]
+ },
+ "appStatus": "{\r\n  \"running\": true,\r\n  \"version\": \"1.0.0\",\r\n  \"mcpSessions\": 1,\r\n  \"emergencyState\": \"Active\",\r\n  \"uiProcess\": \"in-process\",\r\n  \"installMode\": \"portable\"\r\n}",
+ "toolsListAmbient": {
+  "toolCount": 16,
+  "responseBytes": 71195,
+  "note": "ambient profile from %LOCALAPPDATA%\\inbrisk\\settings.json"
+ },
+ "benchNotepad": {
+  "hwnd": "0x20716",
+  "freshLaunchMs": 13622.4,
+  "launchResult": "{\"status\":\"Verified\",\"next\":\"inspect\",\"nextObservationRequired\":true,\"app\":\"notepad\",\"method\":\"AppPath\",\"process\":{\"pid\":16368},\"window\":{\"hwnd\":\"0x20716\",\"title\":\"Not Defteri\"},\"initialMap\":{\"hwnd\":\"0x20716\",\"pid\":16368,\"title\":\"Not Defteri\",\"ready\":true,\"focused\":false,\"landmarks\":[],\"firstActionables\":[],\"modal\":null,\"truncated\":true},\"continuation\":null,\"launchState\":\"Ready\",\"alreadyRunning\":false,\"note\":null,\"durationMs\":533,\"launchMs\":10,\"readyMs\":523}"
+ },
+ "tools": {
+  "computer_app_status": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 0.5,
+    "p50": 0.5,
+    "p95": 0.7,
+    "max": 0.7
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 363,
+    "p50": 363,
+    "p95": 363,
+    "max": 363
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_windows.cached": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 0.5,
+    "p50": 0.6,
+    "p95": 0.7,
+    "max": 0.7
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 1633,
+    "p50": 1633,
+    "p95": 1633,
+    "max": 1633
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_windows.uncached": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 0.5,
+    "p50": 0.6,
+    "p95": 1.1,
+    "max": 4.6
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 1633,
+    "p50": 1633,
+    "p95": 1633,
+    "max": 1633
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_observe.semantic.window.cached": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 0.6,
+    "p50": 0.7,
+    "p95": 0.9,
+    "max": 2.1
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 7649,
+    "p50": 7649,
+    "p95": 7649,
+    "max": 7649
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_observe.semantic.window.uncached": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 25.8,
+    "p50": 28.7,
+    "p95": 33.7,
+    "max": 34.6
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 7471,
+    "p50": 7472,
+    "p95": 7787,
+    "max": 7787
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_find.button.window.cached": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 0.5,
+    "p50": 0.6,
+    "p95": 1.0,
+    "max": 1.5
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 1590,
+    "p50": 1590,
+    "p95": 1590,
+    "max": 1590
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 1,
+    "comCalls": 170,
+    "elementsEnumerated": 14,
+    "liveReads": 169,
+    "cachedReads": 564,
+    "inspectCalls": 0
+   }
+  },
+  "computer_find.button.window.uncached": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 0.8,
+    "p50": 0.8,
+    "p95": 0.9,
+    "max": 1.0
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 1553,
+    "p50": 1553,
+    "p95": 1553,
+    "max": 1553
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_observe.semantic.desktop.cached": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 0.7,
+    "p50": 0.8,
+    "p95": 1.0,
+    "max": 3.0
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 6712,
+    "p50": 6712,
+    "p95": 6712,
+    "max": 6712
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_observe.semantic.desktop.uncached": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 26.0,
+    "p50": 30.9,
+    "p95": 36.0,
+    "max": 38.1
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 6884,
+    "p50": 7155,
+    "p95": 7155,
+    "max": 7155
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_screenshot.desktop": {
+   "iters": 8,
+   "wall": {
+    "n": 8,
+    "min": 59.9,
+    "p50": 67.5,
+    "p95": 70.6,
+    "max": 70.6
+   },
+   "respBytes": {
+    "n": 8,
+    "min": 321474,
+    "p50": 321474,
+    "p95": 321828,
+    "max": 321828
+   },
+   "imageBytes": {
+    "n": 8,
+    "min": 223209,
+    "p50": 223209,
+    "p95": 223287,
+    "max": 223287
+   },
+   "imagesTotal": 8,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "computer_screenshot.window": {
+   "iters": 8,
+   "wall": {
+    "n": 8,
+    "min": 14.8,
+    "p50": 18.7,
+    "p95": 20.3,
+    "max": 20.3
+   },
+   "respBytes": {
+    "n": 8,
+    "min": 39135,
+    "p50": 39135,
+    "p95": 39135,
+    "max": 39135
+   },
+   "imageBytes": {
+    "n": 8,
+    "min": 27084,
+    "p50": 27084,
+    "p95": 27084,
+    "max": 27084
+   },
+   "imagesTotal": 8,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  },
+  "tools/list": {
+   "iters": 15,
+   "wall": {
+    "n": 15,
+    "min": 1.5,
+    "p50": 1.9,
+    "p95": 2.3,
+    "max": 2.8
+   },
+   "respBytes": {
+    "n": 15,
+    "min": 71197,
+    "p50": 71197,
+    "p95": 71197,
+    "max": 71197
+   }
+  },
+  "computer_launch.notepad_existing": {
+   "iters": 5,
+   "wall": {
+    "n": 5,
+    "min": 13017.6,
+    "p50": 13028.8,
+    "p95": 13038.5,
+    "max": 13038.5
+   },
+   "respBytes": {
+    "n": 5,
+    "min": 1018,
+    "p50": 1018,
+    "p95": 1018,
+    "max": 1018
+   },
+   "imageBytes": null,
+   "imagesTotal": 0,
+   "errors": [],
+   "uiaTotalsSharedLog": {
+    "finds": 0,
+    "comCalls": 0,
+    "elementsEnumerated": 0,
+    "liveReads": 0,
+    "cachedReads": 0,
+    "inspectCalls": 0
+   }
+  }
+ },
+ "memory": {
+  "serverPid": 21128,
+  "serverWorkingSetBytes": 321359872,
+  "note": "dotnet.exe hosting inbrisk.dll mcp, after warm run"
+ },
+ "uiaProbe": {
+  "note": "comCalls/cachedReads from find-perf.jsonl (shared log; offset-sliced, settled). Per-call counts are per uia.find/uia.inspect event.",
+  "probes": {
+   "observe.desktop.x3": {
+    "calls": 3,
+    "uia": {
+     "finds": 0,
+     "comCalls": 54,
+     "elementsEnumerated": 27,
+     "liveReads": 54,
+     "cachedReads": 0,
+     "inspectCalls": 2
+    },
+    "events": [
+     {
+      "kind": "uia.inspect",
+      "method": null,
+      "roots": null,
+      "comCalls": 26,
+      "cachedReads": 356,
+      "crossProcessPropertyReads": 26,
+      "elements": 13,
+      "candidatesEnumerated": null,
+      "totalMs": 36
+     },
+     {
+      "kind": "uia.inspect",
+      "method": null,
+      "roots": null,
+      "comCalls": 28,
+      "cachedReads": 388,
+      "crossProcessPropertyReads": 28,
+      "elements": 14,
+      "candidatesEnumerated": null,
+      "totalMs": 21
+     }
+    ]
+   },
+   "find.button.desktop.x3": {
+    "calls": 3,
+    "uia": {
+     "finds": 1,
+     "comCalls": 1767,
+     "elementsEnumerated": 774,
+     "liveReads": 1523,
+     "cachedReads": 2746,
+     "inspectCalls": 0
+    },
+    "events": [
+     {
+      "kind": "uia.cacheScopeFailed",
+      "method": null,
+      "roots": null,
+      "comCalls": null,
+      "cachedReads": null,
+      "crossProcessPropertyReads": null,
+      "elements": null,
+      "candidatesEnumerated": null,
+      "totalMs": null
+     },
+     {
+      "kind": "uia.find",
+      "method": "FindAllBuildCache",
+      "roots": 244,
+      "comCalls": 1767,
+      "cachedReads": 2746,
+      "crossProcessPropertyReads": 1523,
+      "elements": null,
+      "candidatesEnumerated": 774,
+      "totalMs": 2960
+     }
+    ]
+   },
+   "windows.x3": {
+    "calls": 3,
+    "uia": {
+     "finds": 0,
+     "comCalls": 0,
+     "elementsEnumerated": 0,
+     "liveReads": 0,
+     "cachedReads": 0,
+     "inspectCalls": 0
+    },
+    "events": []
+   }
+  }
+ },
+ "tasks": {
+  "notepad": {
+   "status": "FAIL",
+   "wallMs": 43829.4,
+   "launchMs": null,
+   "toolCalls": 7,
+   "screenshots": 0,
+   "notes": "transport: no response within 30s"
+  },
+  "calculator_uwp": {
+   "status": "FAIL",
+   "wallMs": 30002.2,
+   "launchMs": null,
+   "toolCalls": 0,
+   "screenshots": 0,
+   "notes": "transport: no response within 30s"
+  },
+  "edge_cdp": {
+   "status": "FAIL",
+   "wallMs": 31154.0,
+   "launchMs": null,
+   "toolCalls": 0,
+   "screenshots": 0,
+   "notes": "transport: no response within 30s"
+  },
+  "explorer": {
+   "status": "FAIL",
+   "wallMs": 30004.2,
+   "launchMs": null,
+   "toolCalls": 0,
+   "screenshots": 0,
+   "notes": "transport: no response within 30s"
+  },
+  "vscode": {
+   "status": "FAIL",
+   "wallMs": 30011.5,
+   "launchMs": null,
+   "toolCalls": 0,
+   "screenshots": 0,
+   "notes": "transport: no response within 30s"
+  },
+  "custom_app": {
+   "status": "FAIL",
+   "wallMs": 30007.6,
+   "launchMs": null,
+   "toolCalls": 0,
+   "screenshots": 0,
+   "notes": "transport: no response within 30s"
+  }
+ },
+ "tasksNote": "custom_app uses tests/Inbrisk.TestApp (WPF) as the 'custom-rendered-ish' target \u2014 a real game was unavailable. explorer/code.exe are ProtectedProcesses in user settings (launch may be policy-denied)."
+}
