@@ -157,3 +157,80 @@ public interface IClipboardService
     void WriteText(string text);
     void Clear();
 }
+
+// ----------------------- silent (message-based) input -----------------------
+
+/// <summary>How a silent operation addresses its target. Supply either
+/// <paramref name="ElementHwnd"/> (the element's own native window handle —
+/// null for HWND-less UIA elements) or <paramref name="WindowHwnd"/> plus
+/// enough of AutomationId / Name / Bounds to locate the child control via a
+/// bounded child-window scan. <paramref name="CommandId"/> addresses a menu
+/// item via WM_COMMAND.</summary>
+public sealed record SilentTargetRef(
+    long? ElementHwnd = null,
+    long? WindowHwnd = null,
+    string? AutomationId = null,
+    string? Name = null,
+    RectPx? Bounds = null,
+    int? CommandId = null);
+
+public enum SilentInputStatus
+{
+    /// <summary>Delivered — see <see cref="SilentInputResult.Verified"/> for
+    /// whether a post-action read-back confirmed the effect.</summary>
+    Ok,
+    /// <summary>Attempted but the target rejected it, or the post-condition
+    /// did not hold.</summary>
+    Failed,
+    /// <summary>The send timed out — target thread hung or not pumping
+    /// messages.</summary>
+    Timeout,
+    /// <summary>No honest message-only path exists for this target — the
+    /// caller must report NotSupported, never fall back to SendInput.</summary>
+    Unsupported,
+}
+
+/// <summary>Outcome of one silent (message-based) input attempt.
+/// <paramref name="Method"/> names the mechanism used ("wm_settext" |
+/// "em_replacesel" | "bm_click" | "bm_setcheck" | "wm_command" |
+/// "wm_close" | "none") so dispatch and telemetry record exactly what was
+/// tried.</summary>
+public sealed record SilentInputResult(
+    bool Ok,
+    SilentInputStatus Status,
+    string Method,
+    bool Verified,
+    string? Detail = null);
+
+/// <summary>
+/// Message-based ("silent") element actuation: drives a target by posting
+/// window messages to its own hwnd instead of synthesizing pointer/keyboard
+/// input through SendInput. Works on occluded, background and (often)
+/// minimized windows without stealing focus. What messages can honestly do
+/// is narrow — implementations refuse (Unsupported) rather than fake the
+/// rest, and every cross-window send is timeout-guarded so a hung target
+/// can never park the dispatcher. Implementations live in the platform
+/// layer (Platform.Windows: SilentInput); Runtime only sees this contract.
+/// </summary>
+public interface ISilentInputService
+{
+    /// <summary>Honest capability probe — false means the kind has no
+    /// message-only equivalent and the caller must report NotSupported
+    /// (with <paramref name="detail"/> explaining why).</summary>
+    bool IsSupported(ActionKind kind, out string detail);
+
+    /// <summary>Control click — BM_CLICK on a button-class hwnd, or
+    /// WM_COMMAND on a menu command. Never synthesizes pointer input.</summary>
+    SilentInputResult TryClick(SilentTargetRef target);
+
+    /// <summary>Control text set — WM_SETTEXT / EM_REPLACESEL on an
+    /// edit-class hwnd, verified by WM_GETTEXT read-back.</summary>
+    SilentInputResult TrySetText(SilentTargetRef target, string text);
+
+    /// <summary>Deterministic check-state set on a checkable Win32 button
+    /// (BM_GETCHECK → BM_CLICK → BM_SETCHECK).</summary>
+    SilentInputResult TrySetCheck(SilentTargetRef target, bool check);
+
+    /// <summary>Graceful background close — posts WM_CLOSE.</summary>
+    SilentInputResult TryClose(long hwnd);
+}

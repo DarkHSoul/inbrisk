@@ -21,6 +21,10 @@ public sealed class Executor
     private readonly ITelemetrySink? _telemetry;
     private readonly ComputerControlActivityService? _activity;
     private readonly ActionDeltaCollector _delta;
+    /// <summary>Message-based ("silent") input backend — null on runtimes
+    /// that have none; silent intents then fail NotSupported instead of
+    /// falling back to SendInput.</summary>
+    private readonly ISilentInputService? _silent;
     private int _seq;
     private long _mutationVersion;
 
@@ -42,7 +46,8 @@ public sealed class Executor
         SafetyPolicy policy,
         ITelemetrySink? telemetry = null,
         ComputerControlActivityService? activity = null,
-        IEventWaiter? eventWaiter = null)
+        IEventWaiter? eventWaiter = null,
+        ISilentInputService? silent = null)
     {
         _windows = windows;
         _integrity = integrity;
@@ -55,6 +60,7 @@ public sealed class Executor
         _activity = activity;
         _verifier = new Verifier(windows, capture);
         _delta = new ActionDeltaCollector(windows, eventWaiter, _backends);
+        _silent = silent;
     }
 
     /// <summary>Public entry — wraps PerformCore with pre/post desktop
@@ -240,7 +246,10 @@ public sealed class Executor
                 result = Act(intent, element, point, window, attempts, ct);
 
             // --- verify ---
-            var verify = VerifyResult.NotRequested;
+            // a silent action can arrive pre-verified (WM_GETTEXT /
+            // BM_GETCHECK read-backs) — keep that verdict; every other
+            // result reports NotRequested here and verifies as before
+            var verify = result.Verification;
             VerifyEvidence? evidence = null;
             if (result.Success && intent.Verify is { } vs)
             {
@@ -267,7 +276,8 @@ public sealed class Executor
                     }
                 }
             }
-            else if (result.Success && element != null)
+            else if (result.Success && element != null &&
+                verify != VerifyResult.Verified)
                 using (PerfTrace.Stage("verify.post"))
                     (verify, evidence) = PostVerify(intent, element);
 
@@ -334,6 +344,21 @@ public sealed class Executor
         var sw = Stopwatch.StartNew();
         ct.ThrowIfCancellationRequested();
 
+        // ---- silent (background WM-message) delivery ----
+        // Reached only after EVERY PerformCore guard passed — emergency
+        // stop, secure desktop, integrity/UIPI, safety policy and the
+        // confirm/consent gate. Silent actions differ solely in the final
+        // input mechanism: window messages to the target's own hwnd instead
+        // of synthesized pointer/keyboard input. The foreground/focus guard
+        // is skipped BY DESIGN (that is the point of silent input — no
+        // focus theft, works on unfocused/occluded windows), while element
+        // liveness, the disabled-element guard, hwnd↔window containment and
+        // the protected-window check still apply inside ActSilent. A kind
+        // with no honest message-only equivalent fails Unsupported — the
+        // silent path NEVER falls back to SendInput.
+        if (intent.Silent)
+            return ActSilent(intent, element, window, attempts, sw, ct);
+
         switch (intent.Kind)
         {
             // ---- element semantic actions: backend first, coordinate fallback ----
@@ -365,6 +390,20 @@ public sealed class Executor
                         VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Unsupported,
                         $"element {element.Id} is offscreen and cannot be clicked via coordinates");
                 }
+                // volatile-backend staleness guard: OCR/Vision elements are
+                // frozen snapshots — ReResolve returns null and IsAlive is
+                // always true, so the recorded Center never refreshes. When
+                // the owning window has moved since capture, the stale point
+                // is outside the window's live bounds and the click would
+                // land on whatever now occupies those desktop coordinates.
+                if (window != null &&
+                    element.Handle.Backend is BackendId.Ocr or BackendId.Vision &&
+                    !window.Bounds.Contains(element.Center.X, element.Center.Y))
+                    return new ActionResult(false, null, "guard", attempts,
+                        VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Stale,
+                        $"element {element.Id} point is outside the live bounds " +
+                        $"of '{window.Title}' — the window moved since the " +
+                        "OCR/vision capture; re-run computer_find");
                 // coordinate fallback: foreground the owning window first
                 if (window != null) GuardFocus(window, attempts);
                 var c = element.Center;
@@ -475,11 +514,236 @@ public sealed class Executor
                 return Ok(BackendId.Win32, "SetForegroundWindow", attempts, sw);
             }
 
+            case ActionKind.CloseWindow when window != null:
+            {
+                var h = window.Hwnd;
+                // parity with the silent path and the tool-layer close gate:
+                // never close a protected host/terminal/critical-session
+                // window. Lifecycle provenance (agent-owned-only closes)
+                // stays at the tool layer, which executor callers do not
+                // reach.
+                if (_windows.IsWindowProtected(h, out var closeProtect))
+                    return new ActionResult(false, null, "guard", attempts,
+                        VerifyResult.NotRequested, sw.Elapsed,
+                        ErrorCode.PolicyDenied,
+                        $"refusing to close protected window: {closeProtect}");
+                attempts.Add(Do(() =>
+                {
+                    if (!_windows.CloseWindow(h))
+                        throw new InbriskException(ErrorCode.Internal,
+                            "WM_CLOSE post failed");
+                }, BackendId.Win32, "wm_close"));
+                return Ok(BackendId.Win32, "wm_close", attempts, sw);
+            }
+
             default:
                 return new ActionResult(false, null, "none", attempts,
                     VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Unsupported,
                     $"unsupported intent {intent.Kind} for target");
         }
+    }
+
+    /// <summary>
+    /// Silent (background WM-message) actuation. Every PerformCore guard
+    /// already ran — this method differs from <see cref="Act"/> ONLY in the
+    /// delivery mechanism. Deliberately skipped: the foreground/focus guard
+    /// (message delivery needs no focus — that is the feature) and the
+    /// offscreen gate (a message reaches occluded/minimized targets just
+    /// fine). Deliberately kept: element liveness, the disabled-element
+    /// guard, hwnd↔window containment (never message an hwnd outside the
+    /// resolved window's tree), process agreement, and the protected-window
+    /// check. Unsupported kinds and unresolvable targets fail with
+    /// <see cref="ErrorCode.Unsupported"/> — NEVER a SendInput fallback.
+    /// </summary>
+    private ActionResult ActSilent(ActionIntent intent, UiElement? element,
+        WindowInfo? window, List<Attempt> attempts, Stopwatch sw,
+        CancellationToken ct)
+    {
+        ActionResult NotSupported(string why) => new(false, null, "guard",
+            attempts, VerifyResult.NotRequested, sw.Elapsed,
+            ErrorCode.Unsupported,
+            $"silent execution not supported for {intent.Kind} ({why}) " +
+            "— retry with silent:false");
+
+        // ---- routing table ----
+        //   Click/Invoke/Toggle → control click (BM_CLICK / WM_COMMAND)
+        //   TypeText/SetValue   → control text set (WM_SETTEXT/EM_REPLACESEL)
+        //   CloseWindow         → WM_CLOSE posted to the window
+        // everything else (DoubleClick, RightClick, MiddleClick, Drag,
+        // Scroll, MouseMove, KeyPress, Hotkey, FocusWindow, FocusElement,
+        // Select/Expand/Collapse/ScrollIntoView, Clipboard*) has no honest
+        // message-only equivalent → NotSupported.
+        var kind = intent.Kind;
+        if (kind is not (ActionKind.Click or ActionKind.Invoke
+                or ActionKind.Toggle or ActionKind.TypeText
+                or ActionKind.SetValue or ActionKind.CloseWindow))
+        {
+            string? why = null;
+            if (_silent != null && !_silent.IsSupported(kind, out var w) &&
+                w != null)
+                why = w;
+            return NotSupported(why ?? "no message-only path exists for this kind");
+        }
+        if (_silent == null)
+            return NotSupported("this runtime has no silent-input backend wired");
+        ct.ThrowIfCancellationRequested();
+
+        if (kind == ActionKind.CloseWindow)
+        {
+            if (window == null)
+                return NotSupported("requires a window (hwnd) target");
+            var liveWin = _windows.GetWindow(window.Hwnd);
+            if (liveWin == null)
+                return new ActionResult(false, null, "guard", attempts,
+                    VerifyResult.NotRequested, sw.Elapsed, ErrorCode.NotFound,
+                    $"window 0x{window.Hwnd:X} is gone");
+            if (_windows.IsWindowProtected(liveWin.Hwnd, out var protectWhy))
+                return new ActionResult(false, null, "guard", attempts,
+                    VerifyResult.NotRequested, sw.Elapsed,
+                    ErrorCode.PolicyDenied,
+                    $"refusing silent close of protected window: {protectWhy}");
+            return SilentResultOf(intent, attempts, sw,
+                () => _silent.TryClose(liveWin.Hwnd));
+        }
+
+        // ---- element verbs: Click/Invoke/Toggle/TypeText/SetValue ----
+        if (element == null)
+            return NotSupported("requires an element target — coordinate " +
+                "and foreground-window delivery are SendInput semantics");
+
+        // disabled-element guard — identical to the SendInput path
+        if (GuardElementTargetable(intent, element, attempts, sw) is { } denied)
+            return denied;
+
+        // Containment: the hwnd we message must live inside the resolved
+        // window's tree — never message an arbitrary hwnd. element.Hwnd
+        // (the UIA NativeWindowHandle) may be a child control; the resolved
+        // window is its GA_ROOT top-level. HWND-less elements fall back to
+        // the backend's bounded child scan inside the resolved window —
+        // still contained by construction.
+        long? windowHwnd = window?.Hwnd;
+        if (element.Hwnd is { } eh)
+        {
+            var top = _windows.GetTopLevelWindow(eh);
+            if (top == null)
+                return new ActionResult(false, null, "guard", attempts,
+                    VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Stale,
+                    $"element {element.Id} hwnd 0x{eh:X} is no longer a live window");
+            if (window != null && top.Hwnd != window.Hwnd)
+                return new ActionResult(false, null, "guard", attempts,
+                    VerifyResult.NotRequested, sw.Elapsed,
+                    ErrorCode.PolicyDenied,
+                    $"element {element.Id} hwnd resolves to top-level " +
+                    $"0x{top.Hwnd:X}, outside the resolved window " +
+                    $"0x{window.Hwnd:X} — refusing to message it");
+            windowHwnd ??= top.Hwnd;
+        }
+        windowHwnd ??= element.Handle.Recipe.Hwnd;
+        if (windowHwnd == null)
+            return NotSupported("element has no hwnd and no owning window " +
+                "to scope a control scan — HWND-less elements cannot be " +
+                "driven by window messages");
+        var owner = _windows.GetWindow(windowHwnd.Value);
+        if (owner == null)
+            return new ActionResult(false, null, "guard", attempts,
+                VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Stale,
+                $"owning window 0x{windowHwnd:X} is gone");
+
+        // process agreement: a resolved element whose recorded pid differs
+        // from its window's pid is a stale/mismatched binding
+        if (element.Pid is { } ep && owner.Pid != 0 && ep != owner.Pid)
+            return new ActionResult(false, null, "guard", attempts,
+                VerifyResult.NotRequested, sw.Elapsed, ErrorCode.PolicyDenied,
+                $"element {element.Id} records pid {ep} but its window " +
+                $"belongs to pid {owner.Pid} — refusing silent delivery");
+
+        // protected-window check: silent messages to the host/terminal or a
+        // critical-session window refuse exactly like the input path
+        if (_windows.IsWindowProtected(windowHwnd.Value, out var prot))
+            return new ActionResult(false, null, "guard", attempts,
+                VerifyResult.NotRequested, sw.Elapsed, ErrorCode.PolicyDenied,
+                $"refusing silent {kind} on protected window " +
+                $"0x{windowHwnd:X}: {prot}");
+
+        var st = new SilentTargetRef(
+            ElementHwnd: element.Hwnd,
+            WindowHwnd: windowHwnd,
+            AutomationId: element.Handle.Recipe.AutomationId,
+            Name: element.Name,
+            Bounds: element.Bounds);
+
+        return kind switch
+        {
+            ActionKind.TypeText or ActionKind.SetValue =>
+                SilentResultOf(intent, attempts, sw,
+                    () => _silent.TrySetText(st,
+                        intent.Args?.TryGetValue("text", out var t) == true
+                            ? t?.ToString() ?? "" : "")),
+            // Click, Invoke, Toggle — BM_CLICK both clicks push buttons and
+            // toggles checkable ones (BM_GETCHECK read-back verifies)
+            _ => SilentResultOf(intent, attempts, sw, () => _silent.TryClick(st)),
+        };
+    }
+
+    /// <summary>Run one silent op, record the attempt and the
+    /// <c>silent.action</c> perf event, and map the result honestly:
+    /// backend-reported Unsupported stays Unsupported (the target can't be
+    /// driven by messages — retry with silent:false), Timeout stays
+    /// Timeout, and a read-back-verified success carries evidence.</summary>
+    private ActionResult SilentResultOf(ActionIntent intent,
+        List<Attempt> attempts, Stopwatch sw, Func<SilentInputResult> op)
+    {
+        var asw = Stopwatch.StartNew();
+        SilentInputResult r;
+        try { r = op(); }
+        catch (Exception e)
+        {
+            attempts.Add(new Attempt(BackendId.Win32, "silent", false,
+                e.Message, asw.Elapsed));
+            PerfLog.Write(new
+            {
+                kind = "silent.action",
+                action = intent.Kind.ToString(),
+                method = "exception",
+                ms = asw.ElapsedMilliseconds,
+                verified = false,
+                ok = false,
+            });
+            return new ActionResult(false, BackendId.Win32, "silent",
+                attempts, VerifyResult.NotRequested, sw.Elapsed,
+                ErrorCode.Internal, e.Message);
+        }
+        attempts.Add(new Attempt(BackendId.Win32, r.Method, r.Ok, r.Detail,
+            asw.Elapsed));
+        PerfLog.Write(new
+        {
+            kind = "silent.action",
+            action = intent.Kind.ToString(),
+            method = r.Method,
+            ms = asw.ElapsedMilliseconds,
+            verified = r.Verified,
+            ok = r.Ok,
+        });
+
+        if (!r.Ok)
+            return new ActionResult(false, BackendId.Win32, r.Method,
+                attempts, VerifyResult.NotRequested, sw.Elapsed,
+                r.Status == SilentInputStatus.Unsupported
+                    ? ErrorCode.Unsupported
+                    : r.Status == SilentInputStatus.Timeout
+                        ? ErrorCode.Timeout
+                        : ErrorCode.Internal,
+                r.Status == SilentInputStatus.Unsupported
+                    ? $"silent execution not supported for {intent.Kind} on " +
+                      $"this target — {r.Detail} — retry with silent:false"
+                    : r.Detail);
+
+        return new ActionResult(true, BackendId.Win32, r.Method, attempts,
+            r.Verified ? VerifyResult.Verified : VerifyResult.Unverified,
+            sw.Elapsed, ErrorCode.None, r.Detail,
+            Evidence: r.Verified
+                ? new VerifyEvidence(r.Method, Detail: r.Detail)
+                : null);
     }
 
     /// <summary>

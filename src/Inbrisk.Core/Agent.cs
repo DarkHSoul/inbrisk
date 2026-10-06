@@ -51,7 +51,11 @@ public sealed record AgentAction(
     string? ExpectedState = null,
     string? ExpectedValue = null,
     bool Gone = false,
-    bool StopOnUnexpectedDialog = true)
+    bool StopOnUnexpectedDialog = true,
+    /// <summary>Deliver via background window messages instead of
+    /// foreground SendInput — no focus theft. All safety gates still
+    /// apply; unsupported kinds return NotSupported.</summary>
+    bool Silent = false)
 {
     public string Summary() => Kind switch
     {
@@ -234,6 +238,11 @@ public enum OutcomeKind
     ConcurrencyConflict,
     /// <summary>Execution was paused to yield control to human takeover.</summary>
     PausedForHuman,
+    /// <summary>The requested delivery mechanism cannot perform the action
+    /// on this target — e.g. silent (message-based) input on an HWND-less
+    /// element or a kind with no message equivalent. No implicit fallback
+    /// was attempted; the caller must opt out explicitly.</summary>
+    NotSupported,
 }
 
 /// <summary>Machine-readable root-cause diagnosis when target element resolution fails.</summary>

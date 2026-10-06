@@ -6,6 +6,10 @@ public enum ActionKind
     Invoke, SetValue, Toggle, Select, Expand, Collapse, ScrollIntoView,
     TypeText, KeyPress, Hotkey,
     FocusWindow, FocusElement, ClipboardRead, ClipboardWrite,
+    /// <summary>Graceful window close (WM_CLOSE). The tool layer's
+    /// provenance gates still decide whether a close is allowed — this is
+    /// only the transport-level intent.</summary>
+    CloseWindow,
 }
 
 /// <summary>What an action targets. Exactly one field is set.</summary>
@@ -38,7 +42,13 @@ public sealed record ActionIntent(
     ActionKind Kind,
     TargetRef Target,
     IReadOnlyDictionary<string, object?>? Args = null,
-    VerifySpec? Verify = null);
+    VerifySpec? Verify = null,
+    /// <summary>Deliver via background window messages instead of
+    /// synthesized foreground input — no focus theft, works on unfocused
+    /// windows. Every guard still applies; only the final input mechanism
+    /// differs. Kinds with no honest message-only equivalent fail
+    /// Unsupported — there is never a SendInput fallback.</summary>
+    bool Silent = false);
 
 public enum ErrorCode
 {

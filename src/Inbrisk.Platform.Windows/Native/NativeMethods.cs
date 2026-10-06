@@ -465,4 +465,64 @@ internal static class NativeMethods
 
     [DllImport("user32.dll", EntryPoint = "SendMessageW")] internal static extern IntPtr SendMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")] internal static extern IntPtr GetClassLongPtrW(IntPtr hWnd, int nIndex);
+
+    // ---- message-based ("silent") input: timeout-guarded sends ----
+    // Every cross-window SendMessage goes through SendMessageTimeoutW so a
+    // hung target can never block the dispatcher. Three lParam shapes:
+    // plain IntPtr, LPWStr text (WM_SETTEXT / EM_REPLACESEL), and a
+    // caller-sized StringBuilder (WM_GETTEXT read-back).
+    public const uint SMTO_ABORTIFHUNG = 0x0002;
+
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "SendMessageTimeoutW")]
+    internal static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint msg,
+        IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode)]
+    internal static extern IntPtr SendMessageTimeoutText(IntPtr hWnd, uint msg,
+        IntPtr wParam, [MarshalAs(UnmanagedType.LPWStr)] string lParam,
+        uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode)]
+    internal static extern IntPtr SendMessageTimeoutBuffer(IntPtr hWnd, uint msg,
+        IntPtr wParam, StringBuilder lParam,
+        uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+
+    public const uint WM_GETTEXT = 0x000D;
+    public const uint WM_GETTEXTLENGTH = 0x000E;
+    public const uint WM_SETTEXT = 0x000C;
+    public const uint WM_CLOSE = 0x0010;
+    public const uint WM_COMMAND = 0x0111;
+
+    public const uint EM_SETSEL = 0x00B1;
+    public const uint EM_REPLACESEL = 0x00C2;
+
+    public const uint BM_GETCHECK = 0x00F0;
+    public const uint BM_SETCHECK = 0x00F1;
+    public const uint BM_CLICK = 0x00F5;
+    public const int BST_UNCHECKED = 0;
+    public const int BST_CHECKED = 1;
+    public const int BST_INDETERMINATE = 2;
+    public const int BN_CLICKED = 0;
+
+    public const int GWL_STYLE = -16;
+    public const long BS_TYPEMASK = 0x0000000FL;
+    public const long BS_CHECKBOX = 0x00000002L;
+    public const long BS_AUTOCHECKBOX = 0x00000003L;
+    public const long BS_RADIOBUTTON = 0x00000004L;
+    public const long BS_3STATE = 0x00000005L;
+    public const long BS_AUTO3STATE = 0x00000006L;
+    public const long BS_AUTORADIOBUTTON = 0x00000009L;
+
+    [DllImport("user32.dll")] internal static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] internal static extern int GetDlgCtrlID(IntPtr hWnd);
+
+    // ---- menu traversal (WM_COMMAND commandId discovery) ----
+    [DllImport("user32.dll")] internal static extern IntPtr GetMenu(IntPtr hWnd);
+    [DllImport("user32.dll")] internal static extern IntPtr GetSubMenu(IntPtr hMenu, int nPos);
+    [DllImport("user32.dll")] internal static extern int GetMenuItemCount(IntPtr hMenu);
+    [DllImport("user32.dll")] internal static extern uint GetMenuItemID(IntPtr hMenu, int nPos);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    internal static extern int GetMenuStringW(IntPtr hMenu, uint uIDItem, StringBuilder lpString, int cchMax, uint flags);
+    public const uint MF_BYPOSITION = 0x00000400;
+    public const uint MENU_ITEM_SUBMENU = 0xFFFFFFFF;
 }
