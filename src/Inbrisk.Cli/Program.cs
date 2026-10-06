@@ -49,6 +49,18 @@ if (Inbrisk.Setup.SelfInstaller.RunningAsSetupExe)
     return await Inbrisk.Setup.SetupCommands.RunSetupExeAsync(args, Probes);
 }
 
+if (Inbrisk.Cli.GhostWorkerCommand.Matches(args))
+{
+    Inbrisk.Cli.Ui.ConsoleAttach.Ensure();
+    return await Inbrisk.Cli.GhostWorkerCommand.RunAsync(args);
+}
+
+if (Inbrisk.Cli.GhostControlCommand.Matches(args))
+{
+    Inbrisk.Cli.Ui.ConsoleAttach.Ensure();
+    return await Inbrisk.Cli.GhostControlCommand.RunAsync(args);
+}
+
 if (args.Length > 0 && args[0].ToLowerInvariant() is "tray" or "shell")
     return RunDesktopShell();
 

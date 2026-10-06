@@ -61,14 +61,19 @@ public sealed class DesktopFixture : IDisposable
     {
         Environment.SetEnvironmentVariable("INBRISK_DESKTOP_BRIDGE", "off");
         var exe = FindTestAppExe();
-        var psi = new ProcessStartInfo(exe) { UseShellExecute = false };
+        var dll = Path.ChangeExtension(exe, ".dll");
+        var psi = File.Exists(dll)
+            ? new ProcessStartInfo("dotnet", $"\"{dll}\"") { UseShellExecute = false }
+            : new ProcessStartInfo(exe) { UseShellExecute = false };
         // ask the app to open on the secondary monitor directly — spawning
         // on the primary first would flash a window on the user's main
         // screen before MoveToSecondaryMonitor could reposition it
         if (SecondaryMonitorCenter(480, 640) is { } pos)
         {
             psi.Environment["INBRISK_TESTAPP_POS"] = $"{pos.X},{pos.Y}";
-            psi.Arguments = $"{pos.X},{pos.Y}";
+            psi.Arguments = File.Exists(dll)
+                ? $"\"{dll}\" {pos.X},{pos.Y}"
+                : $"{pos.X},{pos.Y}";
         }
         TestApp = Process.Start(psi)!;
         Inbrisk = new Inbrisk.Sdk.InbriskRuntime(new InbriskOptions(AutoConfirm: true,
