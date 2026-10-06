@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "comment": "Permanent UI map: known-stable UIA selectors for standard Windows apps. Keys are 'app.element' (e.g. 'notepad.document'). Selector fields mirror TargetSpec: role|controlType, name, nameContains, automationId, className, value. 'verify':true = not yet confirmed stable across Win10/Win11/locales — treat as a hint and fall back to observe when it misses. A user overlay at %LOCALAPPDATA%\\inbrisk\\uimap.json (or INBRISK_UIMAP) merges on top of this file.",
+  "apps": {
+    "notepad": {
+      "process": "notepad",
+      "aumid": "Microsoft.WindowsNotepad_8wekyb3d8bbwe!App",
+      "elements": {
+        "document": {
+          "role": "document",
+          "comment": "Win11 Notepad exposes the text area as a Document control (RichEdit host). English builds name it 'Text editor' but the name is localized — role+process is the stable selector.",
+          "verify": false
+        },
+        "editor": {
+          "role": "edit",
+          "comment": "Fallback for builds that expose the text area as Edit instead of Document.",
+          "verify": true
+        },
+        "menuFile": {
+          "role": "menuitem",
+          "name": "File",
+          "verify": true
+        },
+        "menuEdit": {
+          "role": "menuitem",
+          "name": "Edit",
+          "verify": true
+        },
+        "menuView": {
+          "role": "menuitem",
+          "name": "View",
+          "verify": true
+        },
+        "menuSave": {
+          "role": "menuitem",
+          "name": "Save",
+          "comment": "File menu must already be open (click map:notepad.menuFile first) — or prefer hotkey ctrl+s.",
+          "verify": true
+        },
+        "menuSaveAs": {
+          "role": "menuitem",
+          "name": "Save as",
+          "verify": true
+        }
+      }
+    },
+    "calculator": {
+      "process": "CalculatorApp",
+      "aumid": "Microsoft.WindowsCalculator_8wekyb3d8bbwe!App",
+      "elements": {
+        "digit0": { "role": "button", "automationId": "num0Button" },
+        "digit1": { "role": "button", "automationId": "num1Button" },
+        "digit2": { "role": "button", "automationId": "num2Button" },
+        "digit3": { "role": "button", "automationId": "num3Button" },
+        "digit4": { "role": "button", "automationId": "num4Button" },
+        "digit5": { "role": "button", "automationId": "num5Button" },
+        "digit6": { "role": "button", "automationId": "num6Button" },
+        "digit7": { "role": "button", "automationId": "num7Button" },
+        "digit8": { "role": "button", "automationId": "num8Button" },
+        "digit9": { "role": "button", "automationId": "num9Button" },
+        "plus": { "role": "button", "automationId": "plusButton" },
+        "minus": { "role": "button", "automationId": "minusButton" },
+        "multiply": { "role": "button", "automationId": "multiplyButton" },
+        "divide": { "role": "button", "automationId": "divideButton" },
+        "equals": { "role": "button", "automationId": "equalButton" },
+        "clear": { "role": "button", "automationId": "clearButton" },
+        "clearEntry": { "role": "button", "automationId": "clearEntryButton" },
+        "backspace": { "role": "button", "automationId": "backSpaceButton" },
+        "decimal": { "role": "button", "automationId": "decimalSeparatorButton" },
+        "negate": { "role": "button", "automationId": "negateButton" },
+        "result": {
+          "role": "text",
+          "automationId": "CalculatorResults",
+          "comment": "Result display; read its value/name for the current expression result."
+        }
+      }
+    },
+    "explorer": {
+      "process": "explorer",
+      "elements": {
+        "fileList": {
+          "role": "list",
+          "name": "Items View",
+          "comment": "en-US name; localized on other languages and may differ on Win11.",
+          "verify": true
+        },
+        "addressBar": {
+          "role": "edit",
+          "nameContains": "Address",
+          "verify": true
+        },
+        "searchBox": {
+          "role": "edit",
+          "nameContains": "Search",
+          "verify": true
+        },
+        "navigationPane": {
+          "role": "tree",
+          "verify": true
+        }
+      }
+    },
+    "taskmgr": {
+      "process": "Taskmgr",
+      "elements": {
+        "processesTab": {
+          "role": "tabitem",
+          "name": "Processes",
+          "comment": "Win11 Task Manager is XAML — processes list is a navigation item, not a tab; verify on target OS.",
+          "verify": true
+        },
+        "searchBox": {
+          "role": "edit",
+          "nameContains": "Search",
+          "verify": true
+        },
+        "endTask": {
+          "role": "button",
+          "name": "End task",
+          "verify": true
+        }
+      }
+    },
+    "mspaint": {
+      "process": "mspaint",
+      "aumid": "Microsoft.Paint_8wekyb3d8bbwe!App",
+      "elements": {
+        "canvas": {
+          "className": "MSPaintView",
+          "comment": "Classic mspaint.exe canvas class; Win11 Paint (packaged) differs — verify.",
+          "verify": true
+        },
+        "ribbon": {
+          "role": "pane",
+          "nameContains": "Ribbon",
+          "verify": true
+        }
+      }
+    }
+  }
+}

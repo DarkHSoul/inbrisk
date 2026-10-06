@@ -6,4 +6,10 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Permanent UI map: embedded so it ships inside the binary regardless
+         of installer layout. UiMap loads it as "inbrisk.uimap.json". -->
+    <EmbeddedResource Include="..\..\resources\uimap.json" LogicalName="inbrisk.uimap.json" />
+  </ItemGroup>
+
 </Project>

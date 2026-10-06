@@ -121,6 +121,7 @@ public sealed class InbriskTools
         [Description("snapshot ID to compute delta against (defaults to previous observation)")] long? baseSnapshotId = null,
         [Description("cap attached image width in px — wider frames are downscaled; frameId coordinate mapping stays correct")] int? maxWidth = null,
         [Description("draw numbered marks on attached frames at clickable element centers; mark i = the i-th element in the printed list")] bool? marks = null,
+        [Description("collapse passive UIA nodes (unnamed, non-actionable panes/groups/images) — default on for slim, off for full")] bool? prune = null,
         CancellationToken ct = default)
     {
         if (BadDetail(detail) is { } bd) return bd;
@@ -135,7 +136,7 @@ public sealed class InbriskTools
             PerfTrace.Count("launchFollowupDiscovery");
         }
 
-        var normArgs = $"{mode}|{hwnd}|{detail}|{maxElements}|{deltaOnly}|{baseSnapshotId}|{maxWidth}|{marks}";
+        var normArgs = $"{mode}|{hwnd}|{detail}|{maxElements}|{deltaOnly}|{baseSnapshotId}|{maxWidth}|{marks}|{prune}";
         var scopeH = ParseHwnd(hwnd) ?? _s.ScopeHwnd ?? 0;
         if (RequestDeduplicator.IsSafeForReadDeduplication("computer_observe", mode, autoScreenshot: false, hasCropOrRegion: false))
         {
@@ -164,7 +165,9 @@ public sealed class InbriskTools
         var hint = ParseHwnd(hwnd);
         BuiltObservation built;
         using (PerfTrace.Stage("observe"))
-            built = await _s.ObserveAsync(hint, ObservationBudget.Default, policy, baseSnapshotId, ct,
+            built = await _s.ObserveAsync(hint,
+                ObservationBudget.Default with { PrunePassive = prune ?? Slim(detail) },
+                policy, baseSnapshotId, ct,
                 maxWidth, marks == true).ConfigureAwait(false);
         if (_s.Control.State == ComputerControlState.EmergencyStopped)
             return Text($"controlState: EmergencyStopped\nemergencyHotkey: {_s.Control.PanicHotkey}");
@@ -256,7 +259,9 @@ public sealed class InbriskTools
         else
         {
             var elCap = maxElements ?? (slim ? 60 : int.MaxValue);
-            sb.AppendLine($"elements ({Math.Min(o.Elements.Count, elCap)} of {o.Elements.Count} shown):");
+            sb.AppendLine($"elements ({Math.Min(o.Elements.Count, elCap)} of {o.Elements.Count} shown" +
+                (built.Prune is { PassiveDropped: > 0 } pp
+                    ? $", {pp.PassiveDropped} passive hidden" : "") + "):");
             foreach (var e in o.Elements.Take(elCap))
             {
                 var dis = e.State?.Contains("disabled", StringComparison.OrdinalIgnoreCase) == true ? " [DISABLED]" : "";
@@ -1899,6 +1904,7 @@ public sealed class InbriskTools
         [Description("alias of name — free-text query, e.g. \"Open Project\"")] string? query = null,
         [Description("object form — same filters nested ({process,name,role,hwnd,…}); merged with the flat args")] TargetSpec? target = null,
         [Description("batch list of search queries to execute in one turn (max 16)")] FindQuery[]? queries = null,
+        [Description("collapse passive UIA nodes (unnamed, non-actionable containers) in the printed list — default on for slim, off for full; skipped when a role filter is given")] bool? prune = null,
         CancellationToken ct = default)
     {
         if (BadDetail(detail) is { } bd) return bd;
@@ -2026,7 +2032,7 @@ public sealed class InbriskTools
             return bResult;
         }
 
-        var normArgs = $"{role}|{name}|{automationId}|{hwnd}|{process}|{enabled}|{nameNotContains}|{value}|{valueContains}|{className}|{within}|{limit}|{detail}|{query}";
+        var normArgs = $"{role}|{name}|{automationId}|{hwnd}|{process}|{enabled}|{nameNotContains}|{value}|{valueContains}|{className}|{within}|{limit}|{detail}|{query}|{prune}";
         if (_s.Deduplicator.TryDeduplicateRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedFind)
             return cachedFind;
 
@@ -2100,9 +2106,25 @@ public sealed class InbriskTools
             _s.Deduplicator.RecordRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, missResult);
             return missResult;
         }
+        // Passive pruning for unfiltered dumps — when the caller asked for a
+        // specific role, every match is intentional, so leave the list alone.
+        var effPrune = (prune ?? slim) && role == null;
+        var shown = effPrune
+            ? els.Where(e => !ObservationBuilder.IsPassiveNoise(e)).ToList()
+            : els;
+        if (effPrune && shown.Count < els.Count)
+            UiaPerf.Write(new
+            {
+                kind = "uia.find.prune", at = DateTimeOffset.Now,
+                traceId = PerfTrace.CurrentId,
+                matched = els.Count, shown = shown.Count,
+                dropped = els.Count - shown.Count, cap,
+            });
         sb.AppendLine($"found {els.Count} element(s)" +
-            (els.Count > cap ? $" — showing {cap}:" : ":"));
-        foreach (var e in els.Take(cap))
+            (shown.Count < els.Count
+                ? $" ({els.Count - shown.Count} passive hidden — prune:false to show)" : "") +
+            (shown.Count > cap ? $" — showing {cap}:" : ":"));
+        foreach (var e in shown.Take(cap))
             sb.AppendLine(slim
                 ? "  " + SlimEl(e, tags)
                 : $"  [{e.Id}] {e.Role} \"{e.Name}\" " +
@@ -2117,8 +2139,8 @@ public sealed class InbriskTools
                     $"actions=[{string.Join(",", e.Actions)}] " +
                     $"enabled={Prop(e, "enabled") ?? "?"}" +
                     (tags.TryGetValue(e.Id, out var tag) ? $" dialogRole={tag}" : ""));
-        if (els.Count > cap)
-            sb.AppendLine($"  …{els.Count - cap} more — refine target or pass limit");
+        if (shown.Count > cap)
+            sb.AppendLine($"  …{shown.Count - cap} more — refine target or pass limit");
         var finalResult = Text(sb.ToString());
         _s.Deduplicator.RecordRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, finalResult);
         return finalResult;
@@ -2723,29 +2745,93 @@ public sealed class InbriskTools
         "semantic target {window,process,role,name,automationId,labelledBy," +
         "nearText,within,ancestor}, or coordinates x+y (desktop or OCR coordinates; " +
         "frameId/observationId optional). button:left|right|double. " +
+        "For apps with no UIA elements (Blender, games, custom OpenGL) pass " +
+        "rx+ry — px offsets from the target window's top-left — or " +
+        "relativeTo:\"window\" to reinterpret x+y the same way; the anchor " +
+        "window comes from target.hwnd/window/process, else the foreground window. " +
         "When executing multiple clicks, typing, or hotkeys in sequence, PREFER computer_batch to collapse them into a single fast roundtrip.")]
-    public Task<CallToolResult> Click(
+    public async Task<CallToolResult> Click(
         [Description("elementId from observe/find")] string? elementId = null,
         [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?}")] TargetSpec? target = null,
         [Description("frameId the point was derived from")] long? frameId = null,
         [Description("observationId the point was derived from")] long? observationId = null,
-        [Description("image-space x")] int? x = null,
-        [Description("image-space y")] int? y = null,
+        [Description("image-space x (or window-relative when relativeTo:\"window\")")] int? x = null,
+        [Description("image-space y (or window-relative when relativeTo:\"window\")")] int? y = null,
         [Description("left|right|double")] string? button = null,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        [Description("window-relative x in px from the anchor window's top-left — for element-less windows; implies relativeTo:\"window\"")] int? rx = null,
+        [Description("window-relative y (see rx)")] int? ry = null,
+        [Description("coordinate space for x,y: \"screen\" (default, absolute desktop px) | \"window\" (x,y are offsets from the anchor window's top-left)")] string? relativeTo = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.IncSequentialSingleAction();
         Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
-        var el = ResolveTargetElement(elementId, target, out var err, out _, "invoke");
-        if (err != null) return Task.FromResult(err);
-        return Act(new AgentAction(button?.Equals("right", StringComparison.OrdinalIgnoreCase) == true
+
+        // Window-relative coordinate path — the fallback for windows that
+        // expose no UIA elements (Blender, games, custom OpenGL canvases).
+        // rx/ry (or x/y under relativeTo:"window") are resolved against the
+        // anchor window's live GetWindowRect and dispatched as a raw desktop
+        // point (FrameId=0 — no captured-frame identity check; the rect is
+        // sampled fresh at click time instead).
+        var windowRelative = rx != null || ry != null ||
+            string.Equals(relativeTo, "window", StringComparison.OrdinalIgnoreCase);
+        ImagePoint? point;
+        string? synthId = null;
+        long anchorHwnd = 0;
+        int relX = 0, relY = 0, absX = 0, absY = 0;
+        if (windowRelative)
+        {
+            var inX = rx ?? x ?? target?.X;
+            var inY = ry ?? y ?? target?.Y;
+            if (inX == null || inY == null)
+                return Error(OutcomeKind.Malformed,
+                    "window-relative click requires rx+ry (or x+y with relativeTo:\"window\")");
+            if (!TryResolveWindowAnchor(elementId, target, out var h, out var anchorErr))
+                return anchorErr!;
+            if (!GetWindowRect((IntPtr)h, out var rc) ||
+                rc.Right - rc.Left <= 0 || rc.Bottom - rc.Top <= 0)
+                return Error(OutcomeKind.WindowLost,
+                    $"anchor window 0x{h:X} has no usable rectangle (closed or minimized)");
+            anchorHwnd = h;
+            relX = inX.Value; relY = inY.Value;
+            absX = rc.Left + relX; absY = rc.Top + relY;
+            // synthetic element id in the same shape the element/result
+            // schema uses — lets callers correlate element-less clicks
+            synthId = $"win:0x{h:X}@({relX},{relY})";
+            point = new ImagePoint(absX, absY, FrameId: 0);
+        }
+        else
+        {
+            point = MakePoint(frameId, observationId, x ?? target?.X, y ?? target?.Y);
+        }
+
+        // A pure window locator (process/hwnd/title only) must not trigger a
+        // UIA element search — element-less windows return zero matches and
+        // would fail before the coordinate path runs. Element-identifying
+        // fields still resolve normally (element wins over the point).
+        UiElement? el;
+        if (windowRelative && elementId == null && target?.ElementId == null &&
+            target?.Role == null && target?.Name == null &&
+            target?.AutomationId == null)
+        {
+            el = null;
+        }
+        else
+        {
+            el = ResolveTargetElement(elementId, target, out var err, out _, "invoke");
+            if (err != null) return err;
+        }
+
+        var res = await Act(new AgentAction(button?.Equals("right", StringComparison.OrdinalIgnoreCase) == true
                 ? AgentActionKind.RightClick
                 : button?.Equals("double", StringComparison.OrdinalIgnoreCase) == true
                     ? AgentActionKind.DoubleClick
                     : AgentActionKind.Click,
-            ElementId: el?.Id, Point: MakePoint(frameId, observationId, x ?? target?.X, y ?? target?.Y)), ct, observe, operationId);
+            ElementId: el?.Id, Point: point), ct, observe, operationId);
+        return synthId != null
+            ? AnnotateWindowRelativeResult(res, synthId, anchorHwnd, relX, relY, absX, absY)
+            : res;
     }
 
     [McpServerTool(Name = "computer_invoke"), Description(
@@ -3030,17 +3116,26 @@ public sealed class InbriskTools
     [McpServerTool(Name = "computer_batch"), Description(
         "Execute a fast, declarative sequence of UI actions in a single turn without LLM roundtrips. " +
         "When 2+ deterministic actions are known and intermediate observation is not needed, ALWAYS prefer computer_batch. " +
-        "Supports sequential 'steps' (click, invoke, type, set_value, hotkey, wait, scroll, launch, etc.), " +
+        "Supports sequential 'steps' (click, invoke, type, set_value, hotkey, key, wait, launch, focus, toggle, select, scroll), " +
         "OR a compact 'set' list for multiple form fields (mutually exclusive with 'steps' to avoid ambiguous ordering). " +
-        "Supports optional 'until' wait condition and optional 'read' list to extract element values/states. " +
+        "Step fields accept aliases: action→do, target→t (string, or object {elementId,name,role,hwnd,window,process,automationId}), " +
+        "text/value→v, waitFor→ms (number; for do:launch also accepts readiness 'window|process|none'). " +
+        "Unknown step fields are REJECTED as Malformed — never silently dropped. " +
+        "failFast (default true) stops at the first failing step; failFast:false or a per-step continueOnError:true " +
+        "records the failure and keeps executing the rest. " +
+        "Optional 'until' waits (appears|disappears|windowAppears|stable; value/state refine appears) are event-driven — " +
+        "WinEvent/UIA events wake them early, a poll cadence remains as fallback; timeoutMs unchanged. " +
+        "Result is compact: {success, stepsExecuted, totalSteps, totalDurationMs, results:[{step,do,t,ok,ms,error?}]}. " +
         "Do NOT batch across an unpredicted reasoning boundary. " +
         "For conditions (ifExists/ifValue), iteration over matched items (scan/for_each), or reusable parameterized flows, prefer computer_run / computer_run_recipe.")]
     public async Task<CallToolResult> Batch(
         [Description("ordered list of simple action steps to execute sequentially (mutually exclusive with 'set')")] BatchStep[]? steps = null,
         [Description("compact list of form fields to set in one turn (target, value, role?); mutually exclusive with 'steps'")] FormFieldSpec[]? set = null,
-        [Description("optional condition to wait for after steps execute (appears/disappears/windowAppears)")] BatchUntilSpec? until = null,
+        [Description("optional condition to wait for after steps execute (appears/disappears/windowAppears/stable; value/state refine appears)")] BatchUntilSpec? until = null,
         [Description("optional list of element targets to read/extract properties from upon completion")] BatchReadSpec[]? read = null,
         [Description("output verbosity: slim|full — default slim")] string? detail = null,
+        [Description("stop the batch at the first failing step (default true); false records each failure in results[] and keeps executing")] bool? failFast = null,
+        [Description("snake_case alias of failFast")] bool? fail_fast = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
@@ -3051,26 +3146,254 @@ public sealed class InbriskTools
         if (set != null && set.Length > 32)
             return Error(OutcomeKind.Malformed, "set array exceeds maximum limit of 32");
 
+        var failFastE = failFast ?? fail_fast ?? true;
+
+        // Strict schema: batch specs capture unknown JSON fields into Extra —
+        // a misspelled field must fail loudly, never be silently dropped.
+        if (steps != null)
+        {
+            for (var i = 0; i < steps.Length; i++)
+            {
+                if (steps[i].Extra is { Count: > 0 } ex)
+                    return Error(OutcomeKind.Malformed,
+                        $"batch step[{i}] unknown field(s): {string.Join(", ", ex.Keys)} — " +
+                        "valid: do/action, t/target, v/text/value, role, hwnd, ms/waitFor, submit, keys, continueOnError");
+            }
+        }
+        if (set != null)
+        {
+            for (var i = 0; i < set.Length; i++)
+            {
+                if (set[i].Extra is { Count: > 0 } sx)
+                    return Error(OutcomeKind.Malformed,
+                        $"batch set[{i}] unknown field(s): {string.Join(", ", sx.Keys)} — valid: target, value, role");
+                if (string.IsNullOrWhiteSpace(set[i].Target))
+                    return Error(OutcomeKind.Malformed, $"batch set[{i}] requires 'target'");
+            }
+        }
+        if (until != null)
+        {
+            if (until.Extra is { Count: > 0 } ux)
+                return Error(OutcomeKind.Malformed,
+                    $"batch 'until' unknown field(s): {string.Join(", ", ux.Keys)} — " +
+                    "valid: appears, disappears, windowAppears, stable, value, state, timeoutMs, stableMs");
+            if (string.IsNullOrWhiteSpace(until.Appears) &&
+                string.IsNullOrWhiteSpace(until.Disappears) &&
+                string.IsNullOrWhiteSpace(until.WindowAppears) &&
+                until.Stable != true)
+                return Error(OutcomeKind.Malformed,
+                    "until requires a condition: appears|disappears|windowAppears|stable — " +
+                    "value/state refine 'appears' and are not standalone conditions");
+        }
+        if (read != null)
+        {
+            for (var i = 0; i < read.Length; i++)
+            {
+                if (read[i].Extra is { Count: > 0 } rx)
+                    return Error(OutcomeKind.Malformed,
+                        $"batch read[{i}] unknown field(s): {string.Join(", ", rx.Keys)} — valid: target, props, role");
+                if (string.IsNullOrWhiteSpace(read[i].Target))
+                    return Error(OutcomeKind.Malformed, $"batch read[{i}] requires 'target'");
+            }
+        }
+
+        if (BadDetail(detail) is { } bd) return bd;
+
         var stepCount = (steps?.Length ?? 0) + (set?.Length ?? 0);
+        if (stepCount == 0 && (read == null || read.Length == 0))
+            return Error(OutcomeKind.Malformed, "either steps, set, or read array is required");
+
+        // Translate the batch surface into canonical plan steps. meta[i] maps
+        // plan-step index → the caller-facing do/t for the compact result.
+        var runSteps = new List<RunStep>();
+        var meta = new List<(string Do, string? T)>();
+        void AddStep(RunStep rs, string doName, string? t, bool tolerated)
+        {
+            runSteps.Add(tolerated ? rs with { ContinueOnError = true } : rs);
+            meta.Add((doName, t));
+        }
+
+        if (steps != null)
+        {
+            for (var i = 0; i < steps.Length; i++)
+            {
+                var s = steps[i];
+                var act = (s.Do ?? s.Action ?? "click").Trim().ToLowerInvariant();
+                var tolerated = s.ContinueOnError || !failFastE;
+
+                // friendly aliases: target→t (string or object), text/value→v, waitFor→ms
+                string? tStr = s.T;
+                string? roleStr = s.Role;
+                string? hwndStr = s.Hwnd;
+                TargetSpec? aliasTarget = null;
+                if (s.Target is { } te)
+                {
+                    if (te.ValueKind == JsonValueKind.String)
+                    {
+                        tStr ??= te.GetString();
+                    }
+                    else if (te.ValueKind == JsonValueKind.Object)
+                    {
+                        try { aliasTarget = te.Deserialize<TargetSpec>(J); }
+                        catch
+                        {
+                            return Error(OutcomeKind.Malformed,
+                                $"batch step[{i}] 'target' is not a string or a valid target object");
+                        }
+                        if (aliasTarget != null)
+                        {
+                            tStr ??= aliasTarget.ElementId ?? aliasTarget.Name;
+                            roleStr ??= aliasTarget.Role;
+                            hwndStr ??= aliasTarget.Hwnd ?? aliasTarget.Window;
+                        }
+                    }
+                    else
+                    {
+                        return Error(OutcomeKind.Malformed,
+                            $"batch step[{i}] 'target' must be a string or an object");
+                    }
+                }
+                var val = s.V ?? BatchAliasStr(s.Text) ?? BatchAliasStr(s.Value);
+                var msV = s.Ms;
+                string? launchReadiness = null;
+                if (s.WaitFor is { } we)
+                {
+                    if (we.ValueKind == JsonValueKind.Number && we.TryGetInt32(out var wn))
+                    {
+                        msV ??= wn;
+                    }
+                    else if (we.ValueKind == JsonValueKind.String)
+                    {
+                        var ws = we.GetString();
+                        if (int.TryParse(ws, out var wm)) msV ??= wm;
+                        else launchReadiness = ws;
+                    }
+                    else
+                    {
+                        return Error(OutcomeKind.Malformed,
+                            $"batch step[{i}] 'waitFor' must be a ms number (wait/scroll) " +
+                            "or a launch readiness (window|process|none)");
+                    }
+                }
+
+                var isElId = tStr?.StartsWith("uia_", StringComparison.OrdinalIgnoreCase) == true;
+                var elId = isElId ? tStr : aliasTarget?.ElementId;
+                TargetSpec? target =
+                    !string.IsNullOrWhiteSpace(tStr) || !string.IsNullOrWhiteSpace(roleStr) ||
+                    !string.IsNullOrWhiteSpace(hwndStr) || aliasTarget != null
+                        ? (aliasTarget ?? new TargetSpec()) with
+                        {
+                            Name = isElId ? null : tStr ?? aliasTarget?.Name,
+                            ElementId = isElId ? tStr : aliasTarget?.ElementId,
+                            Role = roleStr ?? aliasTarget?.Role,
+                            Window = hwndStr ?? aliasTarget?.Window,
+                        }
+                        : null;
+
+                switch (act)
+                {
+                    case "click":
+                        AddStep(new RunStep { Action = "click", Target = target, ElementId = elId }, act, tStr, tolerated);
+                        break;
+                    case "invoke":
+                        AddStep(new RunStep { Action = "invoke", Target = target, ElementId = elId }, act, tStr, tolerated);
+                        break;
+                    case "type":
+                        AddStep(new RunStep { Action = "type", Target = target, ElementId = elId, Text = val, Submit = s.Submit }, act, tStr, tolerated);
+                        break;
+                    case "set_value" or "setvalue":
+                        AddStep(new RunStep { Action = "set_value", Target = target, ElementId = elId, Value = val }, act, tStr, tolerated);
+                        break;
+                    case "hotkey":
+                        AddStep(new RunStep { Action = "hotkey", Keys = s.Keys ?? val }, act, s.Keys ?? val, tolerated);
+                        break;
+                    case "key":
+                        AddStep(new RunStep { Action = "key", Key = s.Keys ?? val }, act, s.Keys ?? val, tolerated);
+                        break;
+                    case "wait":
+                        AddStep(new RunStep { Action = "wait", Ms = msV ?? (int.TryParse(val, out var m) ? m : 500) }, act, tStr, tolerated);
+                        break;
+                    case "launch":
+                        AddStep(new RunStep { Action = "launch", App = tStr ?? val, WaitFor = launchReadiness ?? "window" }, act, tStr ?? val, tolerated);
+                        break;
+                    case "focus":
+                    {
+                        // focus names a WINDOW or an ELEMENT: an hwnd-like t
+                        // routes to hwnd, an element name stays a target (its
+                        // owning window follows the element). A pure hwnd spec
+                        // needs no element target at all.
+                        var tIsHwnd = ParseHwnd(tStr) != null;
+                        var fTarget = (tStr != null && !tIsHwnd) || roleStr != null || aliasTarget != null
+                            ? target : null;
+                        AddStep(new RunStep
+                        {
+                            Action = "focus",
+                            Hwnd = s.Hwnd ?? (tIsHwnd ? tStr : null),
+                            Target = fTarget,
+                            ElementId = elId
+                        }, act, tStr ?? s.Hwnd, tolerated);
+                        break;
+                    }
+                    case "toggle":
+                        AddStep(new RunStep { Action = "toggle", Target = target, ElementId = elId }, act, tStr, tolerated);
+                        break;
+                    case "select":
+                        AddStep(new RunStep { Action = "select", Target = target, ElementId = elId }, act, tStr, tolerated);
+                        break;
+                    case "scroll":
+                        AddStep(new RunStep { Action = "scroll", Delta = msV ?? (int.TryParse(val, out var d) ? d : -120) }, act, tStr, tolerated);
+                        break;
+                    default:
+                        AddStep(new RunStep { Action = act, Target = target, ElementId = elId, Text = val, Keys = s.Keys }, act, tStr, tolerated);
+                        break;
+                }
+            }
+        }
+
+        if (set != null)
+        {
+            for (var i = 0; i < set.Length; i++)
+            {
+                var f = set[i];
+                var isElId = f.Target.StartsWith("uia_", StringComparison.OrdinalIgnoreCase);
+                AddStep(new RunStep
+                {
+                    Action = "set_value",
+                    ElementId = isElId ? f.Target : null,
+                    Target = new TargetSpec
+                    {
+                        Name = isElId ? null : f.Target,
+                        ElementId = isElId ? f.Target : null,
+                        Role = f.Role ?? "Edit"
+                    },
+                    Value = f.Value
+                }, "set_value", f.Target, !failFastE);
+            }
+        }
+
+        // until → a trailing wait step inside the same run. The runtime wait
+        // service is event-driven: scoped WinEvent/UIA events wake it early
+        // (~200ms poll slices remain the fallback cadence). disappears goes
+        // to wait_for_gone and stable to wait_for_stable — the previous
+        // expectedState:"disappeared"/"stable" encodings could never match a
+        // live element's props and always timed out.
+        if (until != null && stepCount > 0)
+        {
+            var timeout = until.TimeoutMs ?? 5000;
+            var uTolerated = !failFastE;
+            if (!string.IsNullOrWhiteSpace(until.Appears))
+                AddStep(new RunStep { Action = "wait_for", Query = until.Appears, ExpectedValue = until.Value, ExpectedState = until.State, Ms = timeout }, "until.appears", until.Appears, uTolerated);
+            else if (!string.IsNullOrWhiteSpace(until.Disappears))
+                AddStep(new RunStep { Action = "wait_for_gone", Query = until.Disappears, Ms = timeout }, "until.disappears", until.Disappears, uTolerated);
+            else if (!string.IsNullOrWhiteSpace(until.WindowAppears))
+                AddStep(new RunStep { Action = "wait_for", Query = until.WindowAppears, Ms = timeout }, "until.windowAppears", until.WindowAppears, uTolerated);
+            else
+                AddStep(new RunStep { Action = "wait_for_stable", Ms = timeout }, "until.stable", null, uTolerated);
+        }
+
         var normArgs = JsonSerializer.Serialize(new
         {
-            steps = steps?.Select(s => new
-            {
-                @do = s.Do,
-                target = s.T,
-                value = s.V,
-                role = s.Role,
-                hwnd = s.Hwnd,
-                ms = s.Ms,
-                submit = s.Submit,
-                keys = s.Keys
-            }),
-            set = set?.Select(f => new
-            {
-                target = f.Target,
-                value = f.Value,
-                role = f.Role
-            }),
+            steps = runSteps,
             until = until == null ? null : new
             {
                 appears = until.Appears,
@@ -3088,161 +3411,41 @@ public sealed class InbriskTools
                 role = r.Role,
                 props = r.Props
             }),
-            detail
-        });
+            detail,
+            failFast = failFastE
+        }, J);
         if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_batch", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
             return deduped;
         if (conflictError != null)
             return conflictError;
 
-        if (BadDetail(detail) is { } bd) return bd;
-        if (stepCount == 0 && (read == null || read.Length == 0))
-            return Error(OutcomeKind.Malformed, "either steps, set, or read array is required");
-
         var sw = Stopwatch.StartNew();
         CallToolResult res;
 
-        if (stepCount == 0)
+        if (runSteps.Count == 0)
         {
-            res = Text(JsonSerializer.Serialize(new { status = "Ok", detail = "read-only batch completed" }, J));
+            res = Text(JsonSerializer.Serialize(new
+            {
+                success = true, status = "Ok", stepsExecuted = 0, totalSteps = 0,
+                totalDurationMs = 0, results = Array.Empty<object>(),
+                detail = "read-only batch completed"
+            }, J));
         }
         else
         {
-            var runSteps = new List<RunStep>();
-
-            if (steps != null)
-            {
-                for (var i = 0; i < steps.Length; i++)
-                {
-                    var s = steps[i];
-                    var act = (s.Do ?? "click").Trim().ToLowerInvariant();
-                    var isElId = s.T?.StartsWith("uia_") == true;
-                    TargetSpec? target = !string.IsNullOrWhiteSpace(s.T) || !string.IsNullOrWhiteSpace(s.Role) || !string.IsNullOrWhiteSpace(s.Hwnd)
-                        ? new TargetSpec
-                        {
-                            Name = isElId ? null : s.T,
-                            ElementId = isElId ? s.T : null,
-                            Role = s.Role,
-                            Window = s.Hwnd
-                        }
-                        : null;
-                    var elId = isElId ? s.T : null;
-
-                    switch (act)
-                    {
-                        case "click":
-                            runSteps.Add(new RunStep { Action = "click", Target = target, ElementId = elId });
-                            break;
-                        case "invoke":
-                            runSteps.Add(new RunStep { Action = "invoke", Target = target, ElementId = elId });
-                            break;
-                        case "type":
-                            runSteps.Add(new RunStep { Action = "type", Target = target, ElementId = elId, Text = s.V, Submit = s.Submit });
-                            break;
-                        case "set_value":
-                            runSteps.Add(new RunStep { Action = "set_value", Target = target, ElementId = elId, Value = s.V });
-                            break;
-                        case "hotkey":
-                            runSteps.Add(new RunStep { Action = "hotkey", Keys = s.Keys ?? s.V });
-                            break;
-                        case "key":
-                            runSteps.Add(new RunStep { Action = "key", Key = s.Keys ?? s.V });
-                            break;
-                        case "wait":
-                            runSteps.Add(new RunStep { Action = "wait", Ms = s.Ms ?? (int.TryParse(s.V, out var m) ? m : 500) });
-                            break;
-                        case "launch":
-                            runSteps.Add(new RunStep { Action = "launch", App = s.T ?? s.V, WaitFor = "window" });
-                            break;
-                        case "focus":
-                            runSteps.Add(new RunStep { Action = "focus", Hwnd = s.Hwnd ?? s.T, ElementId = elId });
-                            break;
-                        case "toggle":
-                            runSteps.Add(new RunStep { Action = "toggle", Target = target, ElementId = elId });
-                            break;
-                        case "select":
-                            runSteps.Add(new RunStep { Action = "select", Target = target, ElementId = elId });
-                            break;
-                        case "scroll":
-                            runSteps.Add(new RunStep { Action = "scroll", Delta = s.Ms ?? (int.TryParse(s.V, out var d) ? d : -120) });
-                            break;
-                        default:
-                            runSteps.Add(new RunStep { Action = act, Target = target, ElementId = elId, Text = s.V, Keys = s.Keys });
-                            break;
-                    }
-                }
-            }
-
-            if (set != null)
-            {
-                for (var i = 0; i < set.Length; i++)
-                {
-                    var f = set[i];
-                    var isElId = f.Target.StartsWith("uia_");
-                    runSteps.Add(new RunStep
-                    {
-                        Action = "set_value",
-                        ElementId = isElId ? f.Target : null,
-                        Target = new TargetSpec
-                        {
-                            Name = isElId ? null : f.Target,
-                            ElementId = isElId ? f.Target : null,
-                            Role = f.Role ?? "Edit"
-                        },
-                        Value = f.Value
-                    });
-                }
-            }
-
-            if (until != null)
-            {
-                var timeout = until.TimeoutMs ?? 5000;
-                if (!string.IsNullOrWhiteSpace(until.Appears))
-                {
-                    runSteps.Add(new RunStep
-                    {
-                        Action = "wait_for",
-                        Query = until.Appears,
-                        ExpectedValue = until.Value,
-                        ExpectedState = until.State,
-                        Ms = timeout
-                    });
-                }
-                else if (!string.IsNullOrWhiteSpace(until.Disappears))
-                {
-                    runSteps.Add(new RunStep { Action = "wait_for", Query = until.Disappears, ExpectedState = "disappeared", Ms = timeout });
-                }
-                else if (!string.IsNullOrWhiteSpace(until.WindowAppears))
-                {
-                    runSteps.Add(new RunStep { Action = "wait_for", Query = until.WindowAppears, Ms = timeout });
-                }
-                else if (until.Stable is true)
-                {
-                    runSteps.Add(new RunStep { Action = "wait_for", ExpectedState = "stable", Ms = timeout });
-                }
-            }
+            // wait-telemetry baseline — the until step's wake source is the
+            // delta of the shared WaitService counters across this run
+            var wt = until != null ? _s.Rt.Parts.Waits.Telemetry : null;
+            var ev0 = wt?.EventWakeCount ?? 0;
+            var poll0 = wt?.FallbackPollCount ?? 0;
 
             try
             {
-                res = await RunPlanCore(runSteps.ToArray(), null, sw, ct, detail: detail ?? "slim");
-                if (until != null && res.Content is [TextContentBlock { Text: { } rawJson }])
-                {
-                    try
-                    {
-                        var doc = JsonSerializer.Deserialize<Dictionary<string, object?>>(rawJson, J);
-                        if (doc != null && !doc.ContainsKey("timeline"))
-                        {
-                            doc["timeline"] = new Dictionary<string, object?>
-                            {
-                                ["t_start"] = 0.0,
-                                ["t_firstChange"] = Math.Round(sw.Elapsed.TotalMilliseconds * 0.5, 2),
-                                ["t_stable"] = Math.Round(sw.Elapsed.TotalMilliseconds, 2)
-                            };
-                            res = Text(JsonSerializer.Serialize(doc, J));
-                        }
-                    }
-                    catch { }
-                }
+                var raw = await RunPlanCore(runSteps.ToArray(), null, sw, ct, detail: detail ?? "slim");
+                (long EventWakes, long PollWakes)? waitDelta = wt != null
+                    ? (wt.EventWakeCount - ev0, wt.FallbackPollCount - poll0)
+                    : null;
+                res = CompactBatchResult(raw, meta, failFastE, until, waitDelta, sw);
             }
             catch (OperationCanceledException)
             {
@@ -3304,7 +3507,12 @@ public sealed class InbriskTools
                     {
                         doc["read"] = readResults;
                         doc["provenance"] = Provenance("uia");
-                        res = Text(JsonSerializer.Serialize(doc, J));
+                        res = new CallToolResult
+                        {
+                            IsError = res.IsError,
+                            Content = [new TextContentBlock
+                                { Text = JsonSerializer.Serialize(doc, J) }],
+                        };
                     }
                 }
                 catch { }
@@ -3313,6 +3521,207 @@ public sealed class InbriskTools
 
         _s.Deduplicator.RecordMutation(operationId, "computer_batch", normArgs, res);
         return res;
+    }
+
+    /// <summary>JsonElement → string for batch field aliases (target/text/
+    /// value/waitFor) — strings pass through, numbers/bools stringify, anything
+    /// else (null/object/array) is ignored.</summary>
+    private static string? BatchAliasStr(JsonElement? e) => e switch
+    {
+        { ValueKind: JsonValueKind.String } s => s.GetString(),
+        { ValueKind: JsonValueKind.Number or JsonValueKind.True or JsonValueKind.False } v
+            => v.ToString(),
+        _ => null,
+    };
+
+    /// <summary>Wrap the plan report into the compact batch contract:
+    /// {success, stepsExecuted, totalSteps, totalDurationMs,
+    /// results:[{step,do,t,ok,ms,error?}]} — plus runId/resume affordance on
+    /// failure and an until{} block carrying the wait's wake source
+    /// (event vs poll vs timeout vs immediate). Emits batch.summary and
+    /// batch.until UiaPerf records.</summary>
+    private CallToolResult CompactBatchResult(CallToolResult raw,
+        IReadOnlyList<(string Do, string? T)> meta, bool failFast,
+        BatchUntilSpec? until,
+        (long EventWakes, long PollWakes)? waitDelta, Stopwatch sw)
+    {
+        var results = new List<Dictionary<string, object?>>();
+        var status = "Failed";
+        string? runId = null, pauseStatus = null, pauseError = null;
+        int? failedStep = null;
+        try
+        {
+            var text = raw.Content?.OfType<TextContentBlock>().FirstOrDefault()?.Text;
+            if (!string.IsNullOrEmpty(text))
+            {
+                using var doc = JsonDocument.Parse(text);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("status", out var st))
+                    status = st.GetString() ?? status;
+                if (root.TryGetProperty("runId", out var rid))
+                    runId = rid.GetString();
+                if (root.TryGetProperty("steps", out var arr) &&
+                    arr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var e in arr.EnumerateArray())
+                    {
+                        var idx = e.TryGetProperty("step", out var si) &&
+                            si.ValueKind == JsonValueKind.Number
+                                ? si.GetInt32() : results.Count;
+                        var stt = e.TryGetProperty("status", out var ss)
+                            ? ss.GetString() ?? "" : "";
+                        var ok = stt.Equals("Ok", StringComparison.OrdinalIgnoreCase)
+                            || stt.Equals("Verified", StringComparison.OrdinalIgnoreCase)
+                            || stt.Equals("Unverified", StringComparison.OrdinalIgnoreCase)
+                            || stt.Equals("ObservedChange", StringComparison.OrdinalIgnoreCase)
+                            || stt.Equals("Skipped", StringComparison.OrdinalIgnoreCase);
+                        var entry = new Dictionary<string, object?>
+                        {
+                            ["step"] = idx,
+                            ["do"] = idx >= 0 && idx < meta.Count
+                                ? meta[idx].Do
+                                : (e.TryGetProperty("action", out var ac) ? ac.GetString() : null),
+                            ["t"] = idx >= 0 && idx < meta.Count ? meta[idx].T : null,
+                            ["ok"] = ok,
+                        };
+                        if (e.TryGetProperty("ms", out var msEl) &&
+                            msEl.ValueKind == JsonValueKind.Number)
+                            entry["ms"] = msEl.GetInt64();
+                        if (!ok)
+                        {
+                            var det = e.TryGetProperty("detail", out var dEl)
+                                ? dEl.GetString() : null;
+                            entry["error"] = string.IsNullOrEmpty(det)
+                                ? stt : $"{stt}: {det}";
+                            failedStep ??= idx;
+                        }
+                        results.Add(entry);
+                    }
+                }
+                if (root.TryGetProperty("pause", out var pz))
+                {
+                    pauseStatus = pz.TryGetProperty("status", out var ps)
+                        ? ps.GetString() : null;
+                    pauseError = pz.TryGetProperty("error", out var pe)
+                        ? pe.GetString() : null;
+                    if (pz.TryGetProperty("step", out var pst) &&
+                        pst.ValueKind == JsonValueKind.Number)
+                        failedStep ??= pst.GetInt32();
+                }
+                // Error() payloads carry {error, detail} instead of status
+                if (root.TryGetProperty("error", out var eTop))
+                {
+                    status = eTop.GetString() ?? status;
+                    pauseError ??= root.TryGetProperty("detail", out var d2)
+                        ? d2.GetString() : null;
+                }
+            }
+        }
+        catch { /* emit whatever parsed — compact must never throw */ }
+
+        var allOk = results.All(r => r["ok"] is true);
+        var success = allOk && status == "Completed";
+        var finalStatus = success ? "Completed"
+            : status == "Completed" ? "Partial"   // completed w/ tolerated failures
+            : pauseStatus ?? (status is "Paused" ? "Failed" : status);
+
+        var outDoc = new Dictionary<string, object?>
+        {
+            ["success"] = success,
+            ["status"] = finalStatus,
+            ["stepsExecuted"] = results.Count,
+            ["totalSteps"] = meta.Count,
+            ["totalDurationMs"] = sw.ElapsedMilliseconds,
+            ["results"] = results,
+            ["provenance"] = Provenance("uia"),
+        };
+        if (runId != null) outDoc["runId"] = runId;
+        if (!failFast) outDoc["failFast"] = false;
+        if (!success)
+        {
+            if (failedStep != null) outDoc["failedStep"] = failedStep;
+            var firstErr = results.FirstOrDefault(r => r["ok"] is false);
+            outDoc["error"] = pauseError
+                ?? (firstErr?.TryGetValue("error", out var ev) == true ? ev : null)
+                ?? finalStatus;
+            if (runId != null)
+                outDoc["resume"] = $"computer_resume_run({{runId:\"{runId}\"}})";
+        }
+
+        if (until != null)
+        {
+            var uIdx = results.FindIndex(r =>
+                (r["do"] as string)?.StartsWith("until.", StringComparison.Ordinal) == true);
+            // uIdx < 0 → an earlier fail-fast stop kept the until step from
+            // ever running — report "skipped", not a fake "timeout"
+            var uOk = uIdx >= 0 && results[uIdx]["ok"] is true;
+            var cond = !string.IsNullOrWhiteSpace(until.Appears) ? "appears"
+                : !string.IsNullOrWhiteSpace(until.Disappears) ? "disappears"
+                : !string.IsNullOrWhiteSpace(until.WindowAppears) ? "windowAppears"
+                : "stable";
+            // wake source: any event wake → "event"; satisfied before the
+            // first wait slice → "immediate"; else the poll fallback cadence
+            // carried the wait → "poll"; failure/timeout → "timeout"
+            var (evW, pollW) = waitDelta ?? (0L, 0L);
+            var wake = uIdx < 0 ? "skipped"
+                : !uOk ? "timeout"
+                : evW > 0 ? "event"
+                : pollW == 0 ? "immediate"
+                : "poll";
+            var uBlock = new Dictionary<string, object?>
+            {
+                ["condition"] = cond,
+                ["query"] = until.Appears ?? until.Disappears ?? until.WindowAppears,
+                ["ok"] = uOk,
+                ["wakeSource"] = wake,
+            };
+            if (waitDelta != null)
+            {
+                uBlock["eventWakes"] = evW;
+                uBlock["pollWakes"] = pollW;
+            }
+            if (uIdx >= 0 && results[uIdx].TryGetValue("ms", out var ums))
+                uBlock["ms"] = ums;
+            outDoc["until"] = uBlock;
+
+            UiaPerf.Write(new
+            {
+                kind = "batch.until",
+                runId,
+                condition = cond,
+                ok = uOk,
+                wakeSource = wake,
+                eventWakes = waitDelta != null ? evW : (long?)null,
+                pollWakes = waitDelta != null ? pollW : (long?)null,
+                ms = uIdx >= 0 && results[uIdx].TryGetValue("ms", out var um2)
+                    ? um2 : null,
+            });
+        }
+
+        UiaPerf.Write(new
+        {
+            kind = "batch.summary",
+            runId,
+            status = finalStatus,
+            success,
+            failFast,
+            stepsExecuted = results.Count,
+            totalSteps = meta.Count,
+            failedStep,
+            totalMs = sw.ElapsedMilliseconds,
+            stepMs = results.Select(r =>
+                r.TryGetValue("ms", out var m) ? m : null).ToArray(),
+            untilWakeSource = until != null &&
+                outDoc["until"] is Dictionary<string, object?> ub
+                    ? ub["wakeSource"] : null,
+        });
+
+        return new CallToolResult
+        {
+            IsError = !success,
+            Content = [new TextContentBlock
+                { Text = JsonSerializer.Serialize(outDoc, J) }],
+        };
     }
 
     [McpServerTool(Name = "computer_save_recipe"), Description(
@@ -3572,7 +3981,7 @@ public sealed class InbriskTools
         "specialist app APIs, CLI tools). Bypasses coordinate clicking and executes semantic commands in <5ms.")]
     public async Task<CallToolResult> AdapterExecute(
         [Description("action to execute, e.g. navigate, click, type, evaluate, get_content, list_tabs, new_tab, close_tab, play, pause, next, volume_up, read_state")] string action,
-        [Description("optional preferred adapter ID: chrome_devtools | media | testapp")] string? adapter = null,
+        [Description("optional preferred adapter ID: chrome_devtools | media | testapp | blender (bpy socket bridge — run action:bootstrap once to install the in-Blender bridge script)")] string? adapter = null,
         [Description("optional target application specification")] TargetSpec? target = null,
         [Description("optional arguments payload for the adapter")] Dictionary<string, object?>? args = null,
         CancellationToken ct = default)
@@ -4349,6 +4758,12 @@ public sealed class InbriskTools
             if (ValidateStep(s) is { } verr)
             {
                 report.Add(StepEntry(i, s, "Malformed", detail: verr));
+                // tolerated malformed step (batch continueOnError / failFast:false)
+                if (s.ContinueOnError == true)
+                {
+                    report[^1]["continuedOnError"] = true;
+                    continue;
+                }
                 return RunReport(state, "Paused", sw, report,
                     internalActions, executed, skipped,
                     pauseStep: i, pauseStatus: "Malformed", pauseError: verr);
@@ -4410,6 +4825,11 @@ public sealed class InbriskTools
                 if (!scanRes.Outcome.Success)
                 {
                     report.Add(StepEntry(i, s, scanRes.Outcome.Kind.ToString(), detail: scanRes.Outcome.Detail, ms: (int)scanRes.DurationMs));
+                    if (s.ContinueOnError == true)
+                    {
+                        report[^1]["continuedOnError"] = true;
+                        continue;
+                    }
                     return RunReport(state, "Paused", sw, report,
                         internalActions, executed, skipped,
                         pauseStep: i, pauseStatus: scanRes.Outcome.Kind.ToString(),
@@ -4456,6 +4876,11 @@ public sealed class InbriskTools
                     if (!adapterRes.Success)
                     {
                         report.Add(StepEntry(i, s, "Failed", detail: adapterRes.Detail ?? "adapter action failed", ms: (int)adapterStepSw.ElapsedMilliseconds));
+                        if (s.ContinueOnError == true)
+                        {
+                            report[^1]["continuedOnError"] = true;
+                            continue;
+                        }
                         return RunReport(state, "Paused", sw, report,
                             internalActions, executed, skipped,
                             pauseStep: i, pauseStatus: "Failed",
@@ -4713,7 +5138,6 @@ public sealed class InbriskTools
                 state.PrePauseForegroundHwnd = fg?.Hwnd;
                 state.PrePauseForegroundTitle = fg?.Title;
                 var nextStepDesc = DescribeStep(steps[i]);
-                _s.Rt.PostHumanTakeover($"Adım durdu: {outcome?.Kind.ToString() ?? errKind ?? "Hata"}", nextStepDesc);
 
                 // a step cancelled by panic must not read as a resumable
                 // pause — the control state is EmergencyStopped
@@ -4722,6 +5146,18 @@ public sealed class InbriskTools
                         internalActions, executed, skipped,
                         pauseStep: i, pauseStatus: "EmergencyStopped",
                         pauseError: StoppedDetail);
+
+                // tolerated failure (batch failFast:false or per-step
+                // continueOnError) — the report entry already records the
+                // failing status; keep executing instead of pausing and
+                // signalling human takeover
+                if (s.ContinueOnError == true)
+                {
+                    report[^1]["continuedOnError"] = true;
+                    continue;
+                }
+
+                _s.Rt.PostHumanTakeover($"Adım durdu: {outcome?.Kind.ToString() ?? errKind ?? "Hata"}", nextStepDesc);
                 return RunReport(state, "Paused", sw, report,
                     internalActions, executed, skipped,
                     pauseStep: i, pauseStatus: outcome?.Kind.ToString() ?? errKind ?? "Failed",
@@ -7147,6 +7583,7 @@ public sealed class InbriskTools
         string? Role = null,         // button/edit/document/...
         string? Name = null,         // case-insensitive substring
         string? AutomationId = null,
+        [Description("permanent UI-map key \"app.element\" (e.g. \"notepad.document\", \"calculator.equals\") — seeds role/name/automationId/className/process from resources/uimap.json; explicit fields override map defaults")] string? Map = null,
         // -------- property selectors (all case-insensitive, AND'd) --------
         string? NameContains = null,     // alias of name — substring
         string? NameNotContains = null,  // reject when name contains this
@@ -7165,6 +7602,7 @@ public sealed class InbriskTools
         public string Summary()
         {
             var parts = new List<string>();
+            if (Map != null) parts.Add($"map: {Map}");
             if (Role != null) parts.Add($"role: {Role}");
             if (Name != null) parts.Add($"name: \"{Name}\"");
             if (NameContains != null) parts.Add($"nameContains: \"{NameContains}\"");
@@ -7250,7 +7688,8 @@ public sealed class InbriskTools
         [Description("auto-navigate across known screens if target is detected on another screen via screen memory (default false)")] bool? AutoNavigate = null,
         [Description("piggyback scoped observation after this step executes (zero-turn feedback)")] bool? Observe = null,
         [Description("specialist application adapter (e.g. \"media\", \"testapp\")")] string? Adapter = null,
-        [Description("adapter command or arguments dictionary")] Dictionary<string, object?>? Args = null)
+        [Description("adapter command or arguments dictionary")] Dictionary<string, object?>? Args = null,
+        [Description("record this step's failure and keep executing the rest of the plan instead of pausing (batch continueOnError / failFast:false); EmergencyStopped/Cancelled still stop the run")] bool? ContinueOnError = null)
     {
         /// <summary>Unknown JSON fields land here instead of being dropped —
         /// ValidateStep rejects them so a misspelled field can't fake success.</summary>
@@ -7275,19 +7714,36 @@ public sealed class InbriskTools
     /// <summary>Lightweight action step for computer_batch.</summary>
     public sealed record BatchStep(
         [Description("action: click|invoke|type|key|hotkey|wait|launch|focus|toggle|select|set_value|scroll")] string? Do = null,
-        [Description("target element name, automationId, or selector")] string? T = null,
+        [Description("alias for do")] string? Action = null,
+        [Description("target element name, automationId, elementId (uia_*), or selector")] string? T = null,
+        [Description("alias for t — string name/id, or a semantic object {elementId,name,role,hwnd,window,process,automationId}")] JsonElement? Target = null,
         [Description("value or text to input / hotkey string")] string? V = null,
+        [Description("alias for v (text to type / value to set)")] JsonElement? Text = null,
+        [Description("alias for v")] JsonElement? Value = null,
         [Description("target role (e.g. Button, Edit, MenuItem, CheckBox)")] string? Role = null,
-        [Description("target window HWND (optional)")] string? Hwnd = null,
-        [Description("wait duration in ms")] int? Ms = null,
+        [Description("target window HWND or title (optional)")] string? Hwnd = null,
+        [Description("wait duration in ms (do:wait) / scroll delta (do:scroll)")] int? Ms = null,
+        [Description("alias for ms — number or numeric string; for do:launch also accepts readiness window|process|none")] JsonElement? WaitFor = null,
         [Description("type: press enter afterwards")] bool Submit = false,
-        [Description("hotkey shorthand (e.g. 'ctrl+s')")] string? Keys = null);
+        [Description("hotkey shorthand (e.g. 'ctrl+s')")] string? Keys = null,
+        [Description("record this step's failure and keep executing the rest of the batch (default false)")] bool ContinueOnError = false)
+    {
+        /// <summary>Unknown JSON fields land here instead of being dropped —
+        /// Batch rejects them so a typo never silently degrades a step.</summary>
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, JsonElement>? Extra { get; set; }
+    }
 
     /// <summary>Compact form field specification for computer_batch.</summary>
     public sealed record FormFieldSpec(
         [Description("target element selector, ID, or name")] string Target,
         [Description("value or text to input")] string Value,
-        [Description("target role (e.g. Edit, ComboBox); default Edit")] string? Role = "Edit");
+        [Description("target role (e.g. Edit, ComboBox); default Edit")] string? Role = "Edit")
+    {
+        /// <summary>Unknown JSON fields land here instead of being dropped.</summary>
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, JsonElement>? Extra { get; set; }
+    }
 
     /// <summary>Wait condition specification for computer_batch.</summary>
     public sealed record BatchUntilSpec(
@@ -7295,16 +7751,26 @@ public sealed class InbriskTools
         [Description("wait until element with this name/text disappears")] string? Disappears = null,
         [Description("wait until window with this title appears")] string? WindowAppears = null,
         [Description("wait until screen or element is stable")] bool? Stable = null,
-        [Description("wait until target element matches this expected value")] string? Value = null,
-        [Description("wait until target element matches this expected state")] string? State = null,
+        [Description("refine appears: target element must match this expected value")] string? Value = null,
+        [Description("refine appears: target element must match this expected state")] string? State = null,
         [Description("timeout in milliseconds (default 5000)")] int? TimeoutMs = null,
-        [Description("stability duration in milliseconds (default 200)")] int? StableMs = null);
+        [Description("stability duration in milliseconds (default 200)")] int? StableMs = null)
+    {
+        /// <summary>Unknown JSON fields land here instead of being dropped.</summary>
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, JsonElement>? Extra { get; set; }
+    }
 
     /// <summary>Read/extract specification for computer_batch.</summary>
     public sealed record BatchReadSpec(
         [Description("target element name to read")] string Target,
         [Description("properties to extract: name, value, role, isEnabled, isSelected, bounds")] string[]? Props = null,
-        [Description("target role filter")] string? Role = null);
+        [Description("target role filter")] string? Role = null)
+    {
+        /// <summary>Unknown JSON fields land here instead of being dropped.</summary>
+        [System.Text.Json.Serialization.JsonExtensionData]
+        public Dictionary<string, JsonElement>? Extra { get; set; }
+    }
 
     public sealed record FindQuery(
         [Description("element name or text substring")] string? Name = null,
@@ -7506,6 +7972,75 @@ public sealed class InbriskTools
         bool firstOnly = false, bool includeOffscreen = false)
         => ResolveTargetElement(elementId, target, out error, out _, purpose, anyMatch, sel, firstOnly, includeOffscreen);
 
+    /// <summary>Resolve a permanent UI-map key ("notepad.document",
+    /// "calculator.equals") to a seed TargetSpec — caller-supplied fields
+    /// merged on top by ExpandUiMapTarget. Returns null when the key is not
+    /// in the map (see resources/uimap.json / UiMap).</summary>
+    private static TargetSpec? TryUiMapTarget(string appKey, string logicalName)
+    {
+        if (!UiMap.TryGet($"{appKey}.{logicalName}", out var app, out var sel) ||
+            app == null || sel == null)
+            return null;
+        return new TargetSpec(
+            Process: app.Process,
+            Role: sel.EffectiveRole,
+            Name: sel.Name,
+            NameContains: sel.NameContains,
+            AutomationId: sel.AutomationId,
+            Value: sel.Value,
+            ClassName: sel.ClassName);
+    }
+
+    /// <summary>Expand target.map / a "map:app.element" name prefix into the
+    /// map's selector fields; explicit fields always win. Strict on an explicit
+    /// map field (typo → Malformed/TargetNotFound), lenient on the name-prefix
+    /// shorthand (unknown key falls back to a literal name match, preserving
+    /// pre-map behaviour for string-target callers like computer_batch).</summary>
+    private static TargetSpec? ExpandUiMapTarget(TargetSpec target, out CallToolResult? error)
+    {
+        error = null;
+        var mapRef = target.Map;
+        var strict = true;
+        if (mapRef == null &&
+            target.Name?.StartsWith(UiMap.Prefix, StringComparison.OrdinalIgnoreCase) == true)
+        {
+            mapRef = target.Name;
+            strict = false;
+        }
+        if (mapRef == null) return target;
+
+        if (!UiMap.TryParseKey(mapRef, out var appKey, out var logical))
+        {
+            if (!strict) return target;
+            error = Error(OutcomeKind.Malformed,
+                $"invalid map selector '{mapRef}' — expected \"app.element\" " +
+                "(e.g. \"notepad.document\", \"calculator.equals\")");
+            return null;
+        }
+        var seed = TryUiMapTarget(appKey, logical);
+        if (seed == null)
+        {
+            if (!strict) return target;
+            error = Error(OutcomeKind.TargetNotFound,
+                $"unknown ui-map key '{appKey}.{logical}'. {UiMap.DescribeAvailable(appKey)}");
+            return null;
+        }
+
+        return target with
+        {
+            Process = target.Process ?? seed.Process,
+            Role = target.Role ?? seed.Role,
+            // the "map:…" shorthand lived in Name — replace it with the map's
+            // name (or clear it so an automationId-only selector isn't AND'd
+            // against the literal ref string)
+            Name = strict ? target.Name ?? seed.Name : seed.Name,
+            NameContains = target.NameContains ?? seed.NameContains,
+            AutomationId = target.AutomationId ?? seed.AutomationId,
+            Value = target.Value ?? seed.Value,
+            ClassName = target.ClassName ?? seed.ClassName,
+        };
+    }
+
     private UiElement? ResolveTargetElementCore(string? elementId,
         TargetSpec? target, out CallToolResult? error, out int matchCount,
         out int nativeCount, out int filteredCount,
@@ -7523,12 +8058,17 @@ public sealed class InbriskTools
             return el;
         }
         if (target == null) return null;
+        // UI-map expansion happens once here so every caller (run steps,
+        // run_recipe expansion, batch t:"map:…", do/click/type targets) shares
+        // it. Explicit target fields always override map defaults.
+        target = ExpandUiMapTarget(target, out var mapErr);
+        if (target == null) { error = mapErr; return null; }
         if (target.Extra is { Count: > 0 } extra)
         {
             error = Error(OutcomeKind.Malformed,
                 $"unknown target field(s): {string.Join(", ", extra.Keys)} — " +
                 "valid: elementId,window,hwnd,process,role,name,automationId," +
-                "nameContains,nameNotContains,value,valueContains,valueNotContains," +
+                "map,nameContains,nameNotContains,value,valueContains,valueNotContains," +
                 "className,labelledBy,nearText,within,ancestor");
             return null;
         }
@@ -8768,6 +9308,76 @@ public sealed class InbriskTools
         => x is { } px && y is { } py
             ? new ImagePoint(px, py, frameId ?? 0, obsId ?? 0)
             : null;
+
+    /// <summary>Anchor-window resolution for window-relative coordinates
+    /// (computer_click rx/ry, or x/y with relativeTo:"window") — the fallback
+    /// for apps that expose no UIA elements (Blender, games, custom OpenGL
+    /// canvases). Order: explicit hwnd → the element's owning window → window
+    /// title substring → process-name substring → session scope → foreground
+    /// window.</summary>
+    private bool TryResolveWindowAnchor(string? elementId, TargetSpec? target,
+        out long hwnd, out CallToolResult? error)
+    {
+        hwnd = 0;
+        error = null;
+        long? h = ParseHwnd(target?.Hwnd) ?? ParseHwnd(target?.Window);
+        var elRef = elementId ?? target?.ElementId;
+        if (h == null && elRef != null)
+        {
+            var el = _s.Rt.Parts.Registry.Get(elRef);
+            h = el?.Hwnd ?? el?.Handle.Recipe.Hwnd;
+        }
+        if (h == null && !string.IsNullOrWhiteSpace(target?.Window))
+            h = _s.Rt.Windows().FirstOrDefault(w =>
+                w.Title.Contains(target.Window, StringComparison.OrdinalIgnoreCase))?.Hwnd;
+        if (h == null && !string.IsNullOrWhiteSpace(target?.Process))
+            h = _s.Rt.Windows().FirstOrDefault(w =>
+                (w.ProcessName ?? "").Contains(target.Process,
+                    StringComparison.OrdinalIgnoreCase))?.Hwnd;
+        h ??= _s.ScopeHwnd;
+        h ??= _s.Rt.ForegroundWindow()?.Hwnd;
+        if (h is not > 0)
+        {
+            error = Error(OutcomeKind.TargetNotFound,
+                "no window to anchor relative coordinates to — pass " +
+                "target:{hwnd|window|process} or focus the target window first");
+            return false;
+        }
+        hwnd = h.Value;
+        return true;
+    }
+
+    /// <summary>Post-wraps a click result so a window-relative coordinate
+    /// click reports its synthetic element id ("win:&lt;hwnd&gt;@(x,y)") in
+    /// the same result shape element-targeted actions use. Kept as a wrapper
+    /// so the shared ActionResult builder stays untouched.</summary>
+    private static CallToolResult AnnotateWindowRelativeResult(CallToolResult res,
+        string synthId, long hwnd, int rx, int ry, int absX, int absY)
+    {
+        try
+        {
+            var text = res.Content?.OfType<TextContentBlock>().FirstOrDefault()?.Text;
+            if (string.IsNullOrEmpty(text)) return res;
+            if (System.Text.Json.Nodes.JsonNode.Parse(text) is not
+                System.Text.Json.Nodes.JsonObject node) return res;
+            node["target"] = new System.Text.Json.Nodes.JsonObject
+            {
+                ["elementId"] = synthId,
+                ["role"] = "windowPoint",
+                ["coordinateSpace"] = "window",
+                ["hwnd"] = $"0x{hwnd:X}",
+                ["rx"] = rx,
+                ["ry"] = ry,
+                ["screen"] = $"({absX},{absY})",
+            };
+            return new CallToolResult
+            {
+                IsError = res.IsError,
+                Content = [new TextContentBlock { Text = node.ToJsonString(J) }],
+            };
+        }
+        catch { return res; }
+    }
 
     private static long? ParseHwnd(string? s)
     {
