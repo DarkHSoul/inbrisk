@@ -1575,5 +1575,23 @@
   "Fuzz caveat: the conhost anchor window never appeared (FindWindow returned null), so the fuzzer's 200KB untargeted computer_type payloads went to whatever was foreground. All 500 calls completed in 29.8s \u2014 no type executed (a real 200KB SendInput would take far longer); every payload was denied/rejected quickly. No user window was modified \u2014 verified no stray chars/dialogs afterwards.",
   "computer_screenshot {target:'desktop'} at full 2366x2160 is refused by the observation image-budget guard (CaptureUnavailable) \u2014 use maxWidth. With maxWidth:800 a real capture is 76ms/167KB PNG (~240KB response), and the repeat call dedups to 'unchanged'.",
   "Leftover: mspaint.exe pid 6744 (hwnd 0x70938) is hung/unresponsive \u2014 spawned by this session, refused WM_CLOSE x6 over 30s, no save prompt. Its UIA/message pump wedged around the time the delayed InvokePattern fired (~120s post-call). User can close it manually."
- ]
+ ],
+ "postFix_reverify": {
+  "commit": "336a2ba",
+  "date": "2026-10-06",
+  "metrics": {
+   "computer_launch_waitFor_window": {
+    "before_ms": 13000,
+    "after_ms": 908
+   },
+   "computer_click_elementId": {
+    "before_ms": 120000,
+    "after_ms": 1391
+   },
+   "computer_find": {
+    "after_ms": 142
+   }
+  },
+  "note": "Reentrant-barrier + holder-read-queue + bounded modal-check fix verified live on self-spawned Notepad. Provenance headers and delta fields confirmed in output."
+ }
 }
