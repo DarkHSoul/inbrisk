@@ -4750,7 +4750,8 @@ public sealed class InbriskTools
                 if (action is not ("focus" or "focus_window"))
                     newWin = DetectNewWindow(fgBefore,
                         built?.LastOrDefault(b => b.Kind == AgentActionKind.FocusWindow)?.Hwnd,
-                        eventGenBefore);
+                        eventGenBefore,
+                        StepTargetPids(built, state.ScopeHwnd ?? fgBefore));
             if (newWin is { dialogLikely: true } nw)
             {
                 state.PausedStepIndex = i;
@@ -5907,13 +5908,13 @@ public sealed class InbriskTools
     /// <summary>Scope-scoped element snapshot — the baseline a checkpoint or
     /// pause diffs against. Ids come from the shared registry so returned
     /// refs are immediately usable as targets.</summary>
-    private List<UiElement> Snapshot(long? hwnd)
+    private List<UiElement> Snapshot(long? hwnd, CancellationToken ct = default)
     {
         try
         {
             using (PerfTrace.Stage("snapshot.uiaFind"))
                 return hwnd != null
-                    ? _s.Rt.Find(new FindSpec(Hwnd: hwnd)).ToList() : [];
+                    ? _s.Rt.Find(new FindSpec(Hwnd: hwnd), ct).ToList() : [];
         }
         catch { return []; }
     }
@@ -6083,13 +6084,19 @@ public sealed class InbriskTools
             (long)(r.Right - r.Left) * (r.Bottom - r.Top) < 1_200_000;
     }
 
+    /// <summary>Hard budget for the modal-check element snapshot. The
+    /// check runs on the action's critical path — a wedged provider must
+    /// degrade to "no elements" instead of stalling the step.</summary>
+    private const int ModalCheckSnapshotBudgetMs = 2000;
+
     /// <summary>Did the foreground window change underneath us? A small
     /// button-bearing window that appeared right after an action is almost
     /// certainly a dialog — report it prominently instead of letting the
     /// plan walk past it. Returns null when nothing changed or the new
     /// window is exempt (an intended focus target).</summary>
     private (long hwnd, string title, bool dialogLikely, List<string> elements)?
-        DetectNewWindow(long? beforeHwnd, long? exemptHwnd, long? baselineEventGen = null)
+        DetectNewWindow(long? beforeHwnd, long? exemptHwnd, long? baselineEventGen = null,
+            IReadOnlyCollection<int>? targetPids = null)
     {
         var fg = _s.Rt.ForegroundWindow();
         if (fg == null || fg.Hwnd == beforeHwnd || fg.Hwnd == exemptHwnd)
@@ -6115,18 +6122,83 @@ public sealed class InbriskTools
         if (!candidateSignal && !isDialogCls && !isModal)
             return null;
 
-        var els = Snapshot(fg.Hwnd);
+        var ownerHwnd = GetWindow((IntPtr)fg.Hwnd, 4 /*GW_OWNER*/);
+        var owner = ownerHwnd != IntPtr.Zero;
         var area = (long)fg.Bounds.Width * fg.Bounds.Height;
+        // Every branch that can yield dialogLikely=true requires a
+        // dialog-shaped window: #32770, a detected modal, or a small owned
+        // popup. Anything else — a heavyweight window that merely took
+        // foreground, e.g. Chrome after a click — is reported without a
+        // UIA subtree walk (an unbounded Descendants find on a huge tree
+        // costs seconds; it was the ~13s step.modalCheck regression).
+        var dialogShaped = isDialogCls || isModal || (owner && area < 1_200_000);
+        if (!dialogShaped)
+            return (fg.Hwnd, fg.Title ?? "", false, []);
+
+        // A modal that interrupts THIS action lives in the action
+        // target's process — or is owned by one of its windows. A
+        // dialog-shaped window from a foreign process still blocks the
+        // desktop, so it is reported (cheaply) — but its element list is
+        // never worth a cross-process tree walk.
+        if (!OwnedByTargetProcess(fg.Hwnd, fg.Pid, ownerHwnd.ToInt64(), targetPids, beforeHwnd))
+            return (fg.Hwnd, fg.Title ?? "", isDialogCls || isModal, []);
+
+        using var snapshotCts = new CancellationTokenSource(ModalCheckSnapshotBudgetMs);
+        var els = Snapshot(fg.Hwnd, snapshotCts.Token);
         var buttons = els.Count(e =>
             e.Role is Core.Role.Button or Core.Role.MenuItem);
         // #32770 is THE Windows dialog class — deterministic. Fallback:
         // small owned window with buttons (DirectUI/custom dialogs).
-        var owner = GetWindow((IntPtr)fg.Hwnd, 4 /*GW_OWNER*/) != IntPtr.Zero;
         var likely = isDialogCls || isModal ||
             (els.Count is > 0 and <= 80 && buttons >= 1 &&
              area < 1_200_000 && owner);
         return (fg.Hwnd, fg.Title ?? "", likely,
             els.Where(e => e.Actions.Count > 0).Take(12).Select(Describe).ToList());
+    }
+
+    /// <summary>Is <paramref name="hwnd"/> in — or owned by a window in —
+    /// one of the action target's processes? A dialog for app X lives in
+    /// X's process; a foreign window that merely took foreground (Chrome
+    /// after a coordinate click) is never the target's modal.</summary>
+    private bool OwnedByTargetProcess(long hwnd, int hwndPid, long ownerHwnd,
+        IReadOnlyCollection<int>? targetPids, long? fallbackHwnd)
+    {
+        var pids = targetPids;
+        if (pids == null || pids.Count == 0)
+        {
+            // No resolved targets — fall back to the pid of the window
+            // that was foreground when the action ran.
+            if (fallbackHwnd is > 0 &&
+                _s.Rt.Window(fallbackHwnd.Value)?.Pid is { } fp && fp > 0)
+                pids = new[] { fp };
+            else
+                return true; // nothing to compare — keep prior behavior
+        }
+        if (hwndPid > 0 && pids.Contains(hwndPid)) return true;
+        // Cross-process but owned by a target window — a system dialog
+        // raised on the target's behalf (consent/picker hosts).
+        return ownerHwnd != 0 &&
+            _s.Rt.Window(ownerHwnd)?.Pid is { } op && pids.Contains(op);
+    }
+
+    /// <summary>Pids of the windows a step's resolved actions target —
+    /// scopes the post-action modal check to the target's own process.</summary>
+    private HashSet<int>? StepTargetPids(IReadOnlyList<AgentAction>? actions, long? fallbackHwnd)
+    {
+        var pids = new HashSet<int>();
+        if (actions != null)
+            foreach (var a in actions)
+            {
+                if (a.Pid is > 0) pids.Add(a.Pid.Value);
+                var h = a.Hwnd ?? (a.ElementId != null
+                    ? _s.Rt.Parts.Registry.Get(a.ElementId)?.Hwnd : null);
+                if (h is > 0 && _s.Rt.Window(h.Value)?.Pid is { } p && p > 0)
+                    pids.Add(p);
+            }
+        if (pids.Count == 0 && fallbackHwnd is > 0 &&
+            _s.Rt.Window(fallbackHwnd.Value)?.Pid is { } fp && fp > 0)
+            pids.Add(fp);
+        return pids.Count > 0 ? pids : null;
     }
 
     [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
@@ -8216,10 +8288,11 @@ public sealed class InbriskTools
                     {
                         var res = DetectNewWindow(fgBefore,
                             steps.LastOrDefault(s => s.Kind == AgentActionKind.FocusWindow)?.Hwnd,
-                            eventGenBefore);
+                            eventGenBefore, targetPids);
                         if (res == null && fgBefore.HasValue && _s.Rt.WindowService.GetModalPopup(fgBefore.Value) is { } spawnedModal && spawnedModal.Hwnd != fgBefore.Value)
                         {
-                            var modalEls = Snapshot(spawnedModal.Hwnd);
+                            using var modalCts = new CancellationTokenSource(ModalCheckSnapshotBudgetMs);
+                            var modalEls = Snapshot(spawnedModal.Hwnd, modalCts.Token);
                             res = (spawnedModal.Hwnd, spawnedModal.Title, true,
                                 modalEls.Where(e => e.Actions.Count > 0).Take(12).Select(Describe).ToList());
                         }

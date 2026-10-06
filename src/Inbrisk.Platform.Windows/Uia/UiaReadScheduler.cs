@@ -90,6 +90,14 @@ public sealed class UiaReadScheduler : IDisposable
 
     private readonly object _lanesGate = new();
     private readonly ConcurrentDictionary<int, ProcessReadLane> _lanes = new();
+    /// <summary>Reads enqueued by an async context that already holds the
+    /// target pid's write barrier. They are serviced ahead of lane gating:
+    /// the write-holder is the one awaiting the read (post-action checks,
+    /// ReResolve verification inside a held scope), so deferring it behind
+    /// the barrier deadlocks the holder against itself for the full read
+    /// timeout. Overlap is inherent — the holder reads its own mutation
+    /// results — and bounded (one logical operation at a time).</summary>
+    private readonly ConcurrentQueue<ReadWorkItem> _holderReads = new();
     private readonly List<Thread> _globalWorkers = new();
     private readonly AutoResetEvent _workAvailable = new(false);
     private readonly Timer _idleEvictionTimer;
@@ -188,8 +196,21 @@ public sealed class UiaReadScheduler : IDisposable
                 $"Global UIA read queue capacity reached ({MaxGlobalQueuedReads})");
         }
 
-        // Read/Write barrier wait: if a mutation is active or pending on this PID, wait briefly
-        await WaitForReadBarrierAsync(lane, ct).ConfigureAwait(false);
+        // A read issued by the context that already HOLDS this pid's
+        // write barrier can never queue behind it: workers skip
+        // write-blocked lanes, so the read would sit until the caller
+        // timeout while the holder itself is blocked awaiting it — a
+        // self-deadlock that previously burned ~3s WritesDrained + ~10s
+        // read timeout (and poisoned the lane) on every post-action
+        // check inside an action chain. Holder reads go to the overlap
+        // queue instead.
+        var holderRead = Inbrisk.Core.LockOrderTracker.CurrentContext
+            .HeldBarrierPids.Contains(pid);
+        if (!holderRead)
+        {
+            // Read/Write barrier wait: if a mutation is active or pending on this PID, wait briefly
+            await WaitForReadBarrierAsync(lane, ct).ConfigureAwait(false);
+        }
 
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var enqueuedTicks = Stopwatch.GetTimestamp();
@@ -197,22 +218,29 @@ public sealed class UiaReadScheduler : IDisposable
         var item = new ReadWorkItem(u => work(u), tcs, ct, deadlineTicks, enqueuedTicks, intentName, pid);
 
         OnReadQueued?.Invoke();
-        try
+        if (holderRead)
         {
-            if (!lane.Queue.TryAdd(item, 50, ct))
+            _holderReads.Enqueue(item);
+        }
+        else
+        {
+            try
+            {
+                if (!lane.Queue.TryAdd(item, 50, ct))
+                {
+                    Interlocked.Decrement(ref _globalQueuedReads);
+                    OnReadDequeued?.Invoke();
+                    throw new InbriskException(ErrorCode.Busy,
+                        $"UIA read queue saturated for PID {pid} (capacity: 64)");
+                }
+            }
+            catch (OperationCanceledException)
             {
                 Interlocked.Decrement(ref _globalQueuedReads);
                 OnReadDequeued?.Invoke();
-                throw new InbriskException(ErrorCode.Busy,
-                    $"UIA read queue saturated for PID {pid} (capacity: 64)");
+                OnReadCancelled?.Invoke();
+                throw;
             }
-        }
-        catch (OperationCanceledException)
-        {
-            Interlocked.Decrement(ref _globalQueuedReads);
-            OnReadDequeued?.Invoke();
-            OnReadCancelled?.Invoke();
-            throw;
         }
 
         _workAvailable.Set();
@@ -292,7 +320,20 @@ public sealed class UiaReadScheduler : IDisposable
         // Copy-on-write: isolate this async branch so sibling branches spawned from the same
         // parent context do not see this branch's Rank 2 acquisition.
         var parentCtx = Inbrisk.Core.LockOrderTracker.CurrentContext;
+
+        // Reentrancy: the WriteGate semaphore is not reentrant. A chain
+        // that already holds this pid's barrier — e.g. ActChain wraps the
+        // whole step chain while each step's PerformNative re-notifies the
+        // same pid — would otherwise self-deadlock for the full
+        // WriteGateTimeoutMs (the ~120s element-action stall). Same-context
+        // re-entry returns a no-op scope (pid 0): the outer scope remains
+        // the sole owner and releases once.
+        if (parentCtx.HeldBarrierPids.Contains(pid))
+            return Task.FromResult(new AsyncMutationScope(this, 0, null, null));
+
         var branchCtx = new Inbrisk.Core.LockContext { HeldProcessBarriers = parentCtx.HeldProcessBarriers + 1 };
+        branchCtx.HeldBarrierPids.UnionWith(parentCtx.HeldBarrierPids);
+        branchCtx.HeldBarrierPids.Add(pid);
         Inbrisk.Core.LockOrderTracker.CurrentContext = branchCtx;
 
         try
@@ -435,11 +476,47 @@ public sealed class UiaReadScheduler : IDisposable
     public void NotifyMutationStarting(int pid)
     {
         OnSyncOverAsyncFallback?.Invoke();
+        if (pid <= 0) return;
+        // Reentrant notify: an ancestor scope on this async context already
+        // holds pid's write gate — acquiring the non-reentrant semaphore
+        // again would deadlock until WriteGateTimeoutMs. Track the nested
+        // depth so the paired NotifyMutationCompleted does not release the
+        // ancestor's hold early.
+        var ctx = Inbrisk.Core.LockOrderTracker.CurrentContext;
+        if (ctx.HeldBarrierPids.Contains(pid))
+        {
+            // The context object can be shared by sibling tasks — guard
+            // the depth map against concurrent updates.
+            lock (ctx)
+            {
+                var depth = ctx.ReentrantNotifyDepth ??= new Dictionary<int, int>();
+                depth[pid] = depth.TryGetValue(pid, out var n) ? n + 1 : 1;
+            }
+            return;
+        }
         EnterMutationBarrierAsync(pid).GetAwaiter().GetResult();
     }
 
     public void NotifyMutationCompleted(int pid)
     {
+        if (pid <= 0) return;
+        var ctx = Inbrisk.Core.LockOrderTracker.CurrentContext;
+        lock (ctx)
+        {
+            if (ctx.ReentrantNotifyDepth != null &&
+                ctx.ReentrantNotifyDepth.TryGetValue(pid, out var depth) && depth > 0)
+            {
+                if (depth == 1) ctx.ReentrantNotifyDepth.Remove(pid);
+                else ctx.ReentrantNotifyDepth[pid] = depth - 1;
+                return;
+            }
+            // The AsyncMutationScope returned by EnterMutationBarrierAsync
+            // is discarded on this notify path — roll back the ambient
+            // branch state it installed (pid + held count) so it does not
+            // leak into unrelated later work on this context.
+            ctx.HeldBarrierPids.Remove(pid);
+            if (ctx.HeldProcessBarriers > 0) ctx.HeldProcessBarriers--;
+        }
         ReleaseMutationBarrier(pid);
     }
 
@@ -587,6 +664,57 @@ public sealed class UiaReadScheduler : IDisposable
         {
             while (!_isDisposed)
             {
+                // Holder-overlap reads first: the write-holder is blocked
+                // awaiting these — lane gating (ActiveWrites/PendingWrites)
+                // does not apply or the holder deadlocks against itself.
+                while (_holderReads.TryDequeue(out var ov))
+                {
+                    OnReadDequeued?.Invoke();
+                    var ovQueueMs = (Stopwatch.GetTimestamp() - ov.EnqueuedTicks)
+                        * 1000.0 / Stopwatch.Frequency;
+                    OnReadQueueWaitRecorded?.Invoke(ovQueueMs);
+
+                    if (ov.Ct.IsCancellationRequested ||
+                        Stopwatch.GetTimestamp() > ov.DeadlineTicks)
+                    {
+                        ov.Tcs.TrySetCanceled(ov.Ct.IsCancellationRequested ? ov.Ct : default);
+                        OnReadCancelled?.Invoke();
+                        continue;
+                    }
+
+                    Interlocked.Increment(ref _activeReadCount);
+                    OnReadActiveStarted?.Invoke();
+                    var ovSw = Stopwatch.StartNew();
+                    ov.ExecutingWorker = workerState;
+                    try
+                    {
+                        if (ov.Ct.IsCancellationRequested)
+                        {
+                            ov.Tcs.TrySetCanceled(ov.Ct);
+                            OnReadCancelled?.Invoke();
+                            continue;
+                        }
+                        ov.Tcs.TrySetResult(ov.Fn(uia));
+                    }
+                    catch (Exception ex)
+                    {
+                        ov.Tcs.TrySetException(ex);
+                    }
+                    finally
+                    {
+                        ovSw.Stop();
+                        OnReadExecutionRecorded?.Invoke(ovSw.Elapsed.TotalMilliseconds);
+                        OnReadActiveFinished?.Invoke();
+                        Interlocked.Decrement(ref _activeReadCount);
+                    }
+
+                    if (workerState.IsAbandoned)
+                    {
+                        Interlocked.Decrement(ref _abandonedWorkerCount);
+                        return;
+                    }
+                }
+
                 ReadWorkItem? item = null;
                 ProcessReadLane? assignedLane = null;
 
@@ -752,6 +880,11 @@ public sealed class UiaReadScheduler : IDisposable
 
         try { _idleEvictionTimer.Dispose(); } catch { }
         _workAvailable.Set();
+
+        while (_holderReads.TryDequeue(out var pending))
+        {
+            pending.Tcs.TrySetCanceled(pending.Ct.IsCancellationRequested ? pending.Ct : default);
+        }
 
         foreach (var lane in _lanes.Values)
         {

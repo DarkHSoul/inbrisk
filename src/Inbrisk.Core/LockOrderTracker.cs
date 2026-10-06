@@ -7,6 +7,22 @@ namespace Inbrisk.Core;
 public sealed class LockContext
 {
     public int HeldProcessBarriers { get; set; }
+
+    /// <summary>Pids whose Rank 2 process write barrier is held by this
+    /// context (or an ancestor context it was branched from). The per-pid
+    /// WriteGate semaphore is NOT reentrant — this set lets the scheduler
+    /// detect same-context re-entry (e.g. an action chain that holds the
+    /// barrier for the whole chain while each step's PerformNative
+    /// re-notifies the same pid) and turn it into a no-op instead of a
+    /// self-deadlock against WriteGateTimeoutMs. Reads scheduled by a
+    /// holding context also bypass the write block via this set — the
+    /// holder would otherwise deadlock against its own barrier.</summary>
+    public HashSet<int> HeldBarrierPids { get; } = new();
+
+    /// <summary>Depth of reentrant NotifyMutationStarting calls per pid —
+    /// the paired NotifyMutationCompleted decrements instead of releasing
+    /// an ancestor-held gate.</summary>
+    public Dictionary<int, int>? ReentrantNotifyDepth { get; set; }
 }
 
 /// <summary>

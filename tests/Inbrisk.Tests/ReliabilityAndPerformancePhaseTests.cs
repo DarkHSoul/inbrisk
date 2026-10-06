@@ -2549,14 +2549,23 @@ public class ReliabilityAndPerformancePhaseTests
         scheduler.NotifyMutationStarting(pid);
         bool readExecuted = false;
 
-        var readTask = Task.Run(async () =>
+        // SuppressFlow: a read scheduled on a context that HOLDS this
+        // pid's barrier is a holder read — it is intentionally served
+        // through the overlap queue (otherwise the holder would deadlock
+        // against its own gate). The barrier contract being tested here
+        // is that reads from FOREIGN contexts still block during a write.
+        Task readTask;
+        using (ExecutionContext.SuppressFlow())
         {
-            await scheduler.ScheduleReadAsync(pid, _ =>
+            readTask = Task.Run(async () =>
             {
-                readExecuted = true;
-                return "read_done";
+                await scheduler.ScheduleReadAsync(pid, _ =>
+                {
+                    readExecuted = true;
+                    return "read_done";
+                });
             });
-        });
+        }
 
         // While write is active, read should not execute
         await Task.Delay(50);
