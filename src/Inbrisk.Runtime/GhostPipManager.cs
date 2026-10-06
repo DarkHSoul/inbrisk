@@ -434,6 +434,13 @@ public class GhostPipManager : IDisposable
             return;
         }
 
+        // Forward keyboard events directly without mouse coordinate mapping
+        if (e.EventType is PipInputEventType.KeyDown or PipInputEventType.KeyUp or PipInputEventType.Char)
+        {
+            _desktopInput.ForwardKeyInput(e.EventType, e.KeyCode, e.Character);
+            return;
+        }
+
         int pipWidth = _windowHost.Width > 0 ? _windowHost.Width : _currentWidth;
         int pipHeight = _windowHost.Height > 0 ? _windowHost.Height : _currentHeight;
         const int headerHeight = 26; // Height of the drag handle header bar

@@ -714,6 +714,18 @@ public static class GhostControlCommand
             trayApp = new GhostTrayApp(initialStatus: "🟢 Inbrisk: Hazır", visible: true);
             trayApp.SetInteractive(initialInteractive);
             trayApp.SetOpacity(initialOpacity);
+            trayApp.OnOpenSettings += () =>
+            {
+                try
+                {
+                    var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
+                    if (!File.Exists(exe))
+                        exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
+                    Process.Start(new ProcessStartInfo(exe, "control") { UseShellExecute = true });
+                }
+                catch { }
+            };
+            trayApp.OnTrayIconClicked += () => trayApp.OpenSettings();
             trayApp.Start();
 
             if (!trayApp.WaitForReady(3000))
@@ -739,7 +751,6 @@ public static class GhostControlCommand
                     hud.Start();
                     hud.SetStandby("Inbrisk Hazır");
                     hud.OnClick = () => trayApp.OpenSettings();
-                    hud.OnRightClick = () => trayApp.ShowContextMenu();
                     LogSuccess("Inbrisk Hazır Winbar HUD pill active on taskbar.", options);
                 }
                 catch (Exception ex)

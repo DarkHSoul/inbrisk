@@ -71,6 +71,8 @@ public static class McpHost
         "computer_pause_run",
         "computer_resume_run",
         "computer_wait_for",
+        "ghost_control_open",
+        "computer_ghost_control",
     };
 
     public static IReadOnlySet<string> CoreTools => CoreToolNames;

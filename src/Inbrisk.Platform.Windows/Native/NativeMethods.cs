@@ -268,6 +268,7 @@ internal static class NativeMethods
     [DllImport("user32.dll", SetLastError = true)] internal static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
 
     public const uint WM_NULL = 0x0000;
+    public const int SW_SHOWNOACTIVATE = 4;
 
     public const uint LWA_COLORKEY = 0x00000001;
     public const uint LWA_ALPHA = 0x00000002;
@@ -276,6 +277,11 @@ internal static class NativeMethods
     public const uint WM_PAINT = 0x000F;
     public const uint WM_DESTROY = 0x0002;
     public const uint WM_DISPLAYCHANGE = 0x007E;
+    public const uint WM_KEYDOWN = 0x0100;
+    public const uint WM_KEYUP = 0x0101;
+    public const uint WM_CHAR = 0x0102;
+    public const uint WM_SYSKEYDOWN = 0x0104;
+    public const uint WM_SYSKEYUP = 0x0105;
     public const uint WM_APP = 0x8000;
 
     public const int SW_RESTORE = 9;

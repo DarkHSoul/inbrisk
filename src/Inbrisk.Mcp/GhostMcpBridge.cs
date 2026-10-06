@@ -904,6 +904,199 @@ public sealed class GhostMcpBridge : IDisposable
         };
     }
 
+    /// <summary>
+    /// Opens or controls the Inbrisk Ghost Control suite (System Tray daemon, PiP window, isolated Ghost Desktop).
+    /// </summary>
+    [McpServerTool(Name = "ghost_control_open"), Description(
+        "Opens or controls the Inbrisk Ghost Control suite (System Tray daemon, PiP window, isolated Ghost Desktop). Starts the daemon if not running.")]
+    public async Task<CallToolResult> GhostControlOpen(
+        [Description("Action to perform: 'open'|'tray' (starts daemon if not running), 'pip' (configures PiP), 'status' (queries status), 'stop' (stops daemon). Default: 'open'")] string? action = "open",
+        [Description("Toggle click-through transparent mode (true = clickable/interactive, false = click-through transparent).")] bool? interactive = null,
+        [Description("Toggle full-screen Shadow Mode covering the primary display.")] bool? fullScreen = null,
+        [Description("Preset anchor position: TopLeft | TopRight | BottomLeft | BottomRight")] string? position = null,
+        [Description("Alpha opacity: 50 | 80 | 100 (or 0-255 / percentage)")] byte? opacity = null,
+        [Description("Window scale multiplier (e.g. 1.0, 1.5, 2.0; default: 1.0)")] float? scale = null,
+        CancellationToken ct = default)
+    {
+        return await ExecuteGhostControlAsync(action, interactive, fullScreen, position, opacity, scale, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Controls the Ghost OS desktop, tray daemon, and PiP overlay.
+    /// </summary>
+    [McpServerTool(Name = "computer_ghost_control"), Description(
+        "Controls the Ghost OS desktop, tray daemon, and PiP overlay.")]
+    public async Task<CallToolResult> ComputerGhostControl(
+        [Description("Action to perform: 'open'|'tray' (starts daemon if not running), 'pip' (configures PiP), 'status' (queries status), 'stop' (stops daemon). Default: 'open'")] string? action = "open",
+        [Description("Toggle click-through transparent mode (true = clickable/interactive, false = click-through transparent).")] bool? interactive = null,
+        [Description("Toggle full-screen Shadow Mode covering the primary display.")] bool? fullScreen = null,
+        [Description("Preset anchor position: TopLeft | TopRight | BottomLeft | BottomRight")] string? position = null,
+        [Description("Alpha opacity: 50 | 80 | 100 (or 0-255 / percentage)")] byte? opacity = null,
+        [Description("Window scale multiplier (e.g. 1.0, 1.5, 2.0; default: 1.0)")] float? scale = null,
+        CancellationToken ct = default)
+    {
+        return await ExecuteGhostControlAsync(action, interactive, fullScreen, position, opacity, scale, ct).ConfigureAwait(false);
+    }
+
+    private async Task<CallToolResult> ExecuteGhostControlAsync(
+        string? action,
+        bool? interactive,
+        bool? fullScreen,
+        string? position,
+        byte? opacity,
+        float? scale,
+        CancellationToken ct)
+    {
+        PerfTrace.Count("ghostControlOpen");
+        string act = (action ?? "open").Trim().ToLowerInvariant();
+
+        // 1. Check if the daemon is already running via the named pipe "inbrisk_ghost_control"
+        bool isDaemonRunning = false;
+        try
+        {
+            var testClient = new GhostIpcClient("inbrisk_ghost_control");
+            await testClient.ConnectAsync(TimeSpan.FromMilliseconds(400), ct).ConfigureAwait(false);
+            isDaemonRunning = testClient.IsConnected;
+            if (isDaemonRunning)
+            {
+                using (testClient)
+                {
+                    if (act == "stop")
+                    {
+                        var stopResp = await testClient.SendRequestAsync("stop", "{}", TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
+                        return SuccessResult(new { success = true, action = "stop", state = "stopped", message = "Ghost Control daemon stopped.", response = stopResp });
+                    }
+
+                    var actionsTaken = new List<string>();
+
+                    if (interactive.HasValue)
+                    {
+                        var p = JsonSerializer.Serialize(new { interactive = interactive.Value });
+                        await testClient.SendRequestAsync("pip_interactive", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                        actionsTaken.Add($"interactive={(interactive.Value ? "on" : "off")}");
+                    }
+
+                    if (fullScreen.HasValue)
+                    {
+                        var p = JsonSerializer.Serialize(new { fullscreen = fullScreen.Value });
+                        await testClient.SendRequestAsync("pip_fullscreen", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                        actionsTaken.Add($"fullscreen={fullScreen.Value}");
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(position))
+                    {
+                        var p = JsonSerializer.Serialize(new { position });
+                        await testClient.SendRequestAsync("pip_position", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                        actionsTaken.Add($"position={position}");
+                    }
+
+                    if (opacity.HasValue)
+                    {
+                        var p = JsonSerializer.Serialize(new { opacity = opacity.Value });
+                        await testClient.SendRequestAsync("pip_opacity", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                        actionsTaken.Add($"opacity={opacity.Value}");
+                    }
+
+                    if (scale.HasValue)
+                    {
+                        var p = JsonSerializer.Serialize(new { scale = scale.Value });
+                        await testClient.SendRequestAsync("pip_scale", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                        actionsTaken.Add($"scale={scale.Value}");
+                    }
+
+                    string statusJson = await testClient.SendRequestAsync("status", "{}", TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+
+                    return SuccessResult(new
+                    {
+                        success = true,
+                        daemonRunning = true,
+                        state = "running",
+                        pipeName = "inbrisk_ghost_control",
+                        actionsApplied = actionsTaken,
+                        message = actionsTaken.Count > 0
+                            ? $"Applied settings to running Ghost Control: {string.Join(", ", actionsTaken)}"
+                            : "Ghost Control daemon is already active and running.",
+                        status = statusJson
+                    });
+                }
+            }
+        }
+        catch { }
+
+        if (act == "stop")
+        {
+            return SuccessResult(new { success = true, action = "stop", state = "stopped", message = "Ghost Control daemon is not running." });
+        }
+
+        // 2. Daemon not running -> Start in background via Process.Start("inbrisk.exe", "ghost tray")
+        try
+        {
+            var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
+            if (string.IsNullOrEmpty(exe) || !File.Exists(exe))
+            {
+                exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
+            }
+
+            var argsList = new List<string> { "ghost", "tray" };
+            if (interactive == true) argsList.Add("--interactive on");
+            else if (interactive == false) argsList.Add("--no-interactive");
+
+            if (fullScreen == true) argsList.Add("--fullscreen");
+            if (!string.IsNullOrWhiteSpace(position)) argsList.Add($"--position {position}");
+            if (opacity.HasValue) argsList.Add($"--opacity {opacity.Value}");
+            if (scale.HasValue) argsList.Add($"--scale {scale.Value}");
+
+            string startArgs = string.Join(" ", argsList);
+
+            var psi = new ProcessStartInfo
+            {
+                FileName = exe,
+                Arguments = startArgs,
+                UseShellExecute = true,
+                CreateNoWindow = true,
+                WindowStyle = ProcessWindowStyle.Hidden
+            };
+
+            var proc = Process.Start(psi);
+
+            // Wait briefly for pipe to warm up
+            var sw = Stopwatch.StartNew();
+            bool connected = false;
+            while (sw.ElapsedMilliseconds < 3500 && !ct.IsCancellationRequested)
+            {
+                await Task.Delay(250, ct).ConfigureAwait(false);
+                try
+                {
+                    var check = new GhostIpcClient("inbrisk_ghost_control");
+                    await check.ConnectAsync(TimeSpan.FromMilliseconds(200), ct).ConfigureAwait(false);
+                    if (check.IsConnected)
+                    {
+                        connected = true;
+                        break;
+                    }
+                }
+                catch { }
+            }
+
+            return SuccessResult(new
+            {
+                success = true,
+                started = true,
+                processId = proc?.Id,
+                executable = exe,
+                arguments = startArgs,
+                pipeConnected = connected,
+                message = connected
+                    ? "Ghost Control daemon successfully started and listening."
+                    : "Ghost Control process launched. Initializing background session and PiP overlay."
+            });
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult("LaunchFailed", $"Failed to start Ghost Control daemon: {ex.Message}");
+        }
+    }
+
     #endregion
 
     #region Helper Methods

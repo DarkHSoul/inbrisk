@@ -504,11 +504,15 @@ public sealed class GhostPipWindowHost : IDisposable
         long newExStyle = curExStyle;
         if (enabled)
         {
+            // Non-interactive: click-through transparent, no activation
             newExStyle |= NativeMethods.WS_EX_TRANSPARENT;
+            newExStyle |= NativeMethods.WS_EX_NOACTIVATE;
         }
         else
         {
+            // Interactive: clickable, accepts keyboard focus and mouse input
             newExStyle &= ~NativeMethods.WS_EX_TRANSPARENT;
+            newExStyle &= ~NativeMethods.WS_EX_NOACTIVATE;
         }
 
         if (newExStyle != curExStyle)
@@ -857,6 +861,12 @@ public sealed class GhostPipWindowHost : IDisposable
                             _ => MouseButton.Left
                         };
 
+                        if (msg == NativeMethods.WM_LBUTTONDOWN)
+                        {
+                            NativeMethods.SetForegroundWindow(hWnd);
+                            NativeMethods.SetFocus(hWnd);
+                        }
+
                         OnInteractiveInput?.Invoke(new PipInputEventArgs(eventType, clientX, clientY, button));
                         return IntPtr.Zero;
                     }
@@ -879,6 +889,44 @@ public sealed class GhostPipWindowHost : IDisposable
                         OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.MouseWheel, ptWheel.X, ptWheel.Y, MouseButton.Left, wheelDelta));
                         return IntPtr.Zero;
                     }
+                }
+                break;
+            }
+
+            case NativeMethods.WM_KEYDOWN:
+            case NativeMethods.WM_SYSKEYDOWN:
+            {
+                if (!_clickThrough)
+                {
+                    int vk = unchecked((int)(long)wParam);
+                    OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyDown, 0, 0, keyCode: vk));
+                    return IntPtr.Zero;
+                }
+                break;
+            }
+
+            case NativeMethods.WM_KEYUP:
+            case NativeMethods.WM_SYSKEYUP:
+            {
+                if (!_clickThrough)
+                {
+                    int vk = unchecked((int)(long)wParam);
+                    OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyUp, 0, 0, keyCode: vk));
+                    return IntPtr.Zero;
+                }
+                break;
+            }
+
+            case NativeMethods.WM_CHAR:
+            {
+                if (!_clickThrough)
+                {
+                    char c = (char)(long)wParam;
+                    if (c >= 32 || c == '\r' || c == '\n' || c == '\t' || c == '\b')
+                    {
+                        OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.Char, 0, 0, character: c));
+                    }
+                    return IntPtr.Zero;
                 }
                 break;
             }

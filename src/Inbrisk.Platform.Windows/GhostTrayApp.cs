@@ -299,10 +299,11 @@ public sealed class GhostTrayApp : IDisposable
             EnsureClassRegistered();
             _hwndHandle = GCHandle.Alloc(this);
             _hwnd = NativeMethods.CreateWindowExW(
-                0,
+                NativeMethods.WS_EX_TOOLWINDOW,
                 WindowClassName,
                 "InbriskGhostTrayMessageWindow",
-                0, 0, 0, 0, 0,
+                NativeMethods.WS_POPUP,
+                -10000, -10000, 10, 10,
                 IntPtr.Zero, IntPtr.Zero,
                 NativeMethods.GetModuleHandleW(null),
                 GCHandle.ToIntPtr(_hwndHandle));
@@ -310,6 +311,7 @@ public sealed class GhostTrayApp : IDisposable
             if (_hwnd != IntPtr.Zero)
             {
                 NativeMethods.SetWindowLongPtr(_hwnd, GwlpUserdata, GCHandle.ToIntPtr(_hwndHandle));
+                NativeMethods.ShowWindow(_hwnd, NativeMethods.SW_SHOWNOACTIVATE);
             }
 
             _wmTaskbarCreated = NativeMethods.RegisterWindowMessageW("TaskbarCreated");
@@ -548,7 +550,7 @@ public sealed class GhostTrayApp : IDisposable
         }
         else
         {
-            ToggleVisibility();
+            OpenSettings();
         }
     }
 

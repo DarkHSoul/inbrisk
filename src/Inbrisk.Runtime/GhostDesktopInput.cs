@@ -126,7 +126,7 @@ public class GhostDesktopInput : IDisposable
             else if (_platformInjector != null && _platformForwardMethod != null)
             {
                 // Route directly to isolated desktop via Windows platform injector
-                var args = new PipInputEventArgs(eventType, targetX, targetY, button, delta);
+                var args = new PipInputEventArgs(eventType, targetX, targetY, button, delta, isMapped: true);
                 _platformForwardMethod.Invoke(_platformInjector, new object[] { args });
             }
             else
@@ -141,6 +141,52 @@ public class GhostDesktopInput : IDisposable
         {
             Debug.WriteLine($"[GhostDesktopInput] ForwardInput failed: {ex.Message}");
             DispatchFailed?.Invoke(ex);
+        }
+    }
+
+    /// <summary>
+    /// Forwards an interactive keyboard key event (KeyDown, KeyUp, Char) directly to the ghost desktop.
+    /// </summary>
+    public void ForwardKeyInput(PipInputEventType eventType, int keyCode, char character)
+    {
+        if (_disposed) return;
+
+        try
+        {
+            if (IsIpcActive)
+            {
+                if (eventType == PipInputEventType.Char)
+                {
+                    _ = SendTextIpcAsync(character.ToString());
+                }
+                else
+                {
+                    _ = SendKeyIpcAsync(eventType == PipInputEventType.KeyDown ? "keydown" : "keyup", keyCode);
+                }
+            }
+            else if (_platformInjector != null && _platformForwardMethod != null)
+            {
+                var args = new PipInputEventArgs(eventType, 0, 0, keyCode: keyCode, character: character, isMapped: true);
+                _platformForwardMethod.Invoke(_platformInjector, new object[] { args });
+            }
+            else
+            {
+                if (eventType == PipInputEventType.Char && character != '\0')
+                {
+                    InputService.TypeText(character.ToString());
+                }
+                else if (Enum.IsDefined(typeof(KeyCode), keyCode))
+                {
+                    if (eventType == PipInputEventType.KeyDown)
+                        InputService.KeyDown((KeyCode)keyCode);
+                    else if (eventType == PipInputEventType.KeyUp)
+                        InputService.KeyUp((KeyCode)keyCode);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[GhostDesktopInput] ForwardKeyInput failed: {ex.Message}");
         }
     }
 

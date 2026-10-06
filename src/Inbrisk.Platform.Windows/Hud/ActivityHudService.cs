@@ -600,8 +600,9 @@ public sealed class ActivityHudService : IDisposable
     {
         if (!ComputeDockBand(out var left, out var right)) return x;
         var pad = (int)(4 * _dpiScale);
-        var maxX = Math.Max(left + pad, right - pad - _winW);
-        return Math.Clamp(x, left + pad, maxX);
+        var minX = left + pad;
+        var maxX = Math.Max(minX, right - pad - _winW);
+        return Math.Clamp(x, minX, maxX);
     }
 
     private void DragMove()
@@ -729,7 +730,9 @@ public sealed class ActivityHudService : IDisposable
 
         try
         {
-            var exe = Environment.ProcessPath ?? "inbrisk.exe";
+            var localApp = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            var canonical = Path.Combine(localApp, "Programs", "Inbrisk", "inbrisk.exe");
+            var exe = File.Exists(canonical) ? canonical : (Environment.ProcessPath ?? "inbrisk.exe");
             Process.Start(new ProcessStartInfo(exe, "control") { UseShellExecute = true });
         }
         catch { }

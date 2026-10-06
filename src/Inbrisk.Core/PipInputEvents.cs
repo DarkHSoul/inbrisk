@@ -20,7 +20,16 @@ public enum PipInputEventType
     DoubleClick,
 
     /// <summary>Mouse wheel scrolled.</summary>
-    MouseWheel
+    MouseWheel,
+
+    /// <summary>Keyboard key pressed down.</summary>
+    KeyDown,
+
+    /// <summary>Keyboard key released up.</summary>
+    KeyUp,
+
+    /// <summary>Unicode text character typed.</summary>
+    Char
 }
 
 /// <summary>
@@ -46,6 +55,15 @@ public sealed class PipInputEventArgs : EventArgs
     /// <summary>Gets the mouse wheel scroll delta (typically ±120 per notch).</summary>
     public int Delta { get; init; }
 
+    /// <summary>Gets the virtual key code for keyboard events.</summary>
+    public int KeyCode { get; init; }
+
+    /// <summary>Gets the character value for text typing events.</summary>
+    public char Character { get; init; }
+
+    /// <summary>Indicates whether (X, Y) are already mapped to target desktop coordinates.</summary>
+    public bool IsMapped { get; init; }
+
     /// <summary>Gets the timestamp in UTC ticks when the event was received.</summary>
     public long TimestampTicks { get; init; } = DateTime.UtcNow.Ticks;
 
@@ -65,13 +83,19 @@ public sealed class PipInputEventArgs : EventArgs
         int x,
         int y,
         MouseButton button = MouseButton.Left,
-        int delta = 0)
+        int delta = 0,
+        int keyCode = 0,
+        char character = '\0',
+        bool isMapped = false)
     {
         EventType = eventType;
         X = x;
         Y = y;
         Button = button;
         Delta = delta;
+        KeyCode = keyCode;
+        Character = character;
+        IsMapped = isMapped;
         TimestampTicks = DateTime.UtcNow.Ticks;
     }
 }

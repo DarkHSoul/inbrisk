@@ -287,6 +287,18 @@ public sealed class GhostDesktopInput : IDisposable
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern uint MapVirtualKeyW(uint uCode, uint uMapType);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetActiveWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetFocus(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
     }
 
     #endregion
@@ -555,6 +567,14 @@ public sealed class GhostDesktopInput : IDisposable
             if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
             {
                 _lastTargetHwnd = hwnd;
+                IntPtr root = Win32.GetAncestor(hwnd, 2 /* GA_ROOT */);
+                if (root != IntPtr.Zero)
+                {
+                    Win32.SetForegroundWindow(root);
+                    Win32.SetActiveWindow(root);
+                }
+                Win32.SetFocus(hwnd);
+                Win32.PostMessageW(hwnd, WM_SETFOCUS, IntPtr.Zero, IntPtr.Zero);
             }
 
             uint msg;
@@ -977,14 +997,35 @@ public sealed class GhostDesktopInput : IDisposable
 
     /// <summary>
     /// Forwards an interactive PiP input event to the ghost desktop.
-    /// Automatically maps PiP coordinates to ghost desktop resolution.
+    /// Automatically maps PiP coordinates to ghost desktop resolution if not already mapped.
     /// </summary>
     public void ForwardPipInput(PipInputEventArgs e)
     {
         ArgumentNullException.ThrowIfNull(e);
         if (!IsPipInteractive) return;
 
-        var (dx, dy) = MapPipToDesktop(e.X, e.Y);
+        if (e.EventType == PipInputEventType.KeyDown)
+        {
+            SendKeyDown((VirtualKey)e.KeyCode);
+            return;
+        }
+
+        if (e.EventType == PipInputEventType.KeyUp)
+        {
+            SendKeyUp((VirtualKey)e.KeyCode);
+            return;
+        }
+
+        if (e.EventType == PipInputEventType.Char)
+        {
+            if (e.Character != '\0')
+            {
+                SendText(e.Character.ToString());
+            }
+            return;
+        }
+
+        var (dx, dy) = e.IsMapped ? (e.X, e.Y) : MapPipToDesktop(e.X, e.Y);
 
         switch (e.EventType)
         {
@@ -1003,6 +1044,28 @@ public sealed class GhostDesktopInput : IDisposable
             case PipInputEventType.MouseWheel:
                 SendMouseScroll(dx, dy, e.Delta);
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Forwards a keyboard key action (KeyDown, KeyUp, Char) directly to the ghost desktop.
+    /// </summary>
+    public void ForwardKeyInput(PipInputEventType eventType, int keyCode, char character)
+    {
+        if (eventType == PipInputEventType.KeyDown)
+        {
+            SendKeyDown((VirtualKey)keyCode);
+        }
+        else if (eventType == PipInputEventType.KeyUp)
+        {
+            SendKeyUp((VirtualKey)keyCode);
+        }
+        else if (eventType == PipInputEventType.Char)
+        {
+            if (character != '\0')
+            {
+                SendText(character.ToString());
+            }
         }
     }
 
