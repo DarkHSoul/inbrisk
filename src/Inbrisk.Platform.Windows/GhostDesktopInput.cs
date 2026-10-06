@@ -198,7 +198,11 @@ public sealed class GhostDesktopInput : IDisposable
     private const uint WM_MOUSEWHEEL = 0x020A;
     private const uint WM_MOUSEHWHEEL = 0x020E;
     private const uint WM_NCHITTEST = 0x0084;
+    private const uint WM_MOUSEACTIVATE = 0x0021;
     private const uint WM_CLOSE = 0x0010;
+    private const uint WM_POINTERUPDATE = 0x0245;
+    private const uint WM_POINTERDOWN = 0x0246;
+    private const uint WM_POINTERUP = 0x0247;
 
     // Non-Client Hit Test Codes
     private const int HTNOWHERE = 0;
@@ -382,6 +386,7 @@ public sealed class GhostDesktopInput : IDisposable
     private int _lastMouseX;
     private int _lastMouseY;
     private IntPtr _lastTargetHwnd = IntPtr.Zero;
+    private IntPtr _capturedMouseHwnd = IntPtr.Zero;
 
     // Interactive Ghost Window Dragging & Resizing State
     private bool _isDraggingWindow;
@@ -690,14 +695,32 @@ public sealed class GhostDesktopInput : IDisposable
                 return;
             }
 
-            IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt);
-            if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
+            IntPtr hwnd;
+            POINT clientPt;
+
+            if (_heldMouseKeys != 0 && _capturedMouseHwnd != IntPtr.Zero && Win32.IsWindow(_capturedMouseHwnd))
             {
-                _lastTargetHwnd = hwnd;
+                hwnd = _capturedMouseHwnd;
+                clientPt = new POINT { X = desktopX, Y = desktopY };
+                Win32.ScreenToClient(hwnd, ref clientPt);
+            }
+            else
+            {
+                hwnd = GetWindowAtPoint(desktopX, desktopY, out clientPt);
+                if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
+                {
+                    _lastTargetHwnd = hwnd;
+                }
             }
 
             IntPtr lParam = MakeLParam(clientPt.X, clientPt.Y);
             Win32.PostMessageW(hwnd, WM_MOUSEMOVE, (IntPtr)_heldMouseKeys, lParam);
+
+            if (_heldMouseKeys != 0)
+            {
+                IntPtr pointerWParam = (IntPtr)((1 /* POINTER_ID 1 */) | (1 << 18 /* INCONTACT */) | (1 << 19 /* FIRSTBUTTON */) | (1 << 20 /* PRIMARY */));
+                Win32.PostMessageW(hwnd, WM_POINTERUPDATE, pointerWParam, lParam);
+            }
         });
     }
 
@@ -758,19 +781,6 @@ public sealed class GhostDesktopInput : IDisposable
                 }
             }
 
-            if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
-            {
-                _lastTargetHwnd = hwnd;
-                IntPtr root = Win32.GetAncestor(hwnd, 2 /* GA_ROOT */);
-                if (root == IntPtr.Zero) root = hwnd;
-
-                Win32.SetForegroundWindow(root);
-                Win32.SetActiveWindow(root);
-                Win32.SetFocus(hwnd);
-                Win32.PostMessageW(root, WM_ACTIVATE, (IntPtr)1 /* WA_ACTIVE */, IntPtr.Zero);
-                Win32.PostMessageW(hwnd, WM_SETFOCUS, IntPtr.Zero, IntPtr.Zero);
-            }
-
             uint msg;
             switch (button)
             {
@@ -789,9 +799,31 @@ public sealed class GhostDesktopInput : IDisposable
                     break;
             }
 
+            if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
+            {
+                _lastTargetHwnd = hwnd;
+                _capturedMouseHwnd = hwnd;
+                IntPtr root = Win32.GetAncestor(hwnd, 2 /* GA_ROOT */);
+                if (root == IntPtr.Zero) root = hwnd;
+
+                Win32.SendMessageTimeoutW(root, WM_MOUSEACTIVATE, root, MakeLParam(1 /* HTCLIENT */, (int)msg), 2 /* SMTO_ABORTIFHUNG */, 50, out _);
+                Win32.SetForegroundWindow(root);
+                Win32.SetActiveWindow(root);
+                Win32.SetFocus(hwnd);
+                Win32.PostMessageW(root, WM_ACTIVATE, (IntPtr)1 /* WA_ACTIVE */, IntPtr.Zero);
+                Win32.PostMessageW(hwnd, WM_SETFOCUS, IntPtr.Zero, IntPtr.Zero);
+            }
+            else
+            {
+                _capturedMouseHwnd = IntPtr.Zero;
+            }
+
             IntPtr lParam = MakeLParam(clientPt.X, clientPt.Y);
             Win32.PostMessageW(hwnd, WM_MOUSEMOVE, (IntPtr)_heldMouseKeys, lParam);
             Win32.PostMessageW(hwnd, msg, (IntPtr)_heldMouseKeys, lParam);
+
+            IntPtr pointerWParam = (IntPtr)((1 /* POINTER_ID 1 */) | (1 << 16 /* NEW */) | (1 << 18 /* INCONTACT */) | (1 << 19 /* FIRSTBUTTON */) | (1 << 20 /* PRIMARY */));
+            Win32.PostMessageW(hwnd, WM_POINTERDOWN, pointerWParam, lParam);
         });
     }
 
@@ -814,17 +846,31 @@ public sealed class GhostDesktopInput : IDisposable
                 _dragHwnd = IntPtr.Zero;
             }
 
-            IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt);
-            if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
+            IntPtr hwnd;
+            POINT clientPt;
+
+            if (_capturedMouseHwnd != IntPtr.Zero && Win32.IsWindow(_capturedMouseHwnd))
             {
-                _lastTargetHwnd = hwnd;
-            }
-            else if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd))
-            {
-                hwnd = _lastTargetHwnd;
+                hwnd = _capturedMouseHwnd;
                 POINT pt = new POINT { X = desktopX, Y = desktopY };
                 Win32.ScreenToClient(hwnd, ref pt);
                 clientPt = pt;
+                _capturedMouseHwnd = IntPtr.Zero;
+            }
+            else
+            {
+                hwnd = GetWindowAtPoint(desktopX, desktopY, out clientPt);
+                if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
+                {
+                    _lastTargetHwnd = hwnd;
+                }
+                else if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd))
+                {
+                    hwnd = _lastTargetHwnd;
+                    POINT pt = new POINT { X = desktopX, Y = desktopY };
+                    Win32.ScreenToClient(hwnd, ref pt);
+                    clientPt = pt;
+                }
             }
 
             uint msg;
@@ -847,6 +893,9 @@ public sealed class GhostDesktopInput : IDisposable
 
             IntPtr lParam = MakeLParam(clientPt.X, clientPt.Y);
             Win32.PostMessageW(hwnd, msg, (IntPtr)_heldMouseKeys, lParam);
+
+            IntPtr pointerWParam = (IntPtr)((1 /* POINTER_ID 1 */) | (1 << 20 /* PRIMARY */));
+            Win32.PostMessageW(hwnd, WM_POINTERUP, pointerWParam, lParam);
         });
     }
 
@@ -1486,17 +1535,32 @@ public sealed class GhostDesktopInput : IDisposable
         if (Win32.SendMessageTimeoutW(hwnd, WM_NCHITTEST, IntPtr.Zero, lParam, 2 /* SMTO_ABORTIFHUNG */, 80, out IntPtr res) != IntPtr.Zero)
         {
             int h = res.ToInt32();
-            if (h != 0 && h != -1) return h;
+            if (h != 0 && h != -1)
+            {
+                // For custom-framed windows (Chrome, VS Code, modern apps) that return HTCLIENT for the entire window:
+                // If the hit is in the top caption band, treat it as non-client caption / window controls.
+                if (h == HTCLIENT && Win32.GetWindowRect(hwnd, out RECT rcc))
+                {
+                    if (screenY >= rcc.Top && screenY < rcc.Top + 34)
+                    {
+                        if (screenX >= rcc.Right - 46) return HTCLOSE;
+                        if (screenX >= rcc.Right - 92) return HTMAXBUTTON;
+                        if (screenX >= rcc.Right - 138) return HTMINBUTTON;
+                        return HTCAPTION;
+                    }
+                }
+                return h;
+            }
         }
 
         if (Win32.GetWindowRect(hwnd, out RECT rc))
         {
             if (screenX >= rc.Left && screenX < rc.Right &&
-                screenY >= rc.Top && screenY < rc.Top + 32)
+                screenY >= rc.Top && screenY < rc.Top + 34)
             {
-                if (screenX >= rc.Right - 36) return HTCLOSE;
-                if (screenX >= rc.Right - 72) return HTMAXBUTTON;
-                if (screenX >= rc.Right - 108) return HTMINBUTTON;
+                if (screenX >= rc.Right - 46) return HTCLOSE;
+                if (screenX >= rc.Right - 92) return HTMAXBUTTON;
+                if (screenX >= rc.Right - 138) return HTMINBUTTON;
                 return HTCAPTION;
             }
             return HTCLIENT;
@@ -1633,6 +1697,7 @@ public sealed class GhostDesktopInput : IDisposable
         {
             _isDraggingWindow = false;
             _dragHwnd = IntPtr.Zero;
+            _capturedMouseHwnd = IntPtr.Zero;
 
             if (_heldMouseKeys != 0)
             {
