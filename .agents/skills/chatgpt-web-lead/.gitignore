@@ -1,0 +1,4 @@
+__pycache__/
+*.log
+*.flag
+bridge_test_results.json

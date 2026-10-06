@@ -86,6 +86,8 @@ internal static class NativeMethods
     public const int SM_YVIRTUALSCREEN = 77;
     public const int SM_CXVIRTUALSCREEN = 78;
     public const int SM_CYVIRTUALSCREEN = 79;
+    public const int SM_CXDRAG = 68;
+    public const int SM_CYDRAG = 69;
 
     [DllImport("user32.dll")] internal static extern int GetSystemMetrics(int nIndex);
 
@@ -108,6 +110,9 @@ internal static class NativeMethods
     [DllImport("user32.dll")] internal static extern bool IsZoomed(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] internal static extern IntPtr GetDesktopWindow();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] internal static extern IntPtr FindWindowW(string? lpClassName, string? lpWindowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)] internal static extern IntPtr FindWindowExW(IntPtr hWndParent, IntPtr hWndChildAfter, string? lpszClass, string? lpszWindow);
     [DllImport("user32.dll")] internal static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern void SwitchToThisWindow(IntPtr hWnd, bool fUnknown);
     [DllImport("user32.dll")] internal static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
@@ -414,8 +419,10 @@ internal static class NativeMethods
 
     public const uint WM_NCHITTEST = 0x0084;
     public const int HTTRANSPARENT = -1;
+    public const uint WM_MOUSEMOVE = 0x0200;
     public const uint WM_LBUTTONDOWN = 0x0201;
     public const uint WM_LBUTTONUP = 0x0202;
+    public const uint WM_CAPTURECHANGED = 0x0215;
     public const uint WM_LBUTTONDBLCLK = 0x0203;
     public const uint WM_RBUTTONDOWN = 0x0204;
     public const uint WM_RBUTTONUP = 0x0205;
@@ -444,5 +451,18 @@ internal static class NativeMethods
 
     [DllImport("user32.dll")] internal static extern bool DestroyIcon(IntPtr hIcon);
     [DllImport("user32.dll")] internal static extern IntPtr LoadIconW(IntPtr hInstance, IntPtr lpIconName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] internal static extern IntPtr LoadCursorW(IntPtr hInstance, IntPtr lpCursorName);
+    [DllImport("user32.dll")] internal static extern IntPtr SetCursor(IntPtr hCursor);
+    [DllImport("user32.dll")] internal static extern IntPtr SetCapture(IntPtr hWnd);
+    [DllImport("user32.dll")] internal static extern IntPtr GetCapture();
+    [DllImport("user32.dll")] internal static extern bool ReleaseCapture();
+
+    public const uint WM_SETCURSOR = 0x0020;
     public static readonly IntPtr IDI_APPLICATION = new(32512);
+    public static readonly IntPtr IDC_ARROW = new(32512);
+    public static readonly IntPtr IDC_HAND = new(32649);
+    public static readonly IntPtr IDC_SIZEWE = new(32646);
+
+    [DllImport("user32.dll", EntryPoint = "SendMessageW")] internal static extern IntPtr SendMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")] internal static extern IntPtr GetClassLongPtrW(IntPtr hWnd, int nIndex);
 }

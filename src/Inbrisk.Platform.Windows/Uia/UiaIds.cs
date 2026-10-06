@@ -44,6 +44,8 @@ internal static class UiaIds
     public const int WindowOpenedEvent = 20016;
     public const int WindowClosedEvent = 20017;
     public const int AutomationPropertyChangedEvent = 20004;
+    public const int NotificationEvent = 20035;
+    public const int LiveRegionChangedEvent = 20024;
 
     /// <summary>Pattern id → advertised action names.</summary>
     internal static readonly (int Id, string Action)[] PatternActions =

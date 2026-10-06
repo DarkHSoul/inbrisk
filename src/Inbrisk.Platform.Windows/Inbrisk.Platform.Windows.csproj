@@ -11,6 +11,7 @@
   <ItemGroup>
     <ProjectReference Include="..\Inbrisk.Core\Inbrisk.Core.csproj" />
     <InternalsVisibleTo Include="Inbrisk.Tests" />
+    <InternalsVisibleTo Include="Inbrisk.Cli" />
   </ItemGroup>
 
   <ItemGroup>

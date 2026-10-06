@@ -3,31 +3,13 @@ using Inbrisk.Core;
 
 namespace Inbrisk.Runtime;
 
-public sealed record RecipeParameter(
-    string Name,
-    string? Description = null,
-    string? DefaultValue = null);
-
-public sealed record TaskRecipeDefinition(
-    string Name,
-    string? Description,
-    string? App,
-    IReadOnlyList<RecipeParameter> Parameters,
-    IReadOnlyList<string> Preconditions,
-    string StepsJson,
-    IReadOnlyList<string> Postconditions,
-    DateTimeOffset CreatedAt,
-    DateTimeOffset? LastRunAt = null,
-    int SuccessCount = 0,
-    int FailureCount = 0);
-
 /// <summary>
 /// Persists semantic UI automation task recipes (macros with semantic preconditions,
 /// parameterized inputs, and postcondition verification).
 /// Stored workflows can be replayed deterministically without requiring redundant
 /// LLM reasoning cycles unless a verification or UI layout change occurs.
 /// </summary>
-public sealed class TaskRecipeStore
+public sealed class TaskRecipeStore : ITaskRecipeStore
 {
     private readonly string _dir;
     private static readonly JsonSerializerOptions JsonOpts = new()

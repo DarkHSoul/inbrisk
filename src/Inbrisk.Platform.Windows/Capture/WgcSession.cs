@@ -68,6 +68,7 @@ internal sealed class WgcSession : ICaptureSession
         _session = _pool.CreateCaptureSession(item);
         _item.Closed += (_, _) => Stop();
         try { _session.IsCursorCaptureEnabled = false; } catch { /* older OS */ }
+        try { _session.GetType().GetProperty("IsBorderRequired")?.SetValue(_session, false); } catch { /* older OS */ }
         // belt & suspenders: item.Closed can be unreliable for HWND items —
         // poll the handle too so a destroyed window always ends the session
         if (target is CaptureTarget.Window wt)

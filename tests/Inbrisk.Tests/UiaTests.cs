@@ -4,11 +4,11 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
-[Collection("desktop")]
 public class UiaTests
 {
-    private readonly DesktopFixture _fx;
-    public UiaTests(DesktopFixture fx) => _fx = fx;
+    private static readonly Lazy<DesktopFixture> _fxLazy = new(() => new DesktopFixture());
+    private DesktopFixture _fx => _fxLazy.Value;
+    public UiaTests() { }
 
     [Fact]
     public void Inspect_ReturnsPrunedTree_WithKnownControls()

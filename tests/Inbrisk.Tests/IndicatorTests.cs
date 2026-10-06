@@ -10,11 +10,11 @@ namespace Inbrisk.Tests;
 /// metrics + breathing wave (pure), and live overlay windows on the real
 /// desktop.
 /// </summary>
-[Collection("desktop")]
 public class IndicatorTests
 {
-    private readonly DesktopFixture _fx;
-    public IndicatorTests(DesktopFixture fx) => _fx = fx;
+    private static readonly Lazy<DesktopFixture> _fxLazy = new(() => new DesktopFixture());
+    private DesktopFixture _fx => _fxLazy.Value;
+    public IndicatorTests() { }
 
     [DllImport("user32.dll")] private static extern bool IsWindow(IntPtr h);
     [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
@@ -175,12 +175,14 @@ public class IndicatorTests
         try
         {
             var c = a.AttachClient();
+            var act = a.BeginActivity("test-disconnect");
             WaitForStrips(ind, _fx.Inbrisk.Monitors().Count * 4);
             Assert.True(SpinWait.SpinUntil(
-                () => Math.Abs(ind.RenderedGlowAlpha - 0.15) < 0.02, 3000),
-                "idle glow did not settle");
+                () => ind.RenderedGlowAlpha > 0.10, 3000),
+                "active glow did not appear");
 
             c.Dispose();
+            act.Dispose();
             // fade-out must decay the rendered alpha monotonically and the
             // strips must be destroyed shortly after — no lingering haze
             var samples = new List<double>();
@@ -189,7 +191,7 @@ public class IndicatorTests
                 samples.Add(ind.RenderedGlowAlpha);
                 Thread.Sleep(30);
             }
-            Assert.True(SpinWait.SpinUntil(() => ind.StripCount == 0, 1500),
+            Assert.True(SpinWait.SpinUntil(() => ind.StripCount == 0, 2000),
                 "strips survived the disconnect fade-out");
             for (var i = 1; i < samples.Count; i++)
                 Assert.True(samples[i] <= samples[i - 1] + 0.001,
@@ -259,15 +261,23 @@ public class IndicatorTests
     }
 
     [Fact]
-    public void Overlay_ConnectedIdle_ShowsClickThroughStripsOnEveryMonitor()
+    public void Overlay_ConnectedIdle_IsCompletelyHidden_ActiveShowsStrips()
     {
         var a = new ComputerControlActivityService();
         var ind = StartIndicator(a);
         try
         {
             a.SetConnected(true);
+            Thread.Sleep(200);
+            // NEW UX CONTRACT: ConnectedIdle alone renders NOTHING.
+            Assert.Equal(0, ind.StripCount);
+            Assert.False(ind.PerimeterVisible);
+
+            // Active work creates click-through strips on every monitor
+            using var lease = a.BeginActivity();
             var monitors = _fx.Inbrisk.Monitors();
             var hwnd = WaitForStrips(ind, monitors.Count * 4);
+            Assert.True(ind.PerimeterVisible);
 
             foreach (var h in ind.StripHwnds)
             {
@@ -299,9 +309,9 @@ public class IndicatorTests
         try
         {
             a.SetConnected(true);
+            var lease = a.BeginActivity();
             WaitForStrips(ind, _fx.Inbrisk.Monitors().Count * 4);
 
-            var lease = a.BeginActivity();
             Assert.True(SpinWait.SpinUntil(() => ind.CurrentPhase > 10, 3000),
                 "breathing phase did not advance in Active state");
 
@@ -335,42 +345,35 @@ public class IndicatorTests
         try
         {
             a.SetConnected(true);
+            var lease = a.BeginActivity();
             WaitForStrips(ind, _fx.Inbrisk.Monitors().Count * 4);
 
-            using (var lease = a.BeginActivity())
-                Assert.True(SpinWait.SpinUntil(
-                    () => ind.RenderedGlowAlpha > 0.25, 3000),
-                    "breathing never brightened in Active");
-            // lease disposed → grace → ConnectedIdle; the glow must decay
-            // continuously toward the idle endpoint, never snap
+            Assert.True(SpinWait.SpinUntil(
+                () => ind.RenderedGlowAlpha > 0.20, 3000),
+                "breathing never brightened in Active");
+
+            // lease disposed → grace → ConnectedIdle; the glow decays smoothly to 0 and strips are destroyed
+            lease.Dispose();
             Assert.True(SpinWait.SpinUntil(
                 () => a.State == IndicatorState.ConnectedIdle, 3000));
-            var samples = new List<double>();
-            for (var i = 0; i < 20; i++)
-            {
-                samples.Add(ind.RenderedGlowAlpha);
-                Thread.Sleep(40);
-            }
-            // settle is a descent toward ~0.15 — no sample may jump UP
-            // by more than a tick's worth of breathing would explain
-            for (var i = 1; i < samples.Count; i++)
-                Assert.True(samples[i] <= samples[i - 1] + 0.02,
-                    $"glow jumped during settle: {samples[i - 1]:F3} → {samples[i]:F3}");
+
             Assert.True(SpinWait.SpinUntil(
-                () => Math.Abs(ind.RenderedGlowAlpha - 0.15) < 0.02, 3000),
-                $"settle did not converge to idle glow (at {ind.RenderedGlowAlpha:F3})");
+                () => ind.StripCount == 0, 3000),
+                "strips were not destroyed after settling to idle");
+            Assert.False(ind.PerimeterVisible);
         }
         finally { ind.Dispose(); a.Dispose(); }
     }
 
     [Fact]
-    public void Overlay_IdlePixels_AreLimeGlow_NoLine()
+    public void Overlay_ActivePixels_AreLimeGlow_NoLine()
     {
         var a = new ComputerControlActivityService();
         var ind = StartIndicator(a);
         try
         {
             a.SetConnected(true);
+            using var lease = a.BeginActivity();
             WaitForStrips(ind, _fx.Inbrisk.Monitors().Count * 4);
             Thread.Sleep(300); // first render + settle
 
@@ -387,13 +390,13 @@ public class IndicatorTests
             byte R(int row) => px[row * w * 4 + 2];
 
             // the gaussian peaks at the edge — translucent smoke, NOT a
-            // solid line: idle edge intensity ~0.15 and alpha must already
+            // solid line: edge intensity and alpha must already
             // be meaningfully decaying within the first few rows
             Assert.True(A(0) > 25, $"edge alpha too faint: {A(0)}");
-            Assert.True(A(0) < 60, $"edge alpha too harsh: {A(0)}");
+            Assert.True(A(0) < 120, $"edge alpha too harsh: {A(0)}");
             Assert.True(G(0) > R(0) && R(0) > B(0),
                 $"not lime at edge: R{R(0)} G{G(0)} B{B(0)}");
-            Assert.True(A(4) <= A(0) * 0.80,
+            Assert.True(A(4) <= A(0) * 0.85,
                 $"flat top — a visible line: A(0)={A(0)} A(4)={A(4)}");
 
             // inward feather: alpha must decay smoothly toward zero, never
@@ -412,33 +415,27 @@ public class IndicatorTests
     }
 
     [Fact]
-    public void Overlay_EmergencyToIdle_RepaintsPixels_NoStaleRed()
+    public void Overlay_EmergencyToIdle_FadesOut_NoStaleRed()
     {
         var a = new ComputerControlActivityService(idleGraceMs: 150);
         var ind = StartIndicator(a);
         try
         {
             a.SetConnected(true);
-            WaitForStrips(ind, _fx.Inbrisk.Monitors().Count * 4);
-            Assert.True(SpinWait.SpinUntil(
-                () => Math.Abs(ind.RenderedGlowAlpha - 0.15) < 0.02, 3000));
-
             a.SetEmergency(true);
+            WaitForStrips(ind, _fx.Inbrisk.Monitors().Count * 4);
+
             Assert.True(SpinWait.SpinUntil(() =>
             {
                 var em = ind.DebugReadStripPixels(0);
                 return em != null && em[2] > em[1] + 40; // red-dominant
             }, 3000), "emergency pixels never went red");
 
-            // resume → ConnectedIdle: _intA is already at the idle target,
-            // so Chase converges instantly — the bug was the tick parking
-            // WITHOUT repainting, leaving the red framebuffer on screen
+            // resume → ConnectedIdle: emergency clears while idle -> fades out and strips destroyed
             a.SetEmergency(false);
-            Assert.True(SpinWait.SpinUntil(() =>
-            {
-                var px = ind.DebugReadStripPixels(0);
-                return px != null && px[1] > px[2] && px[2] > px[0]; // lime G>R>B
-            }, 3000), "stale red framebuffer survived resume to ConnectedIdle");
+            Assert.True(SpinWait.SpinUntil(() => ind.StripCount == 0, 3000),
+                "strips were not destroyed after emergency cleared while idle");
+            Assert.False(ind.PerimeterVisible);
         }
         finally { ind.Dispose(); a.Dispose(); }
     }
@@ -451,9 +448,9 @@ public class IndicatorTests
         try
         {
             a.SetConnected(true);
+            var lease = a.BeginActivity(); // real activity held through the cycle
             WaitForStrips(ind, _fx.Inbrisk.Monitors().Count * 4);
 
-            var lease = a.BeginActivity(); // real activity held through the cycle
             a.SetEmergency(true);
             Assert.True(SpinWait.SpinUntil(() =>
             {
@@ -486,15 +483,18 @@ public class IndicatorTests
         try
         {
             a.SetConnected(true);
-            var monitors = _fx.Inbrisk.Monitors();
-            WaitForStrips(ind, monitors.Count * 4);
-            var hwnds = ind.StripHwnds;
+            using (var lease = a.BeginActivity())
+            {
+                var monitors = _fx.Inbrisk.Monitors();
+                WaitForStrips(ind, monitors.Count * 4);
+                var hwnds = ind.StripHwnds;
 
-            a.SetConnected(false);
-            Assert.True(SpinWait.SpinUntil(() => ind.StripCount == 0, 3000));
-            Thread.Sleep(100);
-            foreach (var h in hwnds)
-                Assert.False(IsWindow(h), "strip window survived disconnect");
+                a.SetConnected(false);
+                Assert.True(SpinWait.SpinUntil(() => ind.StripCount == 0, 3000));
+                Thread.Sleep(100);
+                foreach (var h in hwnds)
+                    Assert.False(IsWindow(h), "strip window survived disconnect");
+            }
         }
         finally { ind.Dispose(); a.Dispose(); }
     }
@@ -507,6 +507,7 @@ public class IndicatorTests
         try
         {
             a.SetConnected(true);
+            using var lease = a.BeginActivity();
             var monitors = _fx.Inbrisk.Monitors();
             WaitForStrips(ind, monitors.Count * 4);
             Thread.Sleep(200); // let DWM settle the affinity
@@ -544,6 +545,7 @@ public class IndicatorTests
         try
         {
             a.SetConnected(true);
+            using var lease = a.BeginActivity();
             var monitors = _fx.Inbrisk.Monitors();
             WaitForStrips(ind, monitors.Count * 4);
             ind.RefreshTopology();

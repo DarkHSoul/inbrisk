@@ -38,12 +38,15 @@ public sealed class UserSettings
     public bool StartMinimized { get; set; } = true;
     /// <summary>Floating HUD always visible (shows Standby when idle vs only appearing during active actions).</summary>
     public bool HudAlwaysVisible { get; set; } = true;
+    /// <summary>Dock gap in DIPs between the pill's right edge and the system tray's left edge.
+    /// -1 = auto (default snug dock). Set by dragging the pill along the taskbar.</summary>
+    public int HudDockGapDip { get; set; } = -1;
     /// <summary>Default MCP output verbosity: "slim" | "full". Null = full.
     /// "slim" compacts the heavy tool results (find/observe/run/capabilities)
     /// for small-context models; any tool call can override with detail.</summary>
-    public string? OutputDetail { get; set; }
-    /// <summary>Tool profile: "full" (all tools) | "core" (streamlined essential tools for fast reasoning). Default "full".</summary>
-    public string? ToolProfile { get; set; }
+    public string? OutputDetail { get; set; } = "slim";
+    /// <summary>Tool profile: "core" (streamlined essential tools for fast reasoning) | "full" (all tools). Default "core".</summary>
+    public string? ToolProfile { get; set; } = "core";
     /// <summary>
     /// Processes protected from AI close/kill/termination actions.
     /// Immutable to AI; only editable by the human user via settings.
@@ -84,47 +87,149 @@ public sealed class UserSettings
             "inbrisk");
 
     private static UserSettings? _cachedSettings;
+    private static string? _cachedPath;
     private static DateTime _cacheTimestamp = DateTime.MinValue;
     private static readonly object _cacheGate = new();
+    private static FileSystemWatcher? _watcher;
+    private static readonly object _watcherGate = new();
 
-    public static UserSettings LoadCached(TimeSpan? ttl = null)
+    public static void InvalidateCache()
     {
-        var effTtl = ttl ?? TimeSpan.FromSeconds(2);
-        var now = DateTime.UtcNow;
         lock (_cacheGate)
         {
-            if (_cachedSettings != null && (now - _cacheTimestamp) < effTtl)
+            _cachedSettings = null;
+            _cachedPath = null;
+            _cacheTimestamp = DateTime.MinValue;
+        }
+    }
+
+    public static void EnsureWatcher(string? dir = null, string? fileName = null)
+    {
+        lock (_watcherGate)
+        {
+            if (_watcher != null) return;
+            try
+            {
+                var targetDir = dir ?? DataDir;
+                if (!Directory.Exists(targetDir))
+                    Directory.CreateDirectory(targetDir);
+
+                var targetFile = fileName ?? Path.GetFileName(SettingsPath);
+                var watcher = new FileSystemWatcher(targetDir, targetFile)
+                {
+                    NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.CreationTime,
+                    EnableRaisingEvents = true
+                };
+
+                FileSystemEventHandler handler = (s, e) => InvalidateCache();
+                RenamedEventHandler renamedHandler = (s, e) => InvalidateCache();
+
+                watcher.Changed += handler;
+                watcher.Created += handler;
+                watcher.Deleted += handler;
+                watcher.Renamed += renamedHandler;
+
+                _watcher = watcher;
+            }
+            catch
+            {
+                // FileSystemWatcher is best-effort; 2s safety TTL serves as backup
+            }
+        }
+    }
+
+    public static void DisposeWatcher()
+    {
+        lock (_watcherGate)
+        {
+            if (_watcher != null)
+            {
+                _watcher.EnableRaisingEvents = false;
+                _watcher.Dispose();
+                _watcher = null;
+            }
+        }
+    }
+
+    public static bool TryLoad(string? path, out UserSettings settings)
+    {
+        try
+        {
+            var targetPath = path ?? SettingsPath;
+            if (!File.Exists(targetPath))
+            {
+                settings = new UserSettings();
+                return true;
+            }
+            var text = File.ReadAllText(targetPath);
+            var parsed = JsonSerializer.Deserialize<UserSettings>(text);
+            if (parsed != null)
+            {
+                settings = parsed;
+                return true;
+            }
+        }
+        catch
+        {
+            // Transient error (e.g. file lock or partial write)
+        }
+        settings = new UserSettings();
+        return false;
+    }
+
+    public static UserSettings LoadCached(TimeSpan? ttl = null, string? explicitPath = null)
+    {
+        EnsureWatcher();
+        var effTtl = ttl ?? TimeSpan.FromSeconds(2);
+        var now = DateTime.UtcNow;
+        var targetPath = explicitPath ?? SettingsPath;
+        lock (_cacheGate)
+        {
+            if (_cachedSettings != null && string.Equals(_cachedPath, targetPath, StringComparison.OrdinalIgnoreCase) && (now - _cacheTimestamp) < effTtl)
                 return _cachedSettings;
 
-            _cachedSettings = Load();
+            if (TryLoad(explicitPath, out var loaded))
+            {
+                _cachedSettings = loaded;
+                _cachedPath = targetPath;
+                _cacheTimestamp = now;
+                return _cachedSettings;
+            }
+
+            // Transient failure: if we already have cached settings for this path, keep them to avoid poisoning
+            if (_cachedSettings != null && string.Equals(_cachedPath, targetPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return _cachedSettings;
+            }
+
+            _cachedSettings = loaded;
+            _cachedPath = targetPath;
             _cacheTimestamp = now;
             return _cachedSettings;
         }
     }
 
-    public static UserSettings Load()
+    public static UserSettings Load(string? path = null)
     {
-        try
-        {
-            if (!File.Exists(SettingsPath)) return new UserSettings();
-            return JsonSerializer.Deserialize<UserSettings>(
-                File.ReadAllText(SettingsPath)) ?? new UserSettings();
-        }
-        catch { return new UserSettings(); }
+        TryLoad(path, out var s);
+        return s;
     }
 
-    public void Save()
+    public void Save(string? path = null)
     {
         try
         {
-            Directory.CreateDirectory(DataDir);
-            var tmp = SettingsPath + ".tmp";
+            var targetPath = path ?? SettingsPath;
+            var dir = Path.GetDirectoryName(targetPath) ?? DataDir;
+            Directory.CreateDirectory(dir);
+            var tmp = targetPath + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(this,
                 new JsonSerializerOptions { WriteIndented = true }));
-            File.Move(tmp, SettingsPath, overwrite: true);
+            File.Move(tmp, targetPath, overwrite: true);
             lock (_cacheGate)
             {
                 _cachedSettings = this;
+                _cachedPath = targetPath;
                 _cacheTimestamp = DateTime.UtcNow;
             }
         }

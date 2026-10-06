@@ -32,7 +32,7 @@ public sealed class UiaDispatcher : IDisposable
     public long CurrentGeneration => Volatile.Read(ref _generation);
     public int QueuedCount => _queue.Count;
 
-    public T Run<T>(Func<IUIAutomation, T> fn, int? timeoutMs = null,
+    public async Task<T> RunAsync<T>(Func<IUIAutomation, T> fn, int? timeoutMs = null,
         CancellationToken ct = default, string? intentName = null)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -56,9 +56,8 @@ public sealed class UiaDispatcher : IDisposable
 
         try
         {
-            return (T)tcs.Task
-                .WaitAsync(TimeSpan.FromMilliseconds(timeout), ct)
-                .GetAwaiter().GetResult()!;
+            var res = await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(timeout), ct).ConfigureAwait(false);
+            return (T)res!;
         }
         catch (TimeoutException)
         {
@@ -67,6 +66,10 @@ public sealed class UiaDispatcher : IDisposable
                 $"UIA call timed out after {timeout}ms (target app unresponsive?)");
         }
     }
+
+    public T Run<T>(Func<IUIAutomation, T> fn, int? timeoutMs = null,
+        CancellationToken ct = default, string? intentName = null) =>
+        RunAsync(fn, timeoutMs, ct, intentName).GetAwaiter().GetResult();
 
     /// <summary>Fire-and-forget variant that still respects the dispatch thread.</summary>
     public void Run(Action<IUIAutomation> fn, int? timeoutMs = null,

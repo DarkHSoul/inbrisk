@@ -187,6 +187,8 @@ public sealed class ScreenIndicatorService : IDisposable
     public bool CaptureExclusionSupported { get; private set; } = true;
     public bool Enabled => _enabled;
     public int StripCount { get { lock (_strips) return _strips.Count; } }
+    /// <summary>Perimeter wall visibility condition: strictly active work or emergency stop with live strips.</summary>
+    public bool PerimeterVisible { get { lock (_strips) return _strips.Count > 0 && (_state is IndicatorState.Active or IndicatorState.EmergencyStopped); } }
 
     private readonly GlowPalette _palette;
 
@@ -220,9 +222,12 @@ public sealed class ScreenIndicatorService : IDisposable
     /// <summary>Enable or disable perimeter indicator rendering.</summary>
     public void SetEnabled(bool enabled)
     {
+        var was = _enabled;
         _enabled = enabled;
         if (!enabled)
             SetState(IndicatorState.Disconnected);
+        else if (!was && _thread == null)
+            Start();
     }
 
     /// <summary>Blocks until the pump finished the first topology build —
@@ -305,14 +310,10 @@ public sealed class ScreenIndicatorService : IDisposable
                 ActRadLo + (ActRadHi - ActRadLo) * v,
                 ChaseUp);
         }
-        else if (_state == IndicatorState.ConnectedIdle)
+        else if (_state is IndicatorState.ConnectedIdle or IndicatorState.Disconnected)
         {
-            moving = Chase(IdleIntA, IdleRadK, ChaseDown);
-        }
-        else if (_state == IndicatorState.Disconnected)
-        {
-            // fade-out ticks: decay the rendered alpha to zero keeping the
-            // last-shown palette, then tear the strips down and park
+            // ConnectedIdle & Disconnected: NO ACTIVE WORK = NO PERIMETER WALL.
+            // Decay rendered alpha to zero and destroy strips.
             moving = Chase(0.0, _radK, FadeOut);
             if (_dirty)
             {
@@ -333,11 +334,6 @@ public sealed class ScreenIndicatorService : IDisposable
             RenderAll(emergency: false);
             _dirty = false;
         }
-
-        // parked? once the settle has converged there is nothing left to
-        // animate — stop the tick until the next state message wakes it
-        if (_state == IndicatorState.ConnectedIdle && !moving)
-            _animTimer?.Change(Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>Step the rendered values toward the target. Returns false
@@ -361,14 +357,14 @@ public sealed class ScreenIndicatorService : IDisposable
     /// the desired state.</summary>
     private void ApplyState()
     {
-        if (_state == IndicatorState.Disconnected)
+        if (_state is IndicatorState.Disconnected or IndicatorState.ConnectedIdle)
         {
             if (_strips.Count == 0)
             {
                 _animTimer?.Change(Timeout.Infinite, Timeout.Infinite);
                 return;
             }
-            // short clean fade-out (~250ms): keep the palette the user is
+            // short clean fade-out (~250-500ms): keep the palette the user is
             // seeing (emergency red fades as red, lime as lime) and start
             // the chase from the actually-rendered intensity
             if (_emergencyRendered) _intA = EmIntA;
@@ -387,17 +383,7 @@ public sealed class ScreenIndicatorService : IDisposable
             return;
         }
 
-        // Active and ConnectedIdle both render through the chase model —
-        // the tick loop wakes (or keeps running) and the current visual
-        // state glides into whatever the new target is.
-        //
-        // INVARIANT: a logical state transition is itself a render input —
-        // color, emergency semantics and animation mode can change even
-        // when the interpolated numeric values happen to already sit on
-        // their new target (e.g. EmergencyStopped → ConnectedIdle leaves
-        // _intA at the idle value, so Chase converges instantly). Without
-        // this the first tick would park with the previous state's pixels
-        // still on screen — the stale-red-frame bug.
+        // Active renders through the chase model — the tick loop wakes (or keeps running)
         _lastTick = Environment.TickCount64;
         _dirty = true;
         _animTimer?.Change(0, _animFrameMs);
@@ -410,7 +396,7 @@ public sealed class ScreenIndicatorService : IDisposable
         if (!force && SameTopology(monitors)) return;
         _monitors = monitors;
         DestroyStrips();
-        if (_state == IndicatorState.Disconnected) return;
+        if (_state is IndicatorState.Disconnected or IndicatorState.ConnectedIdle) return;
 
         foreach (var m in _monitors)
         {

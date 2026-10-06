@@ -28,6 +28,12 @@ public sealed class ElementRegistry
 
     public UiElement? Get(string id) => _elements.TryGetValue(id, out var e) ? e : null;
 
+    public UiElement? FindByName(string name, Role? role = null)
+        => _elements.Values.FirstOrDefault(e =>
+            (string.Equals(e.Name, name, StringComparison.OrdinalIgnoreCase) ||
+             string.Equals(e.Id, name, StringComparison.OrdinalIgnoreCase)) &&
+            (role == null || e.Role == role));
+
     /// <summary>Ensure the element is still usable; re-resolve once if stale.
     /// An id unknown to this process is looked up in the recipe store —
     /// ids minted by a previous one-shot process (e.g. `inbrisk find`)

@@ -1,0 +1,13 @@
+[package]
+name = "inbrisk-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+inbrisk-core.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

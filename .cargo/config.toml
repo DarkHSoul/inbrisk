@@ -1,0 +1,2 @@
+[target.'cfg(windows)']
+runner = "python C:/Users/Ahmet/Documents/inbrisk/.cargo/test_runner.py"

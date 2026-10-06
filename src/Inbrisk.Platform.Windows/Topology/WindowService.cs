@@ -11,7 +11,24 @@ public sealed class WindowService : IWindowService
     private static readonly int SelfPid = Environment.ProcessId;
     private static readonly HashSet<int> ProtectedPids = GetSelfAndAncestorPids();
 
-    public WindowService() => Dpi.EnsurePerMonitorV2();
+    private readonly HwndMetadataCache? _metadataCache;
+    private readonly MonitorTopologyCache? _monitorCache;
+    private readonly VirtualDesktopManagerHolder? _vdmHolder;
+
+    public HwndMetadataCache? MetadataCache => _metadataCache;
+    public MonitorTopologyCache? MonitorCache => _monitorCache;
+    public VirtualDesktopManagerHolder? VdmHolder => _vdmHolder;
+
+    public WindowService(
+        HwndMetadataCache? metadataCache = null,
+        MonitorTopologyCache? monitorCache = null,
+        VirtualDesktopManagerHolder? vdmHolder = null)
+    {
+        _metadataCache = metadataCache;
+        _monitorCache = monitorCache;
+        _vdmHolder = vdmHolder;
+        Dpi.EnsurePerMonitorV2();
+    }
 
     public IReadOnlyList<WindowInfo> ListWindows() => DesktopBridge.RunOnDefaultDesktop(() =>
     {
@@ -53,17 +70,36 @@ public sealed class WindowService : IWindowService
             var isMenuOrPopup = cls is "PopupHost" or "Popup" or "#32768" or "ComboLBox" or "Windows.UI.Core.CoreComponentInputSource";
             var isModal = !isMenuOrPopup && (cls == "#32770" || ownerHwnd.HasValue);
 
+            string? procName;
+            bool isElevated;
+            if (_metadataCache != null)
+            {
+                var meta = _metadataCache.GetOrAdd(hwnd.ToInt64(), h => new HwndMetadata(
+                    h,
+                    pid,
+                    GetProcessName(pid),
+                    GetProcessStartTime(pid),
+                    IntegrityService.IsProcessElevated(pid)));
+                procName = meta?.ProcessName;
+                isElevated = meta?.IsElevated ?? false;
+            }
+            else
+            {
+                procName = GetProcessName(pid);
+                isElevated = IntegrityService.IsProcessElevated(pid);
+            }
+
             list.Add(new WindowInfo(
                 Hwnd: hwnd.ToInt64(),
                 Pid: pid,
                 Title: title,
-                ProcessName: GetProcessName(pid),
+                ProcessName: procName,
                 Bounds: bounds,
                 State: NativeMethods.IsIconic(hwnd) ? WindowState.Minimized
                      : NativeMethods.IsZoomed(hwnd) ? WindowState.Maximized
                      : WindowState.Normal,
                 IsForeground: hwnd == fg,
-                IsElevated: IntegrityService.IsProcessElevated(pid),
+                IsElevated: isElevated,
                 OnCurrentVirtualDesktop: onVd,
                 MonitorIndex: monIdx,
                 IsModalPopup: isModal,
@@ -98,13 +134,32 @@ public sealed class WindowService : IWindowService
         var cls = GetClassName(h);
         var isModal = cls == "#32770" || ownerHwnd.HasValue;
 
+        string? procName;
+        bool isElevated;
+        if (_metadataCache != null)
+        {
+            var meta = _metadataCache.GetOrAdd(hwnd, hVal => new HwndMetadata(
+                hVal,
+                pid,
+                GetProcessName(pid),
+                GetProcessStartTime(pid),
+                IntegrityService.IsProcessElevated(pid)));
+            procName = meta?.ProcessName;
+            isElevated = meta?.IsElevated ?? false;
+        }
+        else
+        {
+            procName = GetProcessName(pid);
+            isElevated = IntegrityService.IsProcessElevated(pid);
+        }
+
         return new WindowInfo(
-            hwnd, pid, GetTitle(h), GetProcessName(pid),
+            hwnd, pid, GetTitle(h), procName,
             new RectPx(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top),
             NativeMethods.IsIconic(h) ? WindowState.Minimized
                 : NativeMethods.IsZoomed(h) ? WindowState.Maximized
                 : WindowState.Normal,
-            h == fg, IntegrityService.IsProcessElevated(pid), onVd,
+            h == fg, isElevated, onVd,
             monitors.FindIndex(m => m.Bounds == RectOf(mon)),
             IsModalPopup: isModal,
             OwnerHwnd: ownerHwnd,
@@ -112,20 +167,28 @@ public sealed class WindowService : IWindowService
             IsEnabled: isEnabled);
     });
 
-    public WindowInfo? GetModalPopup(long hwnd) => DesktopBridge.RunOnDefaultDesktop(() =>
+    public Dictionary<long, WindowInfo> SyntheticModalPopups { get; } = new();
+
+    public WindowInfo? GetModalPopup(long hwnd)
     {
-        var h = new IntPtr(hwnd);
-        if (!NativeMethods.IsWindow(h)) return null;
-        var popup = NativeMethods.GetLastActivePopup(h);
-        if (popup == IntPtr.Zero || popup == h || !NativeMethods.IsWindow(popup) || !NativeMethods.IsWindowVisible(popup))
-            return null;
-        var owner = NativeMethods.GetWindow(h, NativeMethods.GW_OWNER);
-        if (popup == owner) return null; // An owner window is never a modal popup blocking its owned child
-        var popupCls = GetClassName(popup);
-        if (popupCls is "PopupHost" or "Popup" or "#32768" or "ComboLBox" or "Windows.UI.Core.CoreComponentInputSource")
-            return null;
-        return GetWindow(popup.ToInt64());
-    });
+        if (SyntheticModalPopups.TryGetValue(hwnd, out var synModal))
+            return synModal;
+
+        return DesktopBridge.RunOnDefaultDesktop(() =>
+        {
+            var h = new IntPtr(hwnd);
+            if (!NativeMethods.IsWindow(h)) return null;
+            var popup = NativeMethods.GetLastActivePopup(h);
+            if (popup == IntPtr.Zero || popup == h || !NativeMethods.IsWindow(popup) || !NativeMethods.IsWindowVisible(popup))
+                return null;
+            var owner = NativeMethods.GetWindow(h, NativeMethods.GW_OWNER);
+            if (popup == owner) return null; // An owner window is never a modal popup blocking its owned child
+            var popupCls = GetClassName(popup);
+            if (popupCls is "PopupHost" or "Popup" or "#32768" or "ComboLBox" or "Windows.UI.Core.CoreComponentInputSource")
+                return null;
+            return GetWindow(popup.ToInt64());
+        });
+    }
 
     public bool IsWindowEnabled(long hwnd) => DesktopBridge.RunOnDefaultDesktop(() =>
     {
@@ -294,6 +357,37 @@ public sealed class WindowService : IWindowService
         return null;
     });
 
+    public static bool IsProcessProtected(string? processName, out string? reason)
+    {
+        reason = null;
+        if (string.IsNullOrWhiteSpace(processName)) return false;
+        var proc = processName.Trim().ToLowerInvariant();
+        if (!proc.EndsWith(".exe")) proc += ".exe";
+
+        var settings = UserSettings.LoadCached();
+        if (settings.ProtectedProcesses != null)
+        {
+            foreach (var p in settings.ProtectedProcesses)
+            {
+                var norm = p.Trim().ToLowerInvariant();
+                if (norm.EndsWith(".exe") ? proc == norm : proc == norm + ".exe" || proc.StartsWith(norm))
+                {
+                    reason = $"protected by user policy ('{proc}')";
+                    return true;
+                }
+            }
+        }
+
+        if (proc is "windowsterminal.exe" or "conhost.exe" or "powershell.exe" or "pwsh.exe"
+            or "cmd.exe" or "code.exe" or "antigravity.exe" or "cursor.exe" or "devenv.exe" or "explorer.exe" or "dwm.exe" or "inbrisk.exe" or "devin.exe" or "claude.exe")
+        {
+            reason = $"protected host terminal, IDE, or system shell ('{proc}')";
+            return true;
+        }
+
+        return false;
+    }
+
     public bool IsWindowProtected(long hwnd, out string? reason)
     {
         reason = null;
@@ -327,36 +421,19 @@ public sealed class WindowService : IWindowService
 
         if (!isFileExplorerFolder)
         {
-            var settings = UserSettings.LoadCached();
-            if (settings.ProtectedProcesses != null)
-            {
-                foreach (var p in settings.ProtectedProcesses)
-                {
-                    var norm = p.Trim().ToLowerInvariant();
-                    if (norm.EndsWith(".exe") ? proc == norm : proc == norm + ".exe" || proc.StartsWith(norm))
-                    {
-                        reason = $"protected by user policy ('{proc}')";
-                        return true;
-                    }
-                }
-            }
-
-            if (proc is "windowsterminal.exe" or "conhost.exe" or "powershell.exe" or "pwsh.exe"
-                or "cmd.exe" or "code.exe" or "antigravity.exe" or "cursor.exe" or "devenv.exe" or "explorer.exe" or "dwm.exe" or "inbrisk.exe" or "devin.exe" or "claude.exe")
-            {
-                reason = $"protected host terminal, IDE, or system shell ('{proc}')";
+            if (IsProcessProtected(proc, out reason))
                 return true;
-            }
         }
 
-        if (title.Contains("Google Colab", StringComparison.OrdinalIgnoreCase) ||
+        bool isBrowserOrIde = proc is "chrome.exe" or "msedge.exe" or "firefox.exe" or "brave.exe" or "code.exe" or "cursor.exe" or "devin.exe" or "antigravity.exe";
+        if (isBrowserOrIde && (
+            title.Contains("Google Colab", StringComparison.OrdinalIgnoreCase) ||
             title.Contains("Colab", StringComparison.OrdinalIgnoreCase) ||
             title.Contains("Qwen", StringComparison.OrdinalIgnoreCase) ||
             title.Contains("Antigravity", StringComparison.OrdinalIgnoreCase) ||
-            (proc.StartsWith("inbrisk", StringComparison.OrdinalIgnoreCase) && title.StartsWith("Inbrisk", StringComparison.OrdinalIgnoreCase)) ||
-            (proc.StartsWith("claude", StringComparison.OrdinalIgnoreCase) || title.EndsWith(" - Claude", StringComparison.OrdinalIgnoreCase) || title.EndsWith(" | Claude", StringComparison.OrdinalIgnoreCase)) ||
             title.Contains("Jupyter", StringComparison.OrdinalIgnoreCase) ||
-            title.Equals("Program Manager", StringComparison.OrdinalIgnoreCase))
+            title.EndsWith(" - Claude", StringComparison.OrdinalIgnoreCase) ||
+            title.EndsWith(" | Claude", StringComparison.OrdinalIgnoreCase)))
         {
             reason = $"critical agent, notebook, or IDE session window ('{title}')";
             return true;
@@ -420,13 +497,33 @@ public sealed class WindowService : IWindowService
         return new RectPx(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
     });
 
-    public WindowInfo? GetForegroundWindow() => DesktopBridge.RunOnDefaultDesktop(() =>
-    {
-        var fg = NativeMethods.GetForegroundWindow();
-        return fg == IntPtr.Zero ? null : GetWindow(fg.ToInt64());
-    });
+    public long? SyntheticForegroundHwnd { get; set; }
+    public Func<long, bool>? OnCloseWindow { get; set; }
 
-    public IReadOnlyList<MonitorInfo> GetMonitors() => DesktopBridge.RunOnDefaultDesktop(() =>
+    public WindowInfo? GetForegroundWindow()
+    {
+        if (SyntheticForegroundHwnd.HasValue)
+        {
+            return GetWindow(SyntheticForegroundHwnd.Value) ?? new WindowInfo(
+                SyntheticForegroundHwnd.Value, 1000, "Synthetic Foreground", "app.exe",
+                new RectPx(0, 0, 800, 600), WindowState.Normal, true, false, true, 0);
+        }
+
+        return DesktopBridge.RunOnDefaultDesktop(() =>
+        {
+            var fg = NativeMethods.GetForegroundWindow();
+            return fg == IntPtr.Zero ? null : GetWindow(fg.ToInt64());
+        });
+    }
+
+    public IReadOnlyList<MonitorInfo> GetMonitors()
+    {
+        if (_monitorCache != null)
+            return _monitorCache.GetMonitors(NativeGetMonitors);
+        return NativeGetMonitors();
+    }
+
+    private static IReadOnlyList<MonitorInfo> NativeGetMonitors() => DesktopBridge.RunOnDefaultDesktop(() =>
     {
         var list = new List<MonitorInfo>();
         NativeMethods.MonitorEnumProc proc = (IntPtr hMon, IntPtr hdcMon, ref RECT r, IntPtr dwData) =>
@@ -447,7 +544,14 @@ public sealed class WindowService : IWindowService
         return list;
     });
 
-    public RectPx GetVirtualDesktopBounds() => new(
+    public RectPx GetVirtualDesktopBounds()
+    {
+        if (_monitorCache != null)
+            return _monitorCache.GetVirtualDesktopBounds(NativeGetVirtualDesktopBounds);
+        return NativeGetVirtualDesktopBounds();
+    }
+
+    private static RectPx NativeGetVirtualDesktopBounds() => new(
         NativeMethods.GetSystemMetrics(NativeMethods.SM_XVIRTUALSCREEN),
         NativeMethods.GetSystemMetrics(NativeMethods.SM_YVIRTUALSCREEN),
         NativeMethods.GetSystemMetrics(NativeMethods.SM_CXVIRTUALSCREEN),
@@ -508,19 +612,23 @@ public sealed class WindowService : IWindowService
     /// unsaved-work prompts appear normally and hung apps don't hang us.
     /// Returns true once the window is actually gone or hidden (e.g. minimized to tray).
     /// </summary>
-    public bool CloseWindow(long hwnd) => DesktopBridge.RunOnDefaultDesktop(() =>
+    public bool CloseWindow(long hwnd)
     {
-        var h = new IntPtr(hwnd);
-        if (!NativeMethods.IsWindow(h)) return false;
-        NativeMethods.PostMessageW(h, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
-        var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(1500);
-        while (DateTime.UtcNow < deadline)
+        if (OnCloseWindow != null) return OnCloseWindow(hwnd);
+        return DesktopBridge.RunOnDefaultDesktop(() =>
         {
-            if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h)) return true;
-            Thread.Sleep(100);
-        }
-        return !NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h);
-    });
+            var h = new IntPtr(hwnd);
+            if (!NativeMethods.IsWindow(h)) return false;
+            NativeMethods.PostMessageW(h, 0x0010 /*WM_CLOSE*/, IntPtr.Zero, IntPtr.Zero);
+            var deadline = DateTime.UtcNow + TimeSpan.FromMilliseconds(1500);
+            while (DateTime.UtcNow < deadline)
+            {
+                if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h)) return true;
+                Thread.Sleep(100);
+            }
+            return !NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h);
+        });
+    }
 
     internal static string GetTitle(IntPtr hwnd)
     {
@@ -561,9 +669,45 @@ public sealed class WindowService : IWindowService
             info.RcMonitor.Bottom - info.RcMonitor.Top);
     }
 
-    private static IVirtualDesktopManager? TryCreateVdm()
+    private IVirtualDesktopManager? TryCreateVdm()
+    {
+        if (_vdmHolder != null)
+            return _vdmHolder.GetOrCreate(NativeTryCreateVdm);
+        return NativeTryCreateVdm();
+    }
+
+    private static IVirtualDesktopManager? NativeTryCreateVdm()
     {
         try { return (IVirtualDesktopManager)new VirtualDesktopManagerCom(); }
         catch { return null; }
+    }
+
+    internal static DateTimeOffset? GetProcessStartTime(int pid)
+    {
+        if (pid <= 0) return null;
+        try
+        {
+            using var p = System.Diagnostics.Process.GetProcessById(pid);
+            return p.StartTime;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static bool TryActivateWindowByExactTitle(string title)
+    {
+        return DesktopBridge.RunOnDefaultDesktop(() =>
+        {
+            var hwnd = NativeMethods.FindWindowW(null, title);
+            if (hwnd != IntPtr.Zero)
+            {
+                NativeMethods.ShowWindow(hwnd, 9); // SW_RESTORE
+                NativeMethods.SetForegroundWindow(hwnd);
+                return true;
+            }
+            return false;
+        });
     }
 }

@@ -361,6 +361,7 @@ public sealed class ActionResolver
         { Error: ErrorCode.CaptureFailed } => OutcomeKind.CaptureUnavailable,
         { Error: ErrorCode.PolicyDenied } => OutcomeKind.PolicyDenied,
         { Error: ErrorCode.ConfirmationRequired } => OutcomeKind.ConfirmationDenied,
+        { Error: ErrorCode.Busy } => OutcomeKind.ConcurrencyConflict,
         _ => OutcomeKind.Failed,
     };
 }

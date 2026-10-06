@@ -88,7 +88,7 @@ public class SpeedAndStreamliningTests
     }
 
     [Fact]
-    public void CloseWindow_BatchMode_CloseAllAgentWindows()
+    public async Task CloseWindow_BatchMode_CloseAllAgentWindows()
     {
         var session = new McpSession(EmergencyControl.Process);
         var tools = new InbriskTools(session);
@@ -98,7 +98,7 @@ public class SpeedAndStreamliningTests
         session.Rt.Provenance.RegisterAgentLaunch(1001, "calc.exe", testHwnd);
 
         // Calling CloseWindow with closeAllAgentWindows: true
-        var res = tools.CloseWindow(closeAllAgentWindows: true);
+        var res = await tools.CloseWindow(closeAllAgentWindows: true);
         Assert.NotNull(res);
 
         using var doc = JsonDocument.Parse(((TextContentBlock)res.Content[0]).Text);
@@ -107,14 +107,14 @@ public class SpeedAndStreamliningTests
     }
 
     [Fact]
-    public void CloseWindow_BatchMode_WithHwndsList()
+    public async Task CloseWindow_BatchMode_WithHwndsList()
     {
         var session = new McpSession(EmergencyControl.Process);
         var tools = new InbriskTools(session);
 
         // Target fake hwnds
         var hwnds = new[] { "0x99999", "0x88888" };
-        var res = tools.CloseWindow(hwnds: hwnds);
+        var res = await tools.CloseWindow(hwnds: hwnds);
         Assert.NotNull(res);
 
         using var doc = JsonDocument.Parse(((TextContentBlock)res.Content[0]).Text);

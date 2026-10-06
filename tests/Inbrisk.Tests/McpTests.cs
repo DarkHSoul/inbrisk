@@ -12,13 +12,14 @@ namespace Inbrisk.Tests;
 /// the JSON-RPC transport — initialize/tools-call/disconnect all go over
 /// the wire.
 /// </summary>
-[Collection("desktop")]
+[Collection("McpStdioProcess")]
 public sealed class McpTests
 {
-    private readonly DesktopFixture _fx;
-    public McpTests(DesktopFixture fx) => _fx = fx;
+    private static readonly Lazy<DesktopFixture> _fxLazy = new(() => new DesktopFixture());
+    private DesktopFixture _fx => _fxLazy.Value;
+    public McpTests() { }
 
-    private static async Task<McpClient> ConnectAsync()
+    private static async Task<McpClient> ConnectAsync(string profile = "full")
     {
         var dll = Path.Combine(AppContext.BaseDirectory, "inbrisk-mcp.dll");
         Assert.True(File.Exists(dll), $"inbrisk-mcp.dll missing at {dll}");
@@ -31,6 +32,7 @@ public sealed class McpTests
             // a production server's emergency state
             EnvironmentVariables = new Dictionary<string, string?>
             {
+                ["INBRISK_TOOL_PROFILE"] = profile,
                 ["INBRISK_PANIC_HOTKEY"] = "Ctrl+Alt+F12",
                 ["INBRISK_RESUME_HOTKEY"] = "Ctrl+Alt+Shift+F12",
                 ["INBRISK_EMERGENCY_STATE"] = Path.Combine(Path.GetTempPath(),
@@ -85,6 +87,18 @@ public sealed class McpTests
             n.Contains("indicator", StringComparison.OrdinalIgnoreCase) ||
             n.Contains("border", StringComparison.OrdinalIgnoreCase) ||
             n.Contains("overlay", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Initialize_CoreProfile_FiltersToCoreTools()
+    {
+        await using var client = await ConnectAsync("core");
+        var tools = await client.ListToolsAsync();
+        var names = tools.Select(t => t.Name).ToHashSet();
+        Assert.Contains("computer_batch", names);
+        Assert.Contains("computer_click", names);
+        Assert.DoesNotContain("computer_app_restart", names);
+        Assert.DoesNotContain("computer_app_shutdown", names);
     }
 
     [Fact]

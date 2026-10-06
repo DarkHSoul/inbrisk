@@ -187,8 +187,30 @@ public sealed class Executor
             var verify = VerifyResult.NotRequested;
             VerifyEvidence? evidence = null;
             if (result.Success && intent.Verify is { } vs)
+            {
                 using (PerfTrace.Stage("verify"))
-                    verify = _verifier.Verify(vs, element, window);
+                {
+                    if (vs.Kind == VerifyKind.ElementGone)
+                    {
+                        var backend = element != null ? _backends.FirstOrDefault(b => b.Id == element.Handle.Backend) : null;
+                        var fresh = backend != null && element != null ? backend.ReResolve(element.Handle) : null;
+                        if (fresh == null)
+                        {
+                            verify = VerifyResult.Verified;
+                            evidence = new VerifyEvidence("ElementGone", Detail: "element no longer present after action (expected)");
+                        }
+                        else
+                        {
+                            verify = VerifyResult.Failed;
+                            evidence = new VerifyEvidence("ElementStillPresent", Detail: "element still present after action (expected gone)");
+                        }
+                    }
+                    else
+                    {
+                        verify = _verifier.Verify(vs, element, window);
+                    }
+                }
+            }
             else if (result.Success && element != null)
                 using (PerfTrace.Stage("verify.post"))
                     (verify, evidence) = PostVerify(intent, element);
@@ -231,6 +253,17 @@ public sealed class Executor
         {
             ct.ThrowIfCancellationRequested();
             var found = backend.Find(spec, ct);
+            if (found.Count > 0) return found;
+        }
+        return Array.Empty<UiElement>();
+    }
+
+    public async Task<IReadOnlyList<UiElement>> FindAsync(FindSpec spec, CancellationToken ct = default)
+    {
+        foreach (var backend in _backends)
+        {
+            ct.ThrowIfCancellationRequested();
+            var found = await backend.FindAsync(spec, ct).ConfigureAwait(false);
             if (found.Count > 0) return found;
         }
         return Array.Empty<UiElement>();
@@ -398,23 +431,31 @@ public sealed class Executor
     /// </summary>
     private (VerifyResult, VerifyEvidence?) PostVerify(ActionIntent intent, UiElement element)
     {
-        if (intent.Kind is not (ActionKind.Toggle or ActionKind.SetValue
-            or ActionKind.Select or ActionKind.Click or ActionKind.Invoke))
+        // Click and Invoke have no required property-mutation postcondition;
+        // verification is delegated to AutoVerifier (window/event/hierarchy checks)
+        // to avoid redundant ReResolve COM roundtrips.
+        if (intent.Kind is ActionKind.Click or ActionKind.Invoke)
+            return (VerifyResult.Unverified, null);
+
+        if (intent.Kind is not (ActionKind.Toggle or ActionKind.SetValue or ActionKind.Select))
             return (VerifyResult.NotRequested, null);
         var backend = _backends.FirstOrDefault(b => b.Id == element.Handle.Backend);
         if (backend == null) return (VerifyResult.Unverified, null);
 
         UiElement? lastFresh = element;
-        for (var i = 0; i < 3; i++)
+        var maxAttempts = 3;
+        for (var i = 0; i < maxAttempts; i++)
         {
             UiElement? fresh;
             try { fresh = backend.ReResolve(element.Handle); }
             catch { return (VerifyResult.Unverified, null); }
             lastFresh = fresh ?? lastFresh;
             if (fresh == null)
-                return (VerifyResult.Verified,
-                    new VerifyEvidence("ElementGone",
-                        Detail: "element no longer present after action"));
+            {
+                return (VerifyResult.Unverified,
+                    new VerifyEvidence("ElementNotReResolved",
+                        Detail: "target element was no longer found after action — cannot independently verify state"));
+            }
             switch (intent.Kind)
             {
                 case ActionKind.Toggle:
@@ -436,15 +477,9 @@ public sealed class Executor
                         return (VerifyResult.Verified,
                             new VerifyEvidence("PropertyChanged", "false", "true", "selected"));
                     break;
-                case ActionKind.Click or ActionKind.Invoke:
-                    foreach (var p in new[] { "toggleState", "value", "selected",
-                                 "expandCollapseState", "focused" })
-                        if (Prop(fresh, p) is { } a && a != Prop(element, p))
-                            return (VerifyResult.Verified,
-                                new VerifyEvidence("PropertyChanged", Prop(element, p), a, p));
-                    return (VerifyResult.Unverified, null);
             }
-            Thread.Sleep(180);
+            if (i < maxAttempts - 1)
+                Thread.Sleep(60);
         }
         // element still readable and the required postcondition never met
         if (intent.Kind is ActionKind.Toggle)

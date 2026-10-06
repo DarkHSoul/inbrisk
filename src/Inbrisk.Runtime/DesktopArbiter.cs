@@ -25,6 +25,7 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
     private volatile DesktopLease? _currentPhysicalLease;
     private readonly Timer _watchdogTimer;
     private bool _disposed;
+    public bool IsDisposed => _disposed;
 
     /// <summary>
     /// Optional hook invoked when an exclusive physical lease expires or is forcibly revoked
@@ -39,8 +40,8 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
     public DesktopArbiter(string? lockFilePath = null)
     {
         _lockFilePath = lockFilePath ?? Path.Combine(Path.GetTempPath(), "inbrisk", "physical_input.lock");
-        // Periodic watchdog running every 1000ms to clean up expired leases
-        _watchdogTimer = new Timer(WatchdogTick, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+        // Periodic watchdog running every 200ms to clean up expired leases
+        _watchdogTimer = new Timer(WatchdogTick, null, TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(200));
     }
 
     public async Task<IInputLease> AcquireAsync(
@@ -54,6 +55,7 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
     {
         ThrowIfDisposed();
         CheckExpiredLeases();
+        Inbrisk.Core.LockOrderTracker.AssertCanAcquireRank1();
 
         var effTimeout = timeout ?? TimeSpan.FromSeconds(5);
         var effDuration = leaseDuration ?? TimeSpan.FromSeconds(30);
@@ -128,6 +130,7 @@ public sealed class DesktopArbiter : IDesktopArbiter, IDisposable
     {
         ThrowIfDisposed();
         CheckExpiredLeases();
+        Inbrisk.Core.LockOrderTracker.AssertCanAcquireRank1();
 
         var effDuration = leaseDuration ?? TimeSpan.FromSeconds(30);
         var taskCts = GetOrCreateTaskCts(ownerId);

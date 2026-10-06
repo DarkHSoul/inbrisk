@@ -154,7 +154,7 @@ public class ApplicationAdapterTests
     public void StepValidation_AcceptsAdapterAndMediaActions()
     {
         var method = typeof(InbriskTools).GetMethod("ValidateStep",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
         Assert.NotNull(method);
 
         // Action: "media" with text "play"
@@ -274,7 +274,7 @@ public class ApplicationAdapterTests
             DebugPort: 9222);
 
         var method = typeof(InbriskTools).GetMethod("ValidateStep",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
         var err = (string?)method!.Invoke(null, new object[] { step });
         Assert.Null(err);
     }

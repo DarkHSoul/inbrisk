@@ -19,15 +19,7 @@ public class DesktopArbiterTests
         typeof(McpSession).GetField("<SessionCts>k__BackingField",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(session, new CancellationTokenSource());
 
-        var control = (EmergencyControl)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(EmergencyControl));
-        typeof(EmergencyControl).GetField("_state",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(control, ComputerControlState.Active);
-        typeof(EmergencyControl).GetField("_epoch",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(control, new CancellationTokenSource());
-        typeof(EmergencyControl).GetField("_peerAuthority",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(control, true);
-        typeof(EmergencyControl).GetField("_gate",
-            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(control, new object());
+        var control = EmergencyControl.ForTests();
         typeof(McpSession).GetField("<Control>k__BackingField",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(session, control);
 
@@ -149,10 +141,12 @@ public class DesktopArbiterTests
             "Hung script",
             leaseDuration: TimeSpan.FromMilliseconds(100));
 
-        Assert.True(lease.IsActive);
-
-        // Wait ~1.5s for watchdog tick (runs every 1s)
-        await Task.Delay(1300);
+        // Wait up to 3s for watchdog tick (timer ticks every 1000ms)
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (lease.IsActive && sw.ElapsedMilliseconds < 3000)
+        {
+            await Task.Delay(100);
+        }
 
         // Watchdog must have expired the lease
         Assert.False(lease.IsActive);

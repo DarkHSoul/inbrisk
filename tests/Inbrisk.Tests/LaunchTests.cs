@@ -370,56 +370,48 @@ public sealed class LaunchIntegrationTests
     [Fact]
     public void Notepad_FriendlyName_LaunchAndReuse()
     {
-        var before = Process.GetProcessesByName("notepad")
-            .Select(p => p.Id).ToHashSet();
-        try
+        using var tracker = new TestProcessTracker("notepad");
+        var r = _fx.Inbrisk.Launch(new LaunchSpec(App: "notepad"));
+        Assert.True(r.Success, r.ErrorDetail);
+        Assert.Contains(r.Method!.Value, new[]
         {
-            var r = _fx.Inbrisk.Launch(new LaunchSpec(App: "notepad"));
-            Assert.True(r.Success, r.ErrorDetail);
-            Assert.Contains(r.Method!.Value, new[]
-            {
-                LaunchMethod.Executable, LaunchMethod.AppPath,
-                LaunchMethod.Aumid, LaunchMethod.ExistingInstance,
-            });
-            if (r.LaunchState == "AlreadyRunning") return; // was open already
+            LaunchMethod.Executable, LaunchMethod.AppPath,
+            LaunchMethod.Aumid, LaunchMethod.ExistingInstance,
+        });
+        if (r.LaunchState == "AlreadyRunning") return; // was open already
 
-            Assert.Equal("Ready", r.LaunchState);
-            Assert.NotNull(r.Pid);
-            Assert.NotNull(r.Hwnd);
-            Assert.False(string.IsNullOrEmpty(r.WindowTitle));
+        Assert.Equal("Ready", r.LaunchState);
+        Assert.NotNull(r.Pid);
+        Assert.NotNull(r.Hwnd);
+        Assert.False(string.IsNullOrEmpty(r.WindowTitle));
 
-            // second call reuses — never double-spawns
-            var r2 = _fx.Inbrisk.Launch(new LaunchSpec(App: "notepad"));
-            Assert.True(r2.Success, r2.ErrorDetail);
-            Assert.Equal("AlreadyRunning", r2.LaunchState);
-            Assert.Equal(r.Hwnd, r2.Hwnd);
-        }
-        finally { KillNew("notepad", before); }
+        // second call reuses — never double-spawns
+        var r2 = _fx.Inbrisk.Launch(new LaunchSpec(App: "notepad"));
+        Assert.True(r2.Success, r2.ErrorDetail);
+        Assert.Equal("AlreadyRunning", r2.LaunchState);
+        Assert.Equal(r.Hwnd, r2.Hwnd);
     }
 
     [Fact]
     public void Notepad_ByExecutable_Launches()
     {
-        var before = Process.GetProcessesByName("notepad")
-            .Select(p => p.Id).ToHashSet();
-        try
-        {
-            var r = _fx.Inbrisk.Launch(new LaunchSpec(Executable: "notepad.exe"));
-            Assert.True(r.Success, r.ErrorDetail);
-            Assert.NotNull(r.Hwnd);
-        }
-        finally { KillNew("notepad", before); }
+        using var tracker = new TestProcessTracker("notepad");
+        var r = _fx.Inbrisk.Launch(new LaunchSpec(Executable: "notepad.exe"));
+        Assert.True(r.Success, r.ErrorDetail);
+        Assert.NotNull(r.Hwnd);
     }
 
     [Fact]
     public void Calculator_Aumid_Launch()
     {
+        using var tracker = new TestProcessTracker("CalculatorApp", "calculator");
         // packaged-app path — skipped silently on machines without it
         var svc = _fx.Inbrisk.Parts.Apps;
         var cands = svc.ResolveCandidates("calculator")
             .Where(c => c.Method == LaunchMethod.Aumid).ToList();
         if (cands.Count == 0) return;
         var r = _fx.Inbrisk.Launch(new LaunchSpec(App: "calculator"));
+        if (r.Pid.HasValue) tracker.TrackPid(r.Pid.Value);
         Assert.True(r.Success, r.ErrorDetail);
         Assert.NotNull(r.Hwnd);
     }
@@ -511,7 +503,7 @@ public sealed class LaunchIntegrationTests
 /// computer_launch must exist, validate strictly, deny under emergency
 /// stop, and the computer_run launch step must bind a usable window scope.
 /// </summary>
-[Collection("desktop")]
+[Collection("McpStdioProcess")]
 public sealed class LaunchMcpTests
 {
     private static async Task<McpClient> ConnectAsync()
@@ -523,8 +515,8 @@ public sealed class LaunchMcpTests
             Arguments = [dll],
             EnvironmentVariables = new Dictionary<string, string?>
             {
-                ["INBRISK_PANIC_HOTKEY"] = "Ctrl+Alt+F12",
-                ["INBRISK_RESUME_HOTKEY"] = "Ctrl+Alt+Shift+F12",
+                ["INBRISK_PANIC_HOTKEY"] = "Ctrl+Alt+F8",
+                ["INBRISK_RESUME_HOTKEY"] = "Ctrl+Alt+Shift+F8",
                 ["INBRISK_EMERGENCY_STATE"] = Path.Combine(Path.GetTempPath(),
                     $"inbrisk-launchtest-{Guid.NewGuid():N}.flag"),
             },
@@ -562,38 +554,29 @@ public sealed class LaunchMcpTests
     [Fact]
     public async Task Launch_Notepad_Verified_ThenReuse()
     {
-        var before = Process.GetProcessesByName("notepad")
-            .Select(p => p.Id).ToHashSet();
+        using var tracker = new TestProcessTracker("notepad");
         await using var client = await ConnectAsync();
-        try
+        var r = Json(await client.CallToolAsync("computer_launch",
+            new Dictionary<string, object?> { ["app"] = "notepad" }));
+        var root = r.RootElement;
+        Assert.Equal("Verified", root.GetProperty("status").GetString());
+        Assert.Equal("notepad", root.GetProperty("app").GetString());
+        Assert.True(root.GetProperty("durationMs").GetInt64() > 0);
+        var state = root.GetProperty("launchState").GetString();
+        Assert.Contains(state, new[] { "Ready", "AlreadyRunning" });
+        if (state == "Ready")
         {
-            var r = Json(await client.CallToolAsync("computer_launch",
-                new Dictionary<string, object?> { ["app"] = "notepad" }));
-            var root = r.RootElement;
-            Assert.Equal("Verified", root.GetProperty("status").GetString());
-            Assert.Equal("notepad", root.GetProperty("app").GetString());
-            Assert.True(root.GetProperty("durationMs").GetInt64() > 0);
-            var state = root.GetProperty("launchState").GetString();
-            Assert.Contains(state, new[] { "Ready", "AlreadyRunning" });
-            if (state == "Ready")
-            {
-                Assert.StartsWith("0x", root.GetProperty("window")
-                    .GetProperty("hwnd").GetString()!);
-                Assert.False(string.IsNullOrEmpty(root.GetProperty("window")
-                    .GetProperty("title").GetString()));
-            }
+            Assert.StartsWith("0x", root.GetProperty("window")
+                .GetProperty("hwnd").GetString()!);
+            Assert.False(string.IsNullOrEmpty(root.GetProperty("window")
+                .GetProperty("title").GetString()));
+        }
 
-            // second call reuses — never double-spawns
-            var r2 = Json(await client.CallToolAsync("computer_launch",
-                new Dictionary<string, object?> { ["app"] = "notepad" }));
-            Assert.Equal("AlreadyRunning",
-                r2.RootElement.GetProperty("launchState").GetString());
-        }
-        finally
-        {
-            foreach (var p in Process.GetProcessesByName("notepad"))
-                if (!before.Contains(p.Id)) { try { p.Kill(); } catch { } }
-        }
+        // second call reuses — never double-spawns
+        var r2 = Json(await client.CallToolAsync("computer_launch",
+            new Dictionary<string, object?> { ["app"] = "notepad" }));
+        Assert.Equal("AlreadyRunning",
+            r2.RootElement.GetProperty("launchState").GetString());
     }
 
     [Fact]
@@ -632,43 +615,34 @@ public sealed class LaunchMcpTests
     [Fact]
     public async Task Run_LaunchStep_BindsWindowScope()
     {
-        var before = Process.GetProcessesByName("notepad")
-            .Select(p => p.Id).ToHashSet();
+        using var tracker = new TestProcessTracker("notepad");
         await using var client = await ConnectAsync();
-        try
+        var steps = new object[]
         {
-            var steps = new object[]
+            new Dictionary<string, object?>
             {
-                new Dictionary<string, object?>
+                ["action"] = "launch", ["app"] = "notepad",
+                ["as"] = "np",
+            },
+            // the bound hwnd scopes the find to the app's window —
+            // any element inside it proves the scope held (Win11's
+            // editor surface isn't role:"Edit" on every build)
+            new Dictionary<string, object?>
+            {
+                ["action"] = "find",
+                ["target"] = new Dictionary<string, object?>
                 {
-                    ["action"] = "launch", ["app"] = "notepad",
-                    ["as"] = "np",
+                    ["within"] = "$np",
                 },
-                // the bound hwnd scopes the find to the app's window —
-                // any element inside it proves the scope held (Win11's
-                // editor surface isn't role:"Edit" on every build)
-                new Dictionary<string, object?>
-                {
-                    ["action"] = "find",
-                    ["target"] = new Dictionary<string, object?>
-                    {
-                        ["within"] = "$np",
-                    },
-                    ["select"] = "first", ["as"] = "inner",
-                },
-            };
-            var r = await client.CallToolAsync("computer_run",
-                new Dictionary<string, object?> { ["steps"] = steps });
-            var txt = Text(r);
-            Assert.False(r.IsError, txt);
-            using var doc = Json(r);
-            Assert.Equal("Completed",
-                doc.RootElement.GetProperty("status").GetString());
-        }
-        finally
-        {
-            foreach (var p in Process.GetProcessesByName("notepad"))
-                if (!before.Contains(p.Id)) { try { p.Kill(); } catch { } }
-        }
+                ["select"] = "first", ["as"] = "inner",
+            },
+        };
+        var r = await client.CallToolAsync("computer_run",
+            new Dictionary<string, object?> { ["steps"] = steps });
+        var txt = Text(r);
+        Assert.False(r.IsError, txt);
+        using var doc = Json(r);
+        Assert.Equal("Completed",
+            doc.RootElement.GetProperty("status").GetString());
     }
 }

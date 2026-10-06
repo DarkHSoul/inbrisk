@@ -35,6 +35,14 @@ public sealed record ElementHandle(
     string BackendRef,
     ReResolveRecipe Recipe);
 
+/// <summary>Three-state pattern support semantics distinguishing confirmed support, confirmed unsupported, and transient probe failures.</summary>
+public enum PatternSupportState
+{
+    Unknown = 0,
+    Supported = 1,
+    Unsupported = 2,
+}
+
 public sealed record UiElement(
     string Id,
     BackendId Source,
@@ -50,6 +58,53 @@ public sealed record UiElement(
 {
     public (int X, int Y) Center => Bounds.Center;
     public bool IsStale;
+
+    public Func<string, PatternSupportState>? DefaultProbeFallback { get; set; }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, PatternSupportState> _patternStates = new(StringComparer.OrdinalIgnoreCase);
+
+    public PatternSupportState GetPatternState(string action)
+    {
+        if (_patternStates.TryGetValue(action, out var state))
+            return state;
+        if (Actions.Contains(action, StringComparer.OrdinalIgnoreCase))
+            return PatternSupportState.Supported;
+        return PatternSupportState.Unknown;
+    }
+
+    public void SetPatternState(string action, PatternSupportState state)
+    {
+        _patternStates[action] = state;
+    }
+
+    public void RecordPatternProbe(string action, bool supported, bool isTransientFailure = false)
+    {
+        if (isTransientFailure)
+        {
+            SetPatternState(action, PatternSupportState.Unknown);
+        }
+        else
+        {
+            SetPatternState(action, supported ? PatternSupportState.Supported : PatternSupportState.Unsupported);
+        }
+    }
+
+    public bool IsActionSupported(string action, Func<string, PatternSupportState>? probeFallback = null)
+    {
+        var state = GetPatternState(action);
+        if (state == PatternSupportState.Supported) return true;
+        if (state == PatternSupportState.Unsupported) return false;
+
+        var probe = probeFallback ?? DefaultProbeFallback;
+        if (probe != null)
+        {
+            var newState = probe(action);
+            SetPatternState(action, newState);
+            return newState == PatternSupportState.Supported;
+        }
+
+        return false;
+    }
 }
 
 /// <summary>Query to locate elements. Name matching is case-insensitive contains.</summary>

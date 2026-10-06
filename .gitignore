@@ -50,3 +50,9 @@ stdin.txt
 inbrisksetup.txt
 tools/*.json
 qwen-code-export-*
+
+# Rust build output
+target/
+
+# Chat bridge runtime state
+.chat_bridge/

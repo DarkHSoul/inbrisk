@@ -30,8 +30,12 @@ if (Inbrisk.Setup.SelfInstaller.RunningAsSetupExe)
 if (args.Length > 0 && args[0].ToLowerInvariant() is "tray" or "shell")
     return RunDesktopShell();
 
-if (args.Length > 0 && args[0].ToLowerInvariant() is "ui" or "app" or "settings")
+if (args.Length > 0 && args[0].ToLowerInvariant() is "ui" or "app" or "settings" or "dashboard" or "control")
+{
+    if (Inbrisk.Platform.Windows.Topology.WindowService.TryActivateWindowByExactTitle("Inbrisk — Desktop Control Runtime"))
+        return 0;
     return Inbrisk.Cli.Ui.SetupApp.Run(installerMode: false);
+}
 
 if (args.Length == 0)
 {
@@ -725,6 +729,7 @@ static int CmdHelp(string cmd)
 
 static int RunDesktopShell()
 {
+    Inbrisk.Platform.Windows.Native.DesktopBridge.TrySwitchCurrentThread();
     var settings = UserSettings.Load();
     using var control = EmergencyControl.Process;
     control.StartHotkeys(settings.PanicHotkey, settings.ResumeHotkey);
@@ -732,8 +737,20 @@ static int RunDesktopShell()
     using var hud = new ActivityHudService(
         enabled: settings.HudEnabled,
         animationsEnabled: settings.AnimationsEnabled,
-        alwaysVisible: settings.HudAlwaysVisible);
+        alwaysVisible: settings.HudAlwaysVisible,
+        hudDockGapDip: settings.HudDockGapDip);
     hud.Start();
+    hud.OnClick = () =>
+    {
+        try
+        {
+            var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
+            if (!File.Exists(exe))
+                exe = Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
+            Process.Start(new ProcessStartInfo(exe, "control") { UseShellExecute = true });
+        }
+        catch { }
+    };
 
     var idleC = UserSettings.ParseColor(settings.IdleColor);
     var emC = UserSettings.ParseColor(settings.EmergencyColor);
@@ -755,7 +772,7 @@ static int RunDesktopShell()
             var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
             if (!File.Exists(exe))
                 exe = Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
-            Process.Start(new ProcessStartInfo(exe, "settings") { UseShellExecute = true });
+            Process.Start(new ProcessStartInfo(exe, "control") { UseShellExecute = true });
         }
         catch { }
     };
@@ -806,6 +823,23 @@ static int RunDesktopShell()
         quitEvent.Set();
     };
     tray.Start();
+
+    var settingsSync = new System.Threading.Timer(_ =>
+    {
+        try
+        {
+            var s = UserSettings.LoadCached();
+            var changed = false;
+            if (s.PerimeterEnabled != indicator.Enabled) { indicator.SetEnabled(s.PerimeterEnabled); changed = true; }
+            if (s.HudEnabled != hud.Enabled) { hud.SetEnabled(s.HudEnabled); changed = true; }
+            hud.SetAnimationsEnabled(s.AnimationsEnabled);
+            if (changed)
+                tray.UpdateStatus(mcpConnected: false, clientName: "Standby",
+                    working: false, emergency: EmergencyGate.IsStopped,
+                    hudEnabled: s.HudEnabled, perimeterEnabled: s.PerimeterEnabled);
+        }
+        catch { }
+    }, null, 1500, 1500);
 
     control.StateChanged += s =>
     {

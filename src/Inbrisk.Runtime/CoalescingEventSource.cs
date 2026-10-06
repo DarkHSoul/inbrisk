@@ -4,9 +4,10 @@ namespace Inbrisk.Runtime;
 
 /// <summary>
 /// Debounce/coalesce layer between raw event sources and consumers.
-/// Critical transitions (open/close/foreground/focus) pass immediately;
+/// Critical transitions (open/close/foreground/focus/notification) pass immediately;
 /// noisy kinds (structure/name/value/location churn) are coalesced per
-/// (Kind, Hwnd, ElementId) key — the latest wins within each window.
+/// EventCoalescingKey (Kind, Hwnd, ElementId, PropertyId, StructureChange) —
+/// the latest wins within each window while preserving semantic distinctions.
 /// No event kind is ever dropped entirely: each pending key emits its
 /// most recent event on flush.
 /// </summary>
@@ -14,7 +15,7 @@ public sealed class CoalescingEventSource : IEventSource
 {
     private readonly IEventSource _inner;
     private readonly int _windowMs;
-    private readonly Dictionary<(EventKind, long, string), ObservedEvent> _pending = new();
+    private readonly Dictionary<EventCoalescingKey, ObservedEvent> _pending = new();
     private readonly object _gate = new();
     private readonly Timer _flushTimer;
     private bool _started;
@@ -22,11 +23,12 @@ public sealed class CoalescingEventSource : IEventSource
     public long RawCount;
     public long EmittedCount;
 
-    /// <summary>These kinds are delivered immediately — losing an open/close is worse than noise.</summary>
+    /// <summary>These kinds are delivered immediately — losing an open/close or notification is worse than noise.</summary>
     private static readonly HashSet<EventKind> Immediate =
     [
         EventKind.ForegroundChanged, EventKind.WindowOpened,
         EventKind.WindowClosed, EventKind.FocusChanged, EventKind.WindowShown,
+        EventKind.Notification,
     ];
 
     public event Action<ObservedEvent>? Event;
@@ -43,7 +45,7 @@ public sealed class CoalescingEventSource : IEventSource
     public double ReductionRatio =>
         RawCount == 0 ? 0 : 1.0 - (double)EmittedCount / RawCount;
 
-    private void OnRaw(ObservedEvent e)
+    public void OnRaw(ObservedEvent e)
     {
         Interlocked.Increment(ref RawCount);
         if (Immediate.Contains(e.Kind))
@@ -52,11 +54,12 @@ public sealed class CoalescingEventSource : IEventSource
             Event?.Invoke(e);
             return;
         }
+        var key = EventCoalescingKey.FromEvent(e);
         lock (_gate)
-            _pending[(e.Kind, e.Hwnd ?? 0, e.ElementId ?? "")] = e;
+            _pending[key] = e;
     }
 
-    private void Flush()
+    public void Flush()
     {
         List<ObservedEvent> batch;
         lock (_gate)
@@ -77,7 +80,7 @@ public sealed class CoalescingEventSource : IEventSource
         if (_started) return;
         _started = true;
         _inner.Start();
-        _flushTimer.Change(0, _windowMs);
+        _flushTimer.Change(_windowMs, _windowMs);
     }
 
     public void Dispose()

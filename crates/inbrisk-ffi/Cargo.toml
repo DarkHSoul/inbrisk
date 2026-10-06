@@ -1,0 +1,16 @@
+[package]
+name = "inbrisk-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI for the Inbrisk runtime. Each call connects, talks shared memory, and disconnects."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+inbrisk-sdk.workspace = true
+inbrisk-core.workspace = true
+inbrisk-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true

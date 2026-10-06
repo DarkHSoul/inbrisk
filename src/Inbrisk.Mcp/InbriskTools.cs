@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Inbrisk.Core;
+using Inbrisk.Platform.Windows.Apps;
 using Inbrisk.Platform.Windows.Topology;
 using Inbrisk.Platform.Windows.Uia;
 using Inbrisk.Runtime;
@@ -20,9 +21,18 @@ namespace Inbrisk.Mcp;
 [McpServerToolType]
 public sealed class InbriskTools
 {
-    private static readonly JsonSerializerOptions J = new() { WriteIndented = false };
+    private static readonly JsonSerializerOptions J = new()
+    {
+        WriteIndented = false,
+        PropertyNameCaseInsensitive = true
+    };
     private readonly McpSession _s;
-    public InbriskTools(McpSession s) => _s = s;
+    public RequestWindowSnapshot WindowSnapshot { get; }
+    public InbriskTools(McpSession s)
+    {
+        _s = s;
+        WindowSnapshot = new RequestWindowSnapshot(() => _s.Rt.Windows(), () => _s.Rt.MutationVersion);
+    }
 
     /// <summary>Resolved output verbosity — per-call `detail` wins, then
     /// INBRISK_DETAIL env, then settings.json outputDetail, else "full".
@@ -31,7 +41,7 @@ public sealed class InbriskTools
     private readonly string _detailDefault =
         Environment.GetEnvironmentVariable("INBRISK_DETAIL")
         ?? Core.UserSettings.Load().OutputDetail
-        ?? "full";
+        ?? "slim";
 
     private bool Slim(string? detail) =>
         string.Equals(detail ?? _detailDefault, "slim",
@@ -102,7 +112,7 @@ public sealed class InbriskTools
         "ObservedChange or Unverified and concrete confirmation is needed. Returns active " +
         "window, elements with ids/actions/labelledBy, recent events, delta vs previous " +
         "observation, and optionally frames (mode=visual|both).")]
-    public CallToolResult Observe(
+    public async Task<CallToolResult> Observe(
         [Description("auto|semantic|visual|both — auto picks pixels only when semantics are thin")] string? mode = null,
         [Description("window handle to scope the snapshot (hex or decimal)")] string? hwnd = null,
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
@@ -112,6 +122,28 @@ public sealed class InbriskTools
         CancellationToken ct = default)
     {
         if (BadDetail(detail) is { } bd) return bd;
+        if (_s.PrevOutcome?.Kind == OutcomeKind.Verified)
+        {
+            _s.Telemetry.IncPostVerifiedObservation();
+            PerfTrace.Count("postVerifiedObservation");
+        }
+        if (_s.LastLaunchedHwnd != 0 && (DateTimeOffset.UtcNow - _s.LastLaunchTimestamp).TotalSeconds < 5)
+        {
+            _s.Telemetry.IncLaunchFollowupDiscovery();
+            PerfTrace.Count("launchFollowupDiscovery");
+        }
+
+        var normArgs = $"{mode}|{hwnd}|{detail}|{maxElements}|{deltaOnly}|{baseSnapshotId}";
+        var scopeH = ParseHwnd(hwnd) ?? _s.ScopeHwnd ?? 0;
+        if (RequestDeduplicator.IsSafeForReadDeduplication("computer_observe", mode, autoScreenshot: false, hasCropOrRegion: false))
+        {
+            if (_s.Deduplicator.TryDeduplicateRead("computer_observe", normArgs, scopeH, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedObs)
+            {
+                if (RequestDeduplicator.IsSafeForReadDeduplication("computer_observe", mode, autoScreenshot: false, hasCropOrRegion: false, cachedObs))
+                    return cachedObs;
+            }
+        }
+
         using var trace = PerfTrace.Begin("tool", "computer_observe");
         ct.ThrowIfCancellationRequested();
         using var cancelReg = ct.CanBeCanceled ? ct.Register(() => _s.Rt.PurgePendingWork()) : default;
@@ -130,7 +162,7 @@ public sealed class InbriskTools
         var hint = ParseHwnd(hwnd);
         BuiltObservation built;
         using (PerfTrace.Stage("observe"))
-            built = _s.Observe(hint, ObservationBudget.Default, policy, baseSnapshotId);
+            built = await _s.ObserveAsync(hint, ObservationBudget.Default, policy, baseSnapshotId, ct).ConfigureAwait(false);
         if (_s.Control.State == ComputerControlState.EmergencyStopped)
             return Text($"controlState: EmergencyStopped\nemergencyHotkey: {_s.Control.PanicHotkey}");
         var o = built.Observation;
@@ -274,7 +306,10 @@ public sealed class InbriskTools
         foreach (var f in o.Frames)
             if (f.Png != null)
                 content.Add(ImageContentBlock.FromBytes(f.Png, "image/png"));
-        return new CallToolResult { Content = content, IsError = false };
+        var finalResult = new CallToolResult { Content = content, IsError = false };
+        if (RequestDeduplicator.IsSafeForReadDeduplication("computer_observe", mode, autoScreenshot: false, hasCropOrRegion: false, finalResult, o.Frames.Count))
+            _s.Deduplicator.RecordRead("computer_observe", normArgs, scopeH, _s.Rt.MutationVersion, finalResult);
+        return finalResult;
     }
 
     [McpServerTool(Name = "computer_windows"), Description(
@@ -287,7 +322,26 @@ public sealed class InbriskTools
         "Windows matching the input-blocking signature are marked [INPUT-BLOCKING]; modal popups/dialogs and blocked windows are explicitly flagged.")]
     public CallToolResult Windows(CancellationToken ct = default)
     {
-        var wins = _s.Rt.Windows();
+        if (_s.Deduplicator.TryDeduplicateRead("computer_windows", "", 0, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedWin)
+            return cachedWin;
+
+        if (_s.PrevOutcome?.Kind == OutcomeKind.Verified)
+        {
+            _s.Telemetry.IncPostVerifiedObservation();
+            PerfTrace.Count("postVerifiedObservation");
+        }
+        if (_s.LastLaunchedHwnd != 0 && (DateTimeOffset.UtcNow - _s.LastLaunchTimestamp).TotalSeconds < 5)
+        {
+            _s.Telemetry.IncLaunchFollowupDiscovery();
+            PerfTrace.Count("launchFollowupDiscovery");
+        }
+        var prevCount = WindowSnapshot.EnumerationCount;
+        var wins = WindowSnapshot.GetWindows();
+        if (WindowSnapshot.EnumerationCount == prevCount)
+        {
+            _s.Telemetry.IncWindowSnapshotReuses();
+        }
+
         var monitors = _s.Rt.WindowService.GetMonitors();
         var blockers = InputHealth.FindBlockingWindows()
             .Select(b => b.Hwnd).ToHashSet();
@@ -331,40 +385,182 @@ public sealed class InbriskTools
                 $"rect=({w.Bounds.X},{w.Bounds.Y} {w.Bounds.Width}x{w.Bounds.Height})" +
                 flagStr);
         }
-        return Text(sb.ToString());
+        var finalResult = Text(sb.ToString());
+        _s.Deduplicator.RecordRead("computer_windows", "", 0, _s.Rt.MutationVersion, finalResult);
+        return finalResult;
+    }
+
+    private bool IsWindowAgentOwned(WindowInfo win)
+    {
+        lock (_s.TrackedWindows)
+        {
+            var tracked = _s.TrackedWindows.FirstOrDefault(tw => tw.Hwnd == win.Hwnd && !tw.ClosedOrStale);
+            if (tracked != null) return tracked.AgentOwned;
+
+            // Across HWND replacement: if window belongs to ApplicationFrameHost or matches launched identity/title
+            var replacement = _s.TrackedWindows.FirstOrDefault(tw => tw.AgentOwned && !tw.ClosedOrStale &&
+                ((tw.Pid == win.Pid && tw.Pid > 0 && !string.Equals(win.ProcessName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase)) ||
+                 (string.Equals(win.ProcessName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) &&
+                  (!string.IsNullOrEmpty(tw.AppIdentity) && win.Title.Contains(tw.AppIdentity, StringComparison.OrdinalIgnoreCase) ||
+                   !string.IsNullOrEmpty(tw.Title) && win.Title.Contains(tw.Title, StringComparison.OrdinalIgnoreCase)))));
+
+            if (replacement != null)
+            {
+                // Adopt replaced HWND into tracked windows
+                _s.TrackedWindows.Add(replacement with { Hwnd = win.Hwnd, Title = win.Title });
+                return true;
+            }
+        }
+        if (_s.Rt.Provenance.CanAgentClose(win.Hwnd, out _))
+            return true;
+        return false;
+    }
+
+    private LifecycleIntent GetTrackedLifecycleIntent(long hwnd)
+    {
+        lock (_s.TrackedWindows)
+        {
+            var tw = _s.TrackedWindows.FirstOrDefault(w => w.Hwnd == hwnd && !w.ClosedOrStale);
+            if (tw != null) return tw.Intent;
+        }
+        var prov = _s.Rt.Provenance.GetProvenanceForHwnd(hwnd);
+        return prov?.Intent ?? LifecycleIntent.Unknown;
+    }
+
+    private object BuildCandidateWindow(WindowInfo w) => new
+    {
+        hwnd = $"0x{w.Hwnd:X}",
+        pid = w.Pid,
+        title = w.Title,
+        process = w.ProcessName,
+        owned = IsWindowAgentOwned(w),
+        retryArgs = IsWindowAgentOwned(w) ? new { hwnd = $"0x{w.Hwnd:X}" } : null
+    };
+
+    private sealed class CloseScope : IAsyncDisposable
+    {
+        public IDisposable? GlobalLease { get; }
+        public List<IAsyncDisposable> ProcessBarriers { get; }
+        public bool IsForeground { get; }
+
+        public CloseScope(IDisposable? globalLease, List<IAsyncDisposable> processBarriers, bool isForeground)
+        {
+            GlobalLease = globalLease;
+            ProcessBarriers = processBarriers;
+            IsForeground = isForeground;
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            for (int i = ProcessBarriers.Count - 1; i >= 0; i--)
+            {
+                try { await ProcessBarriers[i].DisposeAsync().ConfigureAwait(false); } catch { }
+            }
+            try { GlobalLease?.Dispose(); } catch { }
+        }
+    }
+
+    private async Task<CloseScope> EnterCloseScopeAsync(IEnumerable<WindowInfo> targets, CancellationToken ct)
+    {
+        var targetList = targets.Where(t => t != null).ToList();
+
+        // Round 6: ALL top-level close operations are unconditionally serialized under Global Desktop Gate (Rank 1)
+        // to prevent TOCTOU races where a background window becomes foreground or triggers modal/activation transitions.
+        var arbiter = _s?.Arbiter ?? DesktopArbiter.Shared;
+        IDisposable? globalLease = null;
+        if (arbiter != null)
+        {
+            globalLease = await arbiter.AcquireAsync(
+                ownerId: _s?.SessionId ?? "session",
+                kind: LeaseKind.PhysicalInput,
+                description: "Close window global gate",
+                timeout: TimeSpan.FromSeconds(5),
+                ct: ct).ConfigureAwait(false);
+        }
+
+        var barriers = new List<IAsyncDisposable>();
+        try
+        {
+            if (_s?.Rt?.ReadScheduler != null)
+            {
+                var pids = targetList.Select(w => w.Pid).Where(p => p > 0).Distinct().OrderBy(p => p).ToList();
+                foreach (var pid in pids)
+                {
+                    barriers.Add(await _s.Rt.ReadScheduler.EnterMutationBarrierAsync(pid, ct).ConfigureAwait(false));
+                }
+            }
+        }
+        catch
+        {
+            globalLease?.Dispose();
+            throw;
+        }
+
+        return new CloseScope(globalLease, barriers, isForeground: true);
     }
 
     [McpServerTool(Name = "computer_close_window"), Description(
         "Gracefully close a window (posts WM_CLOSE — save prompts appear " +
         "normally, the app stays in control). Target by hwnd, process name, " +
-        "title substring, list of hwnds, or closeAllAgentWindows: true. Use this to clean up windows you opened when a " +
-        "task is done — don't leave them on the user's desktop. Protected " +
-        "host terminals, IDEs, and Colab sessions are guarded against accidental closure. " +
-        "By default, Inbrisk Application Lifecycle Policy permits closing ONLY applications " +
-        "opened by the agent (ownership: agent). Pre-existing user applications cannot be closed " +
-        "unless force:true is explicitly set. 'When in doubt, leave it open.'")]
-    public CallToolResult CloseWindow(
+        "title substring, list of hwnds, owned: true (closes purely ephemeral helper windows opened by the agent), " +
+        "or lastOwned: true (closes the most recent agent-owned window). Respects the conservative Application Lifecycle Policy: " +
+        "never close pre-existing user applications or protected processes. Do NOT automatically close windows merely because you opened them — " +
+        "leave user-facing results open (Notepad documents, browser tabs, Calculator, Explorer folders). 'When in doubt, leave it open.' " +
+        "Pre-existing user applications cannot be closed unless force:true is explicitly set.")]
+    public async Task<CallToolResult> CloseWindow(
         [Description("window handle — decimal or 0x-prefixed")] string? hwnd = null,
         [Description("batch list of window handles to close in one call")] string[]? hwnds = null,
         [Description("process name of the window to close, e.g. \"mspaint\"")] string? process = null,
         [Description("substring of the window title")] string? titleContains = null,
         [Description("semantic target object, e.g. {\"process\": \"notepad.exe\", \"hwnd\": \"0x...\"}")] TargetSpec? target = null,
-        [Description("close all windows opened during this session by the agent in a single turn")] bool closeAllAgentWindows = false,
+        [Description("close all open windows owned by the agent in this session (replaces guessed close loops)")] bool? owned = null,
+        [Description("close the most recent agent-owned window in this session")] bool? lastOwned = null,
+        [Description("close all windows opened during this session by the agent in a single turn (legacy alias for owned: true)")] bool closeAllAgentWindows = false,
         [Description("override lifecycle policy to close a pre-existing user window if explicitly requested by the user (default false)")] bool force = false,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
+        var normArgs = $"{hwnd}|{string.Join(",", hwnds ?? Array.Empty<string>())}|{process}|{titleContains}|{owned}|{lastOwned}|{closeAllAgentWindows}|{force}";
+        if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_close_window", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
+            return deduped;
+        if (conflictError != null)
+            return conflictError;
+
         hwnd ??= target?.Hwnd ?? (target?.Window != null && (target.Window.StartsWith("0x", StringComparison.OrdinalIgnoreCase) || long.TryParse(target.Window, out _)) ? target.Window : null);
         process ??= target?.Process;
         titleContains ??= target?.Name ?? target?.NameContains ?? (hwnd == null ? target?.Window : null);
 
         var wins = _s.Rt.Windows();
 
-        if (closeAllAgentWindows)
+        if (owned == true || closeAllAgentWindows)
         {
-            var closableWindows = wins
+            var combinedWins = wins.ToList();
+            lock (_s.TrackedWindows)
+            {
+                foreach (var tw in _s.TrackedWindows.Where(tw => tw.AgentOwned && !tw.ClosedOrStale))
+                {
+                    if (!combinedWins.Any(w => w.Hwnd == tw.Hwnd))
+                    {
+                        combinedWins.Add(new WindowInfo(tw.Hwnd, tw.Pid, tw.Title, tw.AppIdentity, new RectPx(0, 0, 800, 600), WindowState.Normal, true, false, true, 0));
+                    }
+                }
+            }
+
+            var closableWindows = combinedWins
                 .Where(x => !_s.Rt.WindowService.IsWindowProtected(x.Hwnd, out _))
-                .Where(x => force || _s.Rt.Provenance.CanAgentClose(x.Hwnd, out _))
+                .Where(x => IsWindowAgentOwned(x))
+                .Where(x =>
+                {
+                    if (closeAllAgentWindows || force) return true;
+                    // For automatic cleanup (owned: true): preserve Reusable, UserUseful, and TaskArtifact resources
+                    var intent = GetTrackedLifecycleIntent(x.Hwnd);
+                    if (intent is LifecycleIntent.Reusable or LifecycleIntent.UserUseful or LifecycleIntent.TaskArtifact)
+                        return false;
+                    return true;
+                })
                 .ToList();
+
+            await using var ownedScope = await EnterCloseScopeAsync(closableWindows, ct).ConfigureAwait(false);
 
             var closedList = new List<object>();
             int closedCount = 0;
@@ -373,6 +569,10 @@ public sealed class InbriskTools
                 var wasClosed = _s.Rt.CloseWindow(win.Hwnd);
                 var winModal = _s.Rt.WindowService.GetModalPopup(win.Hwnd);
                 var winHasModal = winModal != null && winModal.Hwnd != win.Hwnd;
+                if (!wasClosed && _s.Rt.Window(win.Hwnd) == null && !winHasModal)
+                {
+                    wasClosed = true;
+                }
                 if (!wasClosed && force && !winHasModal)
                 {
                     try
@@ -383,7 +583,11 @@ public sealed class InbriskTools
                     }
                     catch { }
                 }
-                if (wasClosed) closedCount++;
+                if (wasClosed)
+                {
+                    closedCount++;
+                    _s.MarkWindowClosed(win.Hwnd);
+                }
                 closedList.Add(new
                 {
                     hwnd = $"0x{win.Hwnd:X}",
@@ -394,7 +598,7 @@ public sealed class InbriskTools
                 });
             }
 
-            return Text(JsonSerializer.Serialize(new
+            var batchRes = Text(JsonSerializer.Serialize(new
             {
                 success = true,
                 batch = true,
@@ -403,10 +607,54 @@ public sealed class InbriskTools
                 windows = closedList,
                 notification = $"Closed {closedCount} windows opened by the agent."
             }, J));
+            _s.Deduplicator.RecordMutation(operationId, "computer_close_window", normArgs, batchRes);
+            return batchRes;
+        }
+
+        if (lastOwned == true)
+        {
+            SessionWindowProvenance? lastProv = null;
+            lock (_s.TrackedWindows)
+            {
+                lastProv = _s.TrackedWindows.LastOrDefault(tw => tw.AgentOwned && !tw.ClosedOrStale);
+            }
+
+            WindowInfo? lastWin = null;
+            if (lastProv != null)
+            {
+                lastWin = wins.FirstOrDefault(x => x.Hwnd == lastProv.Hwnd);
+                if (lastWin == null)
+                {
+                    lastWin = new WindowInfo(lastProv.Hwnd, lastProv.Pid, lastProv.Title, lastProv.AppIdentity, new RectPx(0, 0, 800, 600), WindowState.Normal, true, false, true, 0);
+                }
+            }
+            if (lastWin == null)
+            {
+                var agentWins = wins.Where(x => IsWindowAgentOwned(x)).ToList();
+                if (agentWins.Count > 0)
+                    lastWin = agentWins[^1];
+            }
+
+            if (lastWin == null)
+            {
+                _s.Telemetry.IncCloseRetry();
+                Inbrisk.Core.PerfTrace.Count("closeRetry");
+                return Text(JsonSerializer.Serialize(new
+                {
+                    error = "TargetNotFound",
+                    detail = "No open agent-owned window found to close via lastOwned.",
+                    candidates = wins.Take(10).Select(BuildCandidateWindow).ToList()
+                }, J));
+            }
+
+            hwnd = $"0x{lastWin.Hwnd:X}";
         }
 
         if (hwnds is { Length: > 0 })
         {
+            var targetWins = hwnds.Select(ParseHwnd).Where(h => h.HasValue).Select(h => wins.FirstOrDefault(x => x.Hwnd == h.Value)).Where(x => x != null).ToList();
+            await using var batchScope = await EnterCloseScopeAsync(targetWins!, ct).ConfigureAwait(false);
+
             var batchList = new List<object>();
             int batchClosed = 0;
             foreach (var hStr in hwnds)
@@ -422,14 +670,10 @@ public sealed class InbriskTools
                     batchList.Add(new { hwnd = $"0x{parsedHwnd:X}", closed = false, error = "TargetNotFound" });
                     continue;
                 }
-                if (_s.Rt.WindowService.IsWindowProtected(win.Hwnd, out var pr))
+                if (_s.Rt.WindowService.IsWindowProtected(win.Hwnd, out var pr) ||
+                    Inbrisk.Platform.Windows.Topology.WindowService.IsProcessProtected(win.ProcessName, out pr))
                 {
                     batchList.Add(new { hwnd = $"0x{win.Hwnd:X}", process = win.ProcessName, closed = false, error = "ProtectedWindow", detail = pr });
-                    continue;
-                }
-                if (!force && !_s.Rt.Provenance.CanAgentClose(win.Hwnd, out var lr))
-                {
-                    batchList.Add(new { hwnd = $"0x{win.Hwnd:X}", process = win.ProcessName, closed = false, error = "PolicyDenied", detail = lr });
                     continue;
                 }
                 var c = _s.Rt.CloseWindow(win.Hwnd);
@@ -445,7 +689,11 @@ public sealed class InbriskTools
                     }
                     catch { }
                 }
-                if (c) batchClosed++;
+                if (c)
+                {
+                    batchClosed++;
+                    _s.MarkWindowClosed(win.Hwnd);
+                }
                 batchList.Add(new
                 {
                     hwnd = $"0x{win.Hwnd:X}",
@@ -456,7 +704,7 @@ public sealed class InbriskTools
                 });
             }
 
-            return Text(JsonSerializer.Serialize(new
+            var hwndsRes = Text(JsonSerializer.Serialize(new
             {
                 success = true,
                 batch = true,
@@ -465,10 +713,38 @@ public sealed class InbriskTools
                 windows = batchList,
                 notification = $"Closed {batchClosed} of {hwnds.Length} windows."
             }, J));
+            _s.Deduplicator.RecordMutation(operationId, "computer_close_window", normArgs, hwndsRes);
+            return hwndsRes;
         }
+
+        if (hwnd == null && string.IsNullOrWhiteSpace(process) && string.IsNullOrWhiteSpace(titleContains) && target == null)
+        {
+            _s.Telemetry.IncCloseRetry();
+            Inbrisk.Core.PerfTrace.Count("closeRetry");
+            return Text(JsonSerializer.Serialize(new
+            {
+                error = "Malformed",
+                detail = "Untargeted close is not permitted. Untargeted close will never select the foreground window. Specify hwnd, hwnds, process, titleContains, owned:true, or lastOwned:true.",
+                candidates = wins.Take(10).Select(BuildCandidateWindow).ToList()
+            }, J));
+        }
+
         WindowInfo? w = null;
         if (ParseHwnd(hwnd) is { } h)
+        {
             w = wins.FirstOrDefault(x => x.Hwnd == h);
+            if (w == null)
+            {
+                lock (_s.TrackedWindows)
+                {
+                    var tw = _s.TrackedWindows.FirstOrDefault(x => x.Hwnd == h && !x.ClosedOrStale);
+                    if (tw != null)
+                    {
+                        w = new WindowInfo(tw.Hwnd, tw.Pid, tw.Title, tw.AppIdentity, new RectPx(0, 0, 800, 600), WindowState.Normal, true, false, true, 0);
+                    }
+                }
+            }
+        }
         else if (!string.IsNullOrWhiteSpace(process))
         {
             var hits = wins
@@ -482,19 +758,19 @@ public sealed class InbriskTools
 
             if (hits.Count > 1)
             {
-                var agentHits = hits.Where(x => _s.Rt.Provenance.CanAgentClose(x.Hwnd, out _)).ToList();
+                var agentHits = hits.Where(x => IsWindowAgentOwned(x)).ToList();
                 if (agentHits.Count == 1)
                     w = agentHits[0];
                 else
                 {
-                    var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
-                    var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
-                    if (fgHit != null)
-                        w = fgHit;
-                    else
-                        return Text(JsonSerializer.Serialize(new { error = "AmbiguousTarget",
-                            detail = $"{hits.Count} windows owned by '{process}' — pick one by hwnd",
-                            candidates = hits.Select(x => $"0x{x.Hwnd:X} \"{x.Title}\"").ToList() }, J));
+                    _s.Telemetry.IncCloseRetry();
+                    Inbrisk.Core.PerfTrace.Count("closeRetry");
+                    return Text(JsonSerializer.Serialize(new
+                    {
+                        error = "AmbiguousTarget",
+                        detail = $"{hits.Count} windows owned by '{process}' — pick one by hwnd",
+                        candidates = hits.Select(BuildCandidateWindow).ToList()
+                    }, J));
                 }
             }
             else
@@ -510,19 +786,19 @@ public sealed class InbriskTools
 
             if (hits.Count > 1)
             {
-                var agentHits = hits.Where(x => _s.Rt.Provenance.CanAgentClose(x.Hwnd, out _)).ToList();
+                var agentHits = hits.Where(x => IsWindowAgentOwned(x)).ToList();
                 if (agentHits.Count == 1)
                     w = agentHits[0];
                 else
                 {
-                    var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
-                    var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
-                    if (fgHit != null)
-                        w = fgHit;
-                    else
-                        return Text(JsonSerializer.Serialize(new { error = "AmbiguousTarget",
-                            detail = $"{hits.Count} windows match '{titleContains}' — pick one by hwnd",
-                            candidates = hits.Select(x => $"0x{x.Hwnd:X} \"{x.Title}\"").ToList() }, J));
+                    _s.Telemetry.IncCloseRetry();
+                    Inbrisk.Core.PerfTrace.Count("closeRetry");
+                    return Text(JsonSerializer.Serialize(new
+                    {
+                        error = "AmbiguousTarget",
+                        detail = $"{hits.Count} windows match '{titleContains}' — pick one by hwnd",
+                        candidates = hits.Select(BuildCandidateWindow).ToList()
+                    }, J));
                 }
             }
             else
@@ -530,14 +806,21 @@ public sealed class InbriskTools
                 w = hits.FirstOrDefault();
             }
         }
-        else return Text(JsonSerializer.Serialize(new { error = "Malformed",
-            detail = "pass hwnd, process, titleContains, or target: {process: ...}" }, J));
 
         if (w == null)
-            return Text(JsonSerializer.Serialize(new { error = "TargetNotFound",
-                detail = "no matching window — list candidates with computer_windows" }, J));
+        {
+            _s.Telemetry.IncCloseRetry();
+            Inbrisk.Core.PerfTrace.Count("closeRetry");
+            return Text(JsonSerializer.Serialize(new
+            {
+                error = "TargetNotFound",
+                detail = "no matching window found",
+                candidates = wins.Take(10).Select(BuildCandidateWindow).ToList()
+            }, J));
+        }
 
-        if (_s.Rt.WindowService.IsWindowProtected(w.Hwnd, out var protectReason))
+        if (_s.Rt.WindowService.IsWindowProtected(w.Hwnd, out var protectReason) ||
+            Inbrisk.Platform.Windows.Topology.WindowService.IsProcessProtected(w.ProcessName, out protectReason))
         {
             return Text(JsonSerializer.Serialize(new
             {
@@ -562,23 +845,16 @@ public sealed class InbriskTools
             }, J));
         }
 
-        if (!force && !_s.Rt.Provenance.CanAgentClose(w.Hwnd, out var lifecycleReason))
-        {
-            return Text(JsonSerializer.Serialize(new
-            {
-                error = "PolicyDenied",
-                hwnd = $"0x{w.Hwnd:X}",
-                title = w.Title,
-                process = w.ProcessName,
-                ownership = "user",
-                openedByAgent = false,
-                detail = lifecycleReason + " If the user explicitly instructed you to close this user-owned application, pass force: true."
-            }, J));
-        }
+        await using var singleScope = await EnterCloseScopeAsync(new[] { w }, ct).ConfigureAwait(false);
 
         var closed = _s.Rt.CloseWindow(w.Hwnd);
         var modal = _s.Rt.WindowService.GetModalPopup(w.Hwnd);
         var hasModal = modal != null && modal.Hwnd != w.Hwnd;
+
+        if (!closed && _s.Rt.Window(w.Hwnd) == null && !hasModal)
+        {
+            closed = true;
+        }
 
         if (!closed && force)
         {
@@ -594,6 +870,7 @@ public sealed class InbriskTools
                     process = w.ProcessName,
                     hasUnsavedDataPrompt = true,
                     modalPopup = $"0x{modal!.Hwnd:X} \"{modal.Title}\"",
+                    next = "dismiss_modal",
                     detail = $"WM_CLOSE posted to '{w.ProcessName}', but window remains open because an unsaved changes confirmation dialog appeared (0x{modal.Hwnd:X} \"{modal.Title}\"). Force-kill was prevented to avoid data loss. Resolve or interact with the save prompt."
                 }, J));
             }
@@ -619,7 +896,8 @@ public sealed class InbriskTools
 
         if (closed)
         {
-            return Text(JsonSerializer.Serialize(new
+            _s.MarkWindowClosed(w.Hwnd);
+            var successResult = Text(JsonSerializer.Serialize(new
             {
                 success = true,
                 closed = true,
@@ -629,9 +907,13 @@ public sealed class InbriskTools
                 notification = $"Closed {w.ProcessName} — no longer needed for this task.",
                 detail = $"Closed '{w.ProcessName}' (0x{w.Hwnd:X}) — application was opened by the agent and is no longer needed for this task."
             }, J));
+            _s.Deduplicator.RecordMutation(operationId, "computer_close_window", normArgs, successResult);
+            return successResult;
         }
         else
         {
+            _s.Telemetry.IncCloseRetry();
+            Inbrisk.Core.PerfTrace.Count("closeRetry");
             return Text(JsonSerializer.Serialize(new
             {
                 success = false,
@@ -644,6 +926,7 @@ public sealed class InbriskTools
                 detail = hasModal
                     ? $"WM_CLOSE posted to '{w.ProcessName}', but window remains open because an unsaved changes confirmation dialog appeared (0x{modal!.Hwnd:X} \"{modal.Title}\"). To protect user data, the window was not force-killed. Inspect or interact with the dialog."
                     : "WM_CLOSE posted but window still exists — it may be showing a save prompt (observe it) or the app hung",
+                candidates = wins.Take(10).Select(BuildCandidateWindow).ToList()
             }, J));
         }
     }
@@ -717,66 +1000,257 @@ public sealed class InbriskTools
         "click-through without killing them. This tool never clicks, types, " +
         "or presses anything — safe to call anytime, including while " +
         "emergency-stopped.")]
-    public CallToolResult ResetInput(
+    public Task<CallToolResult> ResetInput(
         [Description("also make detected input-blocking windows click-through")] bool? fixBlockingWindows = null,
+        [Description("deprecated model parameter: cannot bypass healthy active input operations")] bool force = false,
+        CancellationToken ct = default)
+        => ResetInputCore(fixBlockingWindows, privilegedBypass: false, ct);
+
+    internal Task<CallToolResult> PrivilegedResetInputAsync(
+        bool? fixBlockingWindows = null,
+        CancellationToken ct = default)
+        => ResetInputCore(fixBlockingWindows, privilegedBypass: true, ct);
+
+    internal async Task<CallToolResult> ResetInputCore(
+        bool? fixBlockingWindows,
+        bool privilegedBypass,
         CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        var input = _s.Rt.Parts.Input;
-        var before = input.DiagnoseInput();
-        input.SweepAll(); // release-only — allowed even when EmergencyStopped
-        var after = input.DiagnoseInput();
-        var blockers = InputHealth.FindBlockingWindows();
-        var fixedHwnds = new List<long>();
-        if (fixBlockingWindows == true)
-            foreach (var b in blockers)
-                if (InputHealth.MakeClickThrough(b.Hwnd))
-                    fixedHwnds.Add(b.Hwnd);
 
-        var sb = new StringBuilder();
-        // root-cause report: what was held (Inbrisk-owned vs physical), what
-        // was released, what remains — the data a lockup diagnosis needs
-        sb.AppendLine(JsonSerializer.Serialize(new Dictionary<string, object?>
+        var arbiter = _s?.Arbiter ?? DesktopArbiter.Shared;
+        var activePhysical = arbiter.GetExclusiveOwner();
+
+        bool isEmergency = _s.Control.State == ComputerControlState.EmergencyStopped || EmergencyGate.IsStopped;
+        bool isStaleOrHung = activePhysical != null && (DateTimeOffset.UtcNow >= activePhysical.ExpiresAt || !activePhysical.IsActive);
+
+        // Round 6: Immediate bypass strictly requires EmergencyStopped, a verified stale/hung lease,
+        // or explicit internal privileged authorization. Normal MCP model calls (including force:true)
+        // are NEVER granted immediate bypass over healthy active physical leases.
+        bool isRecoveryBypass = isEmergency || isStaleOrHung || privilegedBypass;
+
+        IInputLease? normalLease = null;
+        if (!isRecoveryBypass && activePhysical != null)
         {
-            ["resetReason"] = "manual computer_reset_input",
-            ["before"] = before,
-            ["recovery"] = "sent UP for all modifiers + mouse buttons (untracked holds included)",
-            ["after"] = after,
-        }, J));
-        sb.AppendLine($"blocking windows: {blockers.Count}" +
-            (fixedHwnds.Count > 0 ? $" — made click-through: {fixedHwnds.Count}" : ""));
-        foreach (var b in blockers)
-            sb.AppendLine($"  0x{b.Hwnd:X} \"{b.Title}\" {b.ProcessName} pid={b.Pid} " +
-                $"({b.Bounds.X},{b.Bounds.Y} {b.Bounds.Width}x{b.Bounds.Height}) " +
-                $"monitor={b.MonitorIndex} coverage={b.Coverage:0.00} " +
-                $"exStyle=0x{b.ExStyle:X8}" +
-                (fixedHwnds.Contains(b.Hwnd) ? "  [fixed → click-through]" : ""));
-        if (blockers.Count > 0 && fixBlockingWindows != true)
-            sb.AppendLine("hint: call again with fixBlockingWindows:true to make " +
-                "these windows click-through");
-        return Text(sb.ToString());
+            // Healthy physical input sequence in progress: do NOT corrupt active operation.
+            // Wait behind the Global Desktop Gate to sweep cleanly once the healthy operation completes.
+            try
+            {
+                normalLease = await arbiter.AcquireAsync("reset_input", LeaseKind.PhysicalInput, "clean input reset", timeout: TimeSpan.FromSeconds(5), ct: ct).ConfigureAwait(false);
+            }
+            catch (TimeoutException)
+            {
+                // Timed out waiting for active lease: classify as hung and proceed with recovery sweep
+                arbiter.CancelTask(activePhysical.OwnerId, "reset_input timed out waiting for physical lease");
+                isRecoveryBypass = true;
+            }
+        }
+        else if (!isRecoveryBypass && activePhysical == null)
+        {
+            try
+            {
+                normalLease = await arbiter.AcquireAsync("reset_input", LeaseKind.PhysicalInput, "clean input reset", timeout: TimeSpan.FromSeconds(2), ct: ct).ConfigureAwait(false);
+            }
+            catch { }
+        }
+
+        try
+        {
+            var input = _s.Rt.Parts.Input;
+            var before = input.DiagnoseInput();
+            input.SweepAll(); // release-only — allowed even when EmergencyStopped
+            var after = input.DiagnoseInput();
+            var blockers = InputHealth.FindBlockingWindows();
+            var fixedHwnds = new List<long>();
+            if (fixBlockingWindows == true)
+                foreach (var b in blockers)
+                    if (InputHealth.MakeClickThrough(b.Hwnd))
+                        fixedHwnds.Add(b.Hwnd);
+
+            var sb = new StringBuilder();
+            // root-cause report: what was held (Inbrisk-owned vs physical), what
+            // was released, what remains — the data a lockup diagnosis needs
+            sb.AppendLine(JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["resetReason"] = isRecoveryBypass ? (isEmergency ? "emergency stop recovery" : (isStaleOrHung ? "stale/hung lease recovery" : "privileged recovery")) : "normal input reset",
+                ["recoveryBypassedGate"] = isRecoveryBypass,
+                ["before"] = before,
+                ["recovery"] = "sent UP for all modifiers + mouse buttons (untracked holds included)",
+                ["after"] = after,
+            }, J));
+            sb.AppendLine($"blocking windows: {blockers.Count}" +
+                (fixedHwnds.Count > 0 ? $" — made click-through: {fixedHwnds.Count}" : ""));
+            foreach (var b in blockers)
+                sb.AppendLine($"  0x{b.Hwnd:X} \"{b.Title}\" {b.ProcessName} pid={b.Pid} " +
+                    $"({b.Bounds.X},{b.Bounds.Y} {b.Bounds.Width}x{b.Bounds.Height}) " +
+                    $"monitor={b.MonitorIndex} coverage={b.Coverage:0.00} " +
+                    $"exStyle=0x{b.ExStyle:X8}" +
+                    (fixedHwnds.Contains(b.Hwnd) ? "  [fixed → click-through]" : ""));
+            if (blockers.Count > 0 && fixBlockingWindows != true)
+                sb.AppendLine("hint: call again with fixBlockingWindows:true to make " +
+                    "these windows click-through");
+            return Text(sb.ToString());
+        }
+        finally
+        {
+            normalLease?.Dispose();
+        }
+    }
+
+    private async Task<CallToolResult> ExecuteWithIdempotencyAsync(
+        string? operationId,
+        string toolName,
+        string normalizedArgs,
+        Func<Task<CallToolResult>> action)
+    {
+        if (_s.Deduplicator.TryDeduplicateMutation(operationId, toolName, normalizedArgs, _s.Telemetry, out var conflictError) is { } deduped)
+            return deduped;
+        if (conflictError != null)
+            return conflictError;
+
+        var res = await action();
+        _s.Deduplicator.RecordMutation(operationId, toolName, normalizedArgs, res);
+        return res;
+    }
+
+    private CallToolResult ExecuteWithIdempotency(
+        string? operationId,
+        string toolName,
+        string normalizedArgs,
+        Func<CallToolResult> action)
+    {
+        if (_s.Deduplicator.TryDeduplicateMutation(operationId, toolName, normalizedArgs, _s.Telemetry, out var conflictError) is { } deduped)
+            return deduped;
+        if (conflictError != null)
+            return conflictError;
+
+        var res = action();
+        _s.Deduplicator.RecordMutation(operationId, toolName, normalizedArgs, res);
+        return res;
+    }
+
+    internal Dictionary<string, object?> BuildInitialAppMap(long hwnd, int? pid, string? title, string? appName = null)
+    {
+        var sw = Stopwatch.StartNew();
+        var fg = _s.Rt.ForegroundWindow();
+        var isFocused = fg?.Hwnd == hwnd;
+        var modal = _s.Rt.WindowService.GetModalPopup(hwnd);
+
+        const int maxActionables = 12;
+        const int maxLandmarks = 6;
+        const int maxNodesVisited = 50;
+        var timeBudget = TimeSpan.FromMilliseconds(200);
+
+        IReadOnlyList<UiElement> els = Array.Empty<UiElement>();
+        bool truncated = false;
+        int comPropertyReads = 0;
+
+        try
+        {
+            var findSpec = new FindSpec(Hwnd: hwnd, MaxResults: maxNodesVisited);
+            els = _s.Rt.Find(findSpec);
+            comPropertyReads += els.Count * 2;
+        }
+        catch { }
+
+        if (sw.Elapsed > timeBudget || els.Count >= maxNodesVisited)
+        {
+            truncated = true;
+        }
+
+        var prioritized = els
+            .Where(e => e.Actions.Count > 0 || e.Role is Inbrisk.Core.Role.Button or Inbrisk.Core.Role.Edit or Inbrisk.Core.Role.MenuItem or Inbrisk.Core.Role.TabItem or Inbrisk.Core.Role.CheckBox)
+            .Take(maxActionables)
+            .Select(e => new Dictionary<string, object?>
+            {
+                ["id"] = e.Id,
+                ["role"] = e.Role.ToString(),
+                ["name"] = e.Name,
+                ["actions"] = e.Actions,
+                ["bounds"] = $"({e.Bounds.X},{e.Bounds.Y} {e.Bounds.Width}x{e.Bounds.Height})"
+            })
+            .ToList();
+
+        var landmarks = els
+            .Where(e => e.Role is Inbrisk.Core.Role.TitleBar or Inbrisk.Core.Role.Menu or Inbrisk.Core.Role.Toolbar or Inbrisk.Core.Role.Tab)
+            .Select(e => e.Name)
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct()
+            .Take(maxLandmarks)
+            .ToList();
+
+        // Incorporate persistent profile knowledge
+        if (_s?.ProfileStore != null)
+        {
+            try
+            {
+                var queryName = appName ?? title;
+                if (!string.IsNullOrEmpty(queryName))
+                {
+                    var id = new ApplicationIdentity(displayName: queryName);
+                    var profile = _s.ProfileStore.GetProfile(id);
+                    if (profile?.Landmarks != null)
+                    {
+                        foreach (var lmName in profile.Landmarks.Keys)
+                        {
+                            if (!landmarks.Contains(lmName, StringComparer.OrdinalIgnoreCase))
+                            {
+                                landmarks.Add(lmName);
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        var map = new Dictionary<string, object?>
+        {
+            ["hwnd"] = $"0x{hwnd:X}",
+            ["pid"] = pid,
+            ["title"] = title,
+            ["ready"] = true,
+            ["focused"] = isFocused,
+            ["landmarks"] = landmarks,
+            ["firstActionables"] = prioritized,
+            ["modal"] = (modal != null && modal.Hwnd != hwnd) ? new { hwnd = $"0x{modal.Hwnd:X}", title = modal.Title } : null
+        };
+
+        if (truncated)
+        {
+            map["truncated"] = true;
+        }
+
+        sw.Stop();
+        var jsonBytes = JsonSerializer.SerializeToUtf8Bytes(map);
+        _s.Telemetry.RecordInitialMapMetrics(
+            sw.Elapsed.TotalMilliseconds,
+            els.Count,
+            prioritized.Count,
+            landmarks.Count,
+            jsonBytes.Length,
+            truncated,
+            comPropertyReads
+        );
+
+        return map;
     }
 
     [McpServerTool(Name = "computer_launch"), Description(
         "Launch a Windows application by friendly name — the supported " +
         "replacement for shelling out to PowerShell/Start-Process. " +
+        "DO NOT call computer_apps before launch solely to discover an app — call computer_launch directly. " +
         "Resolves through Windows app registration in a deterministic " +
         "pipeline: already-running window → Start Menu → App Paths → " +
         "packaged apps (AUMID) → executable on PATH → registered URI " +
         "scheme. With waitFor:\"window\" (default) it returns only after a " +
         "usable, UIA-reachable top-level window exists — not merely when a " +
-        "process was spawned. Idempotent: a running app is reused " +
-        "(launchState=AlreadyRunning) unless newInstance:true. This is a " +
-        "mutating computer action — denied while emergency-stopped, and it " +
-        "never runs shell interpreters; arguments are a structured array, " +
-        "never a command line. A friendly name matching several DISTINCT " +
-        "apps returns AmbiguousApplication + candidates — pick one and " +
-        "call computer_launch again immediately with the candidate's " +
-        "identifier; do not narrate intermediate steps. " +
-        "search: searches the installed-apps catalog (computer_apps) and " +
-        "opens the best match — same pipeline as app. " +
+        "process was spawned. Includes a compact initialMap with landmarks and firstActionables so " +
+        "follow-up discovery calls are unnecessary. Idempotent: a running app is reused " +
+        "(launchState=AlreadyRunning) unless newInstance:true. " +
+        "A friendly name matching several DISTINCT apps returns AmbiguousApplication + structured candidates with exact retryArgs. " +
         "Heavy applications (e.g. Blender, IDEs, browsers) take time to load shaders, splash screens, and modules — computer_launch waits automatically (default 25000ms). Do NOT immediately re-launch or conclude failure if an app takes a moment to load; inspect or observe instead of looping launch.")]
-    public CallToolResult Launch(
+    public async Task<CallToolResult> Launch(
         [Description("friendly app name (\"Spotify\", \"Notepad\", \"Calculator\") — preferred")] string? app = null,
         [Description("search installed apps and open the best match — alias of app (\"Unreal\" finds UnrealEditor)")] string? search = null,
         [Description("executable name or path (\"notepad.exe\")")] string? executable = null,
@@ -788,14 +1262,37 @@ public sealed class InbriskTools
         [Description("window (default) | process | none")] string? waitFor = null,
         [Description("readiness timeout ms — default 25000")] int? timeoutMs = null,
         [Description("optional remote debugging port for Chrome DevTools Protocol / CDP (e.g. 9222)")] int? debugPort = null,
+        [Description("optional post-launch continuation steps executed via canonical plan executor")] RunStep[]? then = null,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
+        var normArgs = $"{app}|{search}|{executable}|{path}|{aumid}|{uri}|{string.Join(",", arguments ?? Array.Empty<string>())}|{newInstance}|{waitFor}|{timeoutMs}|{debugPort}|{then?.Length}";
+        if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_launch", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
+            return deduped;
+        if (conflictError != null)
+            return conflictError;
+
+        if (uri != null)
+        {
+            if (!DeepLinkSecurity.IsSafeDeepLink(uri, out var reason))
+            {
+                return Error(OutcomeKind.PolicyDenied, $"Unsafe deep link URI blocked: {reason}");
+            }
+        }
+
+        if (DateTimeOffset.UtcNow - _s.LastAppsQueryTimestamp < TimeSpan.FromSeconds(5))
+        {
+            _s.Telemetry.IncAppsThenLaunchWithin5s();
+            PerfTrace.Count("appsThenLaunchWithin5s");
+        }
+
         var epoch = _s.Control.ActionToken();
         if (epoch == null)
             return Error(OutcomeKind.EmergencyStopped,
                 StoppedDetail);
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(
             ct, _s.SessionCts.Token, epoch.Value);
+        var sw = Stopwatch.StartNew();
 
         var ids = new[]
         {
@@ -812,17 +1309,37 @@ public sealed class InbriskTools
             return Error(OutcomeKind.Malformed,
                 "arguments only apply to executable launches");
 
-        LaunchResult r;
+        // Canonical lock ordering: Acquire GLOBAL DESKTOP GATE (Rank 1) BEFORE launch/spawn/activate.
+        var arbiter = _s?.Arbiter ?? DesktopArbiter.Shared;
+        IInputLease? globalLease = null;
         try
         {
-            r = _s.Rt.Launch(new LaunchSpec(app ?? search, executable, path,
-                aumid, uri, arguments, newInstance ?? false,
-                waitFor ?? "window", timeoutMs ?? 25000, debugPort), linked.Token);
+            globalLease = await arbiter.AcquireAsync(
+                ownerId: _s?.SessionId ?? "session",
+                kind: LeaseKind.PhysicalInput,
+                description: $"Launch: {app ?? search ?? executable ?? path ?? aumid ?? uri}",
+                timeout: TimeSpan.FromMilliseconds(timeoutMs ?? 25000),
+                ct: linked.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (TimeoutException tex)
         {
-            return Error(OutcomeKind.Cancelled, "launch cancelled");
+            return Error(OutcomeKind.ConcurrencyConflict, $"Global desktop gate timed out: {tex.Message}");
         }
+
+        try
+        {
+            var preSnapshot = _s.CapturePreLaunchSnapshot();
+            LaunchResult r;
+            try
+            {
+                r = _s.Rt.Launch(new LaunchSpec(app ?? search, executable, path,
+                    aumid, uri, arguments, newInstance ?? false,
+                    waitFor ?? "window", timeoutMs ?? 25000, debugPort), linked.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                return Error(OutcomeKind.Cancelled, "launch cancelled");
+            }
 
         if (!r.Success)
         {
@@ -836,11 +1353,21 @@ public sealed class InbriskTools
                 _ => OutcomeKind.Failed,
             };
             var sb = new StringBuilder(r.ErrorDetail ?? r.Error);
+            var candidatesList = new List<object>();
             if (r.Candidates is { Count: > 0 } cs)
             {
                 sb.Append("\ncandidates:");
                 foreach (var c in cs)
+                {
                     sb.Append($"\n  {c.Name}  [{c.Method}]  {c.Identifier}");
+                    candidatesList.Add(new
+                    {
+                        name = c.Name,
+                        method = c.Method.ToString(),
+                        identifier = c.Identifier,
+                        retryArgs = new Dictionary<string, string> { [c.Method.ToString().ToLowerInvariant()] = c.Identifier }
+                    });
+                }
                 sb.Append("\n→ pick one and call computer_launch again " +
                     "now with that identifier — do not narrate");
             }
@@ -851,27 +1378,219 @@ public sealed class InbriskTools
                 {
                     sb.Append("\nclosest registered apps:");
                     foreach (var a in near)
+                    {
                         sb.Append($"\n  {a.Name}  [{a.Method}/{a.Kind}]  {a.Launch}");
+                        candidatesList.Add(new
+                        {
+                            name = a.Name,
+                            kind = a.Kind.ToString(),
+                            launch = a.Launch,
+                            retryArgs = new { app = a.Name }
+                        });
+                    }
                     sb.Append("\n→ retry computer_launch with one of these " +
                         "args now — do not narrate");
                 }
             }
-            return Error(kind, sb.ToString());
+            var errObj = new Dictionary<string, object?>
+            {
+                ["error"] = r.Error,
+                ["detail"] = sb.ToString(),
+                ["candidates"] = candidatesList.Count > 0 ? candidatesList : null
+            };
+            return Error(kind, JsonSerializer.Serialize(errObj, J));
         }
 
         // record the window as session scope so a following
         // computer_run within:/wait_for can target it
-        if (r.Hwnd is { } h)
-            _s.ScopeHwnd = h;
-        return Text(JsonSerializer.Serialize(new Dictionary<string, object?>
+        Dictionary<string, object?>? initialMap = null;
+        long targetHwnd = r.Hwnd ?? 0;
+        int targetPid = r.Pid ?? 0;
+
+        if (targetHwnd == 0 && r.Success)
+        {
+            var win = _s.Rt.Windows().FirstOrDefault(w => r.Pid.HasValue && w.Pid == r.Pid.Value);
+            if (win != null)
+            {
+                targetHwnd = win.Hwnd;
+                targetPid = win.Pid;
+            }
+        }
+
+        DateTimeOffset? finalStartTime = null;
+        if (targetPid > 0)
+        {
+            try
+            {
+                using var targetProc = Process.GetProcessById(targetPid);
+                finalStartTime = targetProc.StartTime;
+            }
+            catch { }
+        }
+
+        var foundWin = _s.Rt.Windows().FirstOrDefault(w => (targetHwnd != 0 && w.Hwnd == targetHwnd) || (targetPid > 0 && w.Pid == targetPid));
+        string? targetProcName = foundWin?.ProcessName;
+        if (targetProcName == null && targetPid > 0)
+        {
+            try
+            {
+                using var targetP = Process.GetProcessById(targetPid);
+                targetProcName = targetP.ProcessName;
+            }
+            catch { }
+        }
+
+        bool isHostedProcess = string.Equals(targetProcName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) ||
+                               r.Method == LaunchMethod.Aumid ||
+                               !string.IsNullOrEmpty(aumid);
+
+        bool agentOwned = LaunchCreationEvidenceEvaluator.EvaluateAgentOwnership(
+            preSnapshot,
+            finalHwnd: targetHwnd,
+            finalPid: targetPid,
+            finalPidStartTime: finalStartTime,
+            spawnedPid: r.Pid,
+            launchState: r.LaunchState,
+            hasExplicitProcessSpawn: r.Pid.HasValue && r.Pid.Value > 0,
+            isHostedProcess: isHostedProcess
+        );
+        bool alreadyRunning = !agentOwned || r.LaunchState == "AlreadyRunning";
+
+        IAsyncDisposable? targetBarrier = null;
+        if (targetPid > 0 && _s?.Rt?.ReadScheduler != null)
+        {
+            targetBarrier = await _s.Rt.ReadScheduler.EnterMutationBarrierAsync(targetPid, linked.Token).ConfigureAwait(false);
+        }
+
+        // Foreground activation and process spawn are complete: release Global Desktop Gate early
+        // so unrelated physical tasks are not blocked during initial-map UIA tree inspection.
+        globalLease?.Dispose();
+        globalLease = null;
+
+        try
+        {
+            if (targetHwnd != 0)
+            {
+                _s.ScopeHwnd = targetHwnd;
+                _s.LastLaunchTimestamp = DateTimeOffset.UtcNow;
+                _s.LastLaunchedHwnd = targetHwnd;
+
+                var appNorm = (r.ResolvedName ?? app ?? search ?? executable ?? aumid ?? "").ToLowerInvariant();
+                var intent = LifecycleIntent.Unknown;
+                if (appNorm.Contains("calc")) intent = LifecycleIntent.Reusable;
+                else if (appNorm.Contains("notepad") || appNorm.Contains("word") || appNorm.Contains("code")) intent = LifecycleIntent.TaskArtifact;
+                else if (appNorm.Contains("explorer")) intent = LifecycleIntent.UserUseful;
+
+                _s.RecordWindowLaunch(
+                    launchRunId: null,
+                    hwnd: targetHwnd,
+                    pid: targetPid,
+                    appIdentity: r.ResolvedName ?? (app ?? search ?? executable ?? path ?? aumid ?? uri ?? ""),
+                    title: r.WindowTitle ?? "",
+                    agentOwned: agentOwned,
+                    alreadyRunning: alreadyRunning,
+                    intent: intent
+                );
+                if (agentOwned && targetPid > 0)
+                {
+                    _s.Rt.Provenance.RegisterAgentLaunch(targetPid, targetProcName ?? r.ResolvedName ?? app ?? "app", targetHwnd, r.ResolvedName ?? app, intent);
+                }
+                initialMap = BuildInitialAppMap(targetHwnd, targetPid, r.WindowTitle, r.ResolvedName ?? app ?? search);
+            }
+            else
+            {
+                initialMap = new Dictionary<string, object?>
+                {
+                    ["hwnd"] = null,
+                    ["pid"] = r.Pid,
+                    ["title"] = r.WindowTitle,
+                    ["landmarks"] = Array.Empty<string>(),
+                    ["firstActionables"] = Array.Empty<object>()
+                };
+            }
+        }
+        finally
+        {
+            if (targetBarrier != null)
+            {
+                await targetBarrier.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+
+        string next = "none";
+        bool nextObservationRequired = false;
+
+        var hasModal = initialMap != null && initialMap.TryGetValue("modal", out var mVal) && mVal != null;
+        var isTruncated = initialMap != null && initialMap.TryGetValue("truncated", out var tVal) && tVal is true;
+        var actionableCount = 0;
+        if (initialMap != null && initialMap.TryGetValue("firstActionables", out var faObj) && faObj is System.Collections.IEnumerable enumerable)
+        {
+            foreach (var _ in enumerable) actionableCount++;
+        }
+
+        if (hasModal)
+        {
+            next = "dismiss_modal";
+            nextObservationRequired = true;
+        }
+        else if (isTruncated || initialMap == null || actionableCount == 0)
+        {
+            next = "inspect";
+            nextObservationRequired = true;
+        }
+        else
+        {
+            next = "none";
+            nextObservationRequired = false;
+        }
+
+
+        if (hasModal && then != null && then.Length > 0)
+        {
+            var pauseRes = Text(JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["status"] = "Paused",
+                ["pauseReason"] = "UnexpectedModal",
+                ["app"] = r.ResolvedName,
+                ["modal"] = initialMap?["modal"],
+                ["note"] = "Launch completed but an unexpected modal appeared before continuation could run; execution paused for resolution.",
+                ["resumable"] = true
+            }, J));
+            _s.Deduplicator.RecordMutation(operationId, "computer_launch", normArgs, pauseRes);
+            return pauseRes;
+        }
+
+        object? continuationOutcome = null;
+        if (then != null && then.Length > 0)
+        {
+            var planResult = await RunPlanCore(then, null, Stopwatch.StartNew(), linked.Token, detail: "slim").ConfigureAwait(false);
+            try
+            {
+                if (planResult.Content is [TextContentBlock { Text: { } rawJson }])
+                {
+                    continuationOutcome = JsonSerializer.Deserialize<Dictionary<string, object?>>(rawJson, J);
+                }
+            }
+            catch { }
+            if (continuationOutcome == null)
+            {
+                continuationOutcome = planResult.Content;
+            }
+        }
+
+        var launchRes = Text(JsonSerializer.Serialize(new Dictionary<string, object?>
         {
             ["status"] = "Verified",
+            ["next"] = next,
+            ["nextObservationRequired"] = nextObservationRequired,
             ["app"] = r.ResolvedName,
             ["method"] = r.Method?.ToString(),
             ["process"] = r.Pid is { } p
                 ? new { pid = p } : null,
             ["window"] = r.Hwnd is { } wh
                 ? new { hwnd = $"0x{wh:X}", title = r.WindowTitle } : null,
+            ["initialMap"] = initialMap,
+            ["continuation"] = continuationOutcome,
             ["launchState"] = r.LaunchState,
             ["alreadyRunning"] = r.LaunchState == "AlreadyRunning",
             ["note"] = r.LaunchState == "AlreadyRunning"
@@ -880,19 +1599,21 @@ public sealed class InbriskTools
             ["launchMs"] = r.LaunchMs,
             ["readyMs"] = r.ReadyMs,
         }, J));
+        _s.Deduplicator.RecordMutation(operationId, "computer_launch", normArgs, launchRes);
+        return launchRes;
+        }
+        finally
+        {
+            globalLease?.Dispose();
+        }
     }
 
     [McpServerTool(Name = "computer_apps"), Description(
-        "SEARCH the launchable applications registered on this machine — " +
-        "pass name and get back only matching entries, each with the " +
-        "exact computer_launch argument that opens it. To OPEN an app " +
-        "you usually skip this tool entirely: computer_launch{search:" +
-        "\"name\"} searches AND launches in one call. Without name this " +
-        "tool returns counts only — the full list needs all:true and is " +
-        "huge; always prefer a name query. kind filters installed " +
-        "(user apps) vs system (Windows inbox components). Results are " +
-        "candidates — pick one and call computer_launch with its arg " +
-        "immediately; do not narrate intermediate steps.")]
+        "SEARCH the launchable applications registered on this machine. " +
+        "DO NOT call computer_apps before launch solely to discover an app; call computer_launch directly. " +
+        "computer_launch resolves apps automatically and provides candidate retry arguments if ambiguous or not found. " +
+        "To OPEN an app you usually skip this tool entirely: computer_launch{search:\"name\"} searches AND launches in one call. " +
+        "Without name this tool returns counts only — the full list needs all:true and is huge; always prefer a name query.")]
     public CallToolResult Apps(
         [Description("case-insensitive name query — the app's name or a distinctive substring (\"unreal\", \"epic\"). Always pass this first")] string? name = null,
         [Description("installed|system|all — default all")] string? kind = null,
@@ -901,6 +1622,8 @@ public sealed class InbriskTools
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
         CancellationToken ct = default)
     {
+        _s.LastAppsQueryTimestamp = DateTimeOffset.UtcNow;
+        _s.LastAppsQueryName = name;
         if (BadDetail(detail) is { } bd) return bd;
         if (kind != null && kind is not ("installed" or "system" or "all"))
             return Error(OutcomeKind.Malformed,
@@ -973,6 +1696,7 @@ public sealed class InbriskTools
             sb.AppendLine($"  {a.Name}  [{a.Method}/{a.Kind}]  {a.Launch}");
         if (apps.Count > cap)
             sb.AppendLine($"  …{apps.Count - cap} more — pass name to filter or limit to widen");
+        _s.LastAppsQueryTimestamp = DateTimeOffset.UtcNow;
         return Text(sb.ToString());
     }
 
@@ -1017,7 +1741,7 @@ public sealed class InbriskTools
         "role to avoid label/control collisions. Prefer process over window " +
         "(titles are localized). Example: {process:\"notepad\", " +
         "role:\"document\"} → the Notepad text area.")]
-    public CallToolResult Find(
+    public async Task<CallToolResult> Find(
         [Description("role filter, e.g. button/edit/checkbox/listitem")] string? role = null,
         [Description("name contains (case-insensitive)")] string? name = null,
         [Description("AutomationId")] string? automationId = null,
@@ -1033,9 +1757,137 @@ public sealed class InbriskTools
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
         [Description("alias of name — free-text query, e.g. \"Open Project\"")] string? query = null,
         [Description("object form — same filters nested ({process,name,role,hwnd,…}); merged with the flat args")] TargetSpec? target = null,
+        [Description("batch list of search queries to execute in one turn (max 16)")] FindQuery[]? queries = null,
         CancellationToken ct = default)
     {
         if (BadDetail(detail) is { } bd) return bd;
+        if (_s.PrevOutcome?.Kind == OutcomeKind.Verified)
+        {
+            _s.Telemetry.IncPostVerifiedObservation();
+            PerfTrace.Count("postVerifiedObservation");
+        }
+        if (_s.LastLaunchedHwnd != 0 && (DateTimeOffset.UtcNow - _s.LastLaunchTimestamp).TotalSeconds < 5)
+        {
+            _s.Telemetry.IncLaunchFollowupDiscovery();
+            PerfTrace.Count("launchFollowupDiscovery");
+        }
+
+        var scopeH = ParseHwnd(hwnd) ?? _s.ScopeHwnd ?? 0;
+
+        if (queries != null)
+        {
+            if (role != null || name != null || automationId != null || hwnd != null || process != null || enabled != null || nameNotContains != null || value != null || valueContains != null || className != null || within != null || query != null || target != null)
+                return Error(OutcomeKind.Malformed, "InvalidArgument: use either legacy single-query fields or queries[], not both");
+            if (queries.Length == 0)
+                return Error(OutcomeKind.Malformed, "queries array requires at least 1 query");
+            if (queries.Length > 16)
+                return Error(OutcomeKind.Malformed, "queries array exceeds maximum limit of 16");
+
+            var qNorm = $"batch_find:{queries.Length}:" + string.Join(";", queries.Select(q => q.Summary()));
+            if (_s.Deduplicator.TryDeduplicateRead("computer_find", qNorm, scopeH, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedBatch)
+                return cachedBatch;
+
+            using var bTrace = PerfTrace.Begin("tool", "computer_find.batch");
+            ct.ThrowIfCancellationRequested();
+            using var bCancelReg = ct.CanBeCanceled ? ct.Register(() => _s.Rt.PurgePendingWork()) : default;
+
+            var results = new BatchFindItemResult[queries.Length];
+            using var sem = new SemaphoreSlim(Math.Min(8, Environment.ProcessorCount));
+            var tasks = new Task[queries.Length];
+            for (var i = 0; i < queries.Length; i++)
+            {
+                var idx = i;
+                var q = queries[i];
+                tasks[i] = Task.Run(async () =>
+                {
+                    await sem.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var qRole = q.Role ?? role;
+                        var qName = q.Name;
+                        var qAutoId = q.AutomationId;
+                        var qHwnd = q.Hwnd ?? hwnd;
+                        var qProc = q.Process ?? process;
+                        var qWithin = q.Within ?? within;
+                        var qVal = q.Value;
+                        var qClass = q.ClassName ?? className;
+
+                        var (els, err) = await FindElementsAsync(qRole, qName, qAutoId, qHwnd, qProc,
+                            within: qWithin, valueEquals: qVal,
+                            className: qClass, enabled: enabled == true ? true : null, ct: ct).ConfigureAwait(false);
+
+                        if (err != null)
+                        {
+                            results[idx] = new BatchFindItemResult(idx, "error", Error: ExtractErrorDetail(err));
+                            return;
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(qName))
+                            els = els.Where(e => e.Name?.Contains(qName, StringComparison.OrdinalIgnoreCase) == true).ToList();
+                        els = ApplyPropFilters(els, new TargetSpec(NameNotContains: nameNotContains, Value: qVal, ValueContains: valueContains, ClassName: qClass));
+                        if (enabled == true)
+                            els = els.Where(e => e.Props.TryGetValue("enabled", out var en) && en is true).ToList();
+
+                        var cap = limit ?? (Slim(detail) ? 20 : 60);
+                        var count = els.Count;
+                        var matches = els.Take(cap).Select(e => new BatchElementMatch(
+                            e.Id,
+                            e.Role.ToString(),
+                            e.Name ?? "",
+                            e.Hwnd != null ? $"0x{e.Hwnd:X}" : null,
+                            e.Pid,
+                            $"({e.Bounds.X},{e.Bounds.Y} {e.Bounds.Width}x{e.Bounds.Height})",
+                            Prop(e, "enabled")?.ToString() == "false" ? false : null,
+                            e.Props.TryGetValue("value", out var v) && v != null ? TruncEdges(v.ToString(), 160) : null
+                        )).ToList();
+
+                        results[idx] = new BatchFindItemResult(idx, "ok", Count: count, Truncated: count > cap ? count - cap : null, Elements: matches.Count > 0 ? matches : null);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        results[idx] = new BatchFindItemResult(idx, "cancelled", Error: "query cancelled");
+                    }
+                    catch (Exception ex)
+                    {
+                        results[idx] = new BatchFindItemResult(idx, "error", Error: ex.Message);
+                    }
+                    finally
+                    {
+                        sem.Release();
+                    }
+                }, ct);
+            }
+
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+
+            var okCount = results.Count(r => r?.Status == "ok");
+            var failCount = results.Length - okCount;
+            var overallStatus = okCount == results.Length ? "ok" : (okCount > 0 ? "partial" : "error");
+            var resObj = new
+            {
+                status = overallStatus,
+                total = results.Length,
+                successful = okCount,
+                failed = failCount,
+                results = results
+            };
+            var bResult = Text(JsonSerializer.Serialize(resObj, J));
+            _s.Deduplicator.RecordRead("computer_find", qNorm, scopeH, _s.Rt.MutationVersion, bResult);
+            return bResult;
+        }
+
+        var normArgs = $"{role}|{name}|{automationId}|{hwnd}|{process}|{enabled}|{nameNotContains}|{value}|{valueContains}|{className}|{within}|{limit}|{detail}|{query}";
+        if (_s.Deduplicator.TryDeduplicateRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedFind)
+            return cachedFind;
+
         using var trace = PerfTrace.Begin("tool", "computer_find");
         ct.ThrowIfCancellationRequested();
         using var cancelReg = ct.CanBeCanceled ? ct.Register(() => _s.Rt.PurgePendingWork()) : default;
@@ -1053,10 +1905,10 @@ public sealed class InbriskTools
         className ??= target?.ClassName;
         List<UiElement> els; CallToolResult? err;
         using (PerfTrace.Stage("find"))
-            els = FindElements(role, name, automationId, hwnd, process,
-                out err, within: within, valueContains: valueContains,
+            (els, err) = await FindElementsAsync(role, name, automationId, hwnd, process,
+                within: within, valueContains: valueContains,
                 valueEquals: value, className: className,
-                enabled: enabled == true ? true : null);
+                enabled: enabled == true ? true : null, ct: ct).ConfigureAwait(false);
         if (err != null) return err;
         if (!string.IsNullOrWhiteSpace(name))
             els = els.Where(e => e.Name?.Contains(name, StringComparison.OrdinalIgnoreCase) == true).ToList();
@@ -1102,7 +1954,9 @@ public sealed class InbriskTools
                 sb.AppendLine($"  actionableFix: {diag.SuggestedAction}");
             if (diag.CloseMatches is { Count: > 0 })
                 sb.AppendLine($"  closeMatches: [{string.Join(", ", diag.CloseMatches.Select(m => $"\"{m}\""))}]");
-            return Text(sb.ToString());
+            var missResult = Text(sb.ToString());
+            _s.Deduplicator.RecordRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, missResult);
+            return missResult;
         }
         sb.AppendLine($"found {els.Count} element(s)" +
             (els.Count > cap ? $" — showing {cap}:" : ":"));
@@ -1123,7 +1977,9 @@ public sealed class InbriskTools
                     (tags.TryGetValue(e.Id, out var tag) ? $" dialogRole={tag}" : ""));
         if (els.Count > cap)
             sb.AppendLine($"  …{els.Count - cap} more — refine target or pass limit");
-        return Text(sb.ToString());
+        var finalResult = Text(sb.ToString());
+        _s.Deduplicator.RecordRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, finalResult);
+        return finalResult;
     }
 
     /// <summary>Shared deterministic find — used by computer_find and by
@@ -1132,6 +1988,92 @@ public sealed class InbriskTools
     /// element's subtree, hwnd → that window); pushable property selectors
     /// (value/valueContains/className/enabled) go into the native UIA
     /// condition so providers never enumerate non-matching subtrees.</summary>
+    private async Task<(List<UiElement> Elements, CallToolResult? Error)> FindElementsAsync(string? role, string? name,
+        string? automationId, string? hwnd, string? process,
+        string? within = null,
+        string? valueContains = null, string? valueEquals = null,
+        string? className = null, bool? enabled = null,
+        bool firstOnly = false, bool includeOffscreen = false,
+        CancellationToken ct = default)
+    {
+        Core.Role? r = role != null && Enum.TryParse<Core.Role>(role, true,
+            out var rr) ? rr : null;
+        if (role != null && r == null)
+        {
+            return ([], Error(OutcomeKind.Malformed, $"unknown role '{role}'"));
+        }
+        long? scopeHwnd = null;
+        string? scopeId = null;
+        if (within is { } wref)
+        {
+            if (ParseHwnd(wref) is { } wh)
+                scopeHwnd = wh;
+            else
+            {
+                var container = _s.Rt.Parts.Registry.EnsureAlive(wref);
+                if (container == null)
+                {
+                    return ([], Error(OutcomeKind.TargetNotFound,
+                        $"within reference '{wref}' not found"));
+                }
+                scopeId = container.Handle.BackendRef;
+                scopeHwnd = container.Handle.Recipe.Hwnd ?? container.Hwnd;
+            }
+        }
+        int? pid = null;
+        if (process != null)
+        {
+            var w = FindBestWindowForProcess(process);
+            if (w == null)
+            {
+                return ([], Error(OutcomeKind.TargetNotFound,
+                    $"no window for process '{process}'"));
+            }
+            pid = w.Pid;
+        }
+        var spec = new FindSpec(Hwnd: scopeHwnd ?? ParseHwnd(hwnd), Pid: pid,
+            Role: r, Name: name, AutomationId: automationId,
+            ScopeElementId: scopeId, ValueContains: valueContains,
+            ValueEquals: valueEquals, ClassName: className, Enabled: enabled,
+            FirstOnly: firstOnly, IncludeOffscreen: includeOffscreen);
+        var fKey = new FindCacheKey(
+            ScopeHwnd: scopeHwnd,
+            Hwnd: ParseHwnd(hwnd),
+            Pid: pid,
+            Role: r,
+            Name: name,
+            AutomationId: automationId,
+            ScopeElementId: scopeId,
+            ValueContains: valueContains,
+            ValueEquals: valueEquals,
+            ClassName: className,
+            Enabled: enabled,
+            FirstOnly: firstOnly,
+            IncludeOffscreen: includeOffscreen);
+
+        var beforeHits = _s.FindCache.Telemetry.HitCount;
+        var result = await _s.FindCache.GetOrComputeAsync(fKey, async innerCt =>
+        {
+            using (PerfTrace.Stage("find:cache=miss"))
+            {
+                var res = await _s.Rt.FindAsync(spec, innerCt).ConfigureAwait(false);
+                return res.ToList();
+            }
+        }, ct).ConfigureAwait(false);
+
+        if (_s.FindCache.Telemetry.HitCount > beforeHits)
+        {
+            using (PerfTrace.Stage("find:cache=hit")) { }
+            PerfTrace.Count("find:cache=hit");
+        }
+        else
+        {
+            PerfTrace.Count("find:cache=miss");
+        }
+
+        return (result.ToList(), null);
+    }
+
     private List<UiElement> FindElements(string? role, string? name,
         string? automationId, string? hwnd, string? process,
         out CallToolResult? error, string? within = null,
@@ -1183,50 +2125,24 @@ public sealed class InbriskTools
             ScopeElementId: scopeId, ValueContains: valueContains,
             ValueEquals: valueEquals, ClassName: className, Enabled: enabled,
             FirstOnly: firstOnly, IncludeOffscreen: includeOffscreen);
-        // short-lived result cache: an identical query on an unchanged UI
-        // reuses the list — element ids stay valid because they come from
-        // the same registry. Invalidated by any semantic event attributable
-        // to the scope (matching hwnd/pid, or unattributable) and bounded by
-        // a 400ms TTL for providers that under-report.
-        var key = string.Join('|', scopeHwnd, hwnd, pid, r, name,
-            automationId, scopeId, valueContains, valueEquals, className,
-            enabled, includeOffscreen ? "1" : "0");
-        var buf = _s.Rt.Parts.EventBuffer;
-        var now = DateTimeOffset.UtcNow;
-        bool Fresh((List<UiElement> Els, DateTimeOffset At, HashSet<long> Hwnds,
-            HashSet<int> Pids, long Ver) hit) =>
-            hit.Ver == _s.Rt.MutationVersion &&   // a performed action
-            (now - hit.At).TotalMilliseconds < 400 &&   // may have changed the tree
-            !buf.Snapshot(100).Any(e => e.At >= hit.At &&
-                (hit.Hwnds.Contains(e.Hwnd ?? 0) ||
-                 (e.Pid is { } ep && hit.Pids.Contains(ep)) ||
-                 (e.Hwnd is null or 0 && e.Pid == null)));
-        // a full-result entry answers a firstOnly query too (take [0]);
-        // a firstOnly entry must never serve a full query
-        if ((_findCache.TryGetValue(key, out var hit) && Fresh(hit)) ||
-            (firstOnly && _findCache.TryGetValue(key + "|1", out hit) &&
-             Fresh(hit)))
-        {
-            PerfTrace.Count("find.cacheHit");
-            return hit.Els;
-        }
-        var result = _s.Rt.Find(spec).ToList();
-        var hwnds = new HashSet<long>(result.Select(e => e.Hwnd ?? 0));
-        if (spec.Hwnd is { } sh) hwnds.Add(sh);
-        var pids = new HashSet<int>(result.Select(e => e.Pid ?? 0));
-        if (spec.Pid is { } sp) pids.Add(sp);
-        _findCache[firstOnly ? key + "|1" : key] = (result,
-            DateTimeOffset.UtcNow, hwnds, pids, _s.Rt.MutationVersion);
-        if (_findCache.Count > 64) _findCache.Clear();
-        PerfTrace.Count("find.cacheMiss");
-        return result;
-    }
+        var fKey = new FindCacheKey(
+            ScopeHwnd: scopeHwnd,
+            Hwnd: ParseHwnd(hwnd),
+            Pid: pid,
+            Role: r,
+            Name: name,
+            AutomationId: automationId,
+            ScopeElementId: scopeId,
+            ValueContains: valueContains,
+            ValueEquals: valueEquals,
+            ClassName: className,
+            Enabled: enabled,
+            FirstOnly: firstOnly,
+            IncludeOffscreen: includeOffscreen);
 
-    /// <summary>Per-session find-result cache — invalidated by scope-matched
-    /// UI events and bounded by a 400ms TTL (see FindElements).</summary>
-    private readonly Dictionary<string, (List<UiElement> Els,
-        DateTimeOffset At, HashSet<long> Hwnds, HashSet<int> Pids,
-        long Ver)> _findCache = new();
+        var result = _s.FindCache.GetOrCompute(fKey, () => _s.Rt.Find(spec).ToList());
+        return result.ToList();
+    }
 
     [McpServerTool(Name = "computer_inspect"), Description(
         "Deep view of one window's element tree (with dialogRole " +
@@ -1234,13 +2150,14 @@ public sealed class InbriskTools
         "Pass relational=true to group list/table rows with their child actions and labels. " +
         "Accepts hwnd, elementId, or target object {hwnd, elementId}. " +
         "Automatically detects and surfaces blocking modal popups and error dialogs.")]
-    public CallToolResult Inspect(
+    public async Task<CallToolResult> Inspect(
         [Description("window handle to inspect (hex or decimal); default = active")] string? hwnd = null,
         [Description("elementId for single-element detail")] string? elementId = null,
         [Description("target specification: accepts {hwnd: '...'}, {elementId: '...'}, or string")] JsonElement? target = null,
         [Description("max elements to list — default 40 (slim) / 80 (full)")] int? maxElements = null,
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
         [Description("group rows/items relationally with their child actions and labels — ideal for lists/tables")] bool relational = false,
+        [Description("batch list of window handles to inspect in one call (max 16)")] string[]? hwnds = null,
         CancellationToken ct = default)
     {
         if (target.HasValue)
@@ -1266,97 +2183,388 @@ public sealed class InbriskTools
         }
 
         if (BadDetail(detail) is { } bd) return bd;
-        using var trace = PerfTrace.Begin("tool", "computer_inspect");
-        ct.ThrowIfCancellationRequested();
-        using var cancelReg = ct.CanBeCanceled ? ct.Register(() => _s.Rt.PurgePendingWork()) : default;
-        if (elementId != null)
+        if (_s.PrevOutcome?.Kind == OutcomeKind.Verified)
         {
-            var parts = _s.Rt.Parts;
-            var registered = parts.Registry.Get(elementId);
-            if (registered == null)
-                return Error(OutcomeKind.TargetNotFound, $"unknown element '{elementId}'");
-            var backend = parts.Backends.FirstOrDefault(b => b.Id == registered.Handle.Backend);
-            UiElement? el;
-            using (PerfTrace.Stage("reResolve"))
-                el = backend?.ReResolve(registered.Handle);
-            if (el == null)
-                return Error(OutcomeKind.Stale, $"element '{elementId}' could not be re-resolved");
-            el = el with { Id = elementId };
-            parts.Registry.Register([el]);
-            var sb = new StringBuilder();
-            sb.AppendLine($"[{el.Id}] {el.Role} \"{el.Name}\" stale={el.IsStale}");
-            sb.AppendLine($"bounds=({el.Bounds.X},{el.Bounds.Y} {el.Bounds.Width}x{el.Bounds.Height}) hwnd=0x{el.Hwnd ?? 0:X} pid={el.Pid}");
-            sb.AppendLine($"actions=[{string.Join(",", el.Actions)}]");
-            foreach (var kv in el.Props) sb.AppendLine($"  {kv.Key} = {kv.Value}");
-            return Text(sb.ToString());
+            _s.Telemetry.IncPostVerifiedObservation();
+            PerfTrace.Count("postVerifiedObservation");
         }
-        var h = ParseHwnd(hwnd) ?? _s.Rt.ForegroundWindow()?.Hwnd;
-        if (h == null) return Error(OutcomeKind.Malformed, "no hwnd and no active window");
-
-        var rootH = WindowService.GetRootHwnd(h.Value);
-        var modal = _s.Rt.WindowService.GetActiveBlockingPopup(rootH);
-        var isModalBlocked = modal != null && modal.Hwnd != rootH;
-        var inspectHwnd = isModalBlocked ? modal!.Hwnd : rootH;
-
-        IReadOnlyList<UiElement> els;
-        using (PerfTrace.Stage("inspect.uia"))
-            els = _s.Rt.Inspect(inspectHwnd);
-        var win = _s.Rt.Window(inspectHwnd);
-        var app = win?.ProcessName ?? "";
-        var screen = _s.Memory.RecordObservation(inspectHwnd, app, win?.Title ?? "", els);
-        var tags = DialogTags(els);
-        var slim = Slim(detail);
-        var cap = maxElements ?? (slim ? 40 : 80);
-
-        var modalWarning = "";
-        if (isModalBlocked)
+        if (_s.LastLaunchedHwnd != 0 && (DateTimeOffset.UtcNow - _s.LastLaunchTimestamp).TotalSeconds < 5)
         {
-            modalWarning = $"⚠️ [MODAL-OR-POPUP-ACTIVE: 0x{modal!.Hwnd:X} \"{modal.Title}\" ({modal.ProcessName})]\n" +
-                $"WARNING: Window 0x{h.Value:X} is currently BLOCKED by foreground popup/dialog 0x{modal.Hwnd:X}.\n" +
-                $"Actions sent to 0x{h.Value:X} will fail. You must dismiss or interact with this modal dialog or flyout first (e.g. press Escape).\n" +
-                $"Inspecting controls of active popup 0x{modal.Hwnd:X}:\n\n";
+            _s.Telemetry.IncLaunchFollowupDiscovery();
+            PerfTrace.Count("launchFollowupDiscovery");
+        }
+        if (_s.PrevOutcome?.Kind == OutcomeKind.ObservedChange)
+        {
+            _s.Telemetry.IncObservedChangeFollowup();
+            PerfTrace.Count("observedChangeFollowup");
         }
 
-        if (relational)
+        if (hwnds != null)
         {
-            var rows = RelationalInspector.ExtractRows(els);
-            if (rows.Count > 0)
+            if (hwnd != null || elementId != null || target.HasValue)
+                return Error(OutcomeKind.Malformed, "InvalidArgument: use either hwnd or hwnds[], not both");
+            if (hwnds.Length == 0)
+                return Error(OutcomeKind.Malformed, "hwnds array requires at least 1 window handle");
+            if (hwnds.Length > 16)
+                return Error(OutcomeKind.Malformed, "hwnds array exceeds maximum limit of 16");
+
+            var hNorm = $"batch_inspect:{hwnds.Length}:" + string.Join(";", hwnds);
+            if (_s.Deduplicator.TryDeduplicateRead("computer_inspect", hNorm, 0, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedBatchInsp)
+                return cachedBatchInsp;
+
+            using var bTrace = PerfTrace.Begin("tool", "computer_inspect.batch");
+            ct.ThrowIfCancellationRequested();
+            using var bCancelReg = ct.CanBeCanceled ? ct.Register(() => _s.Rt.PurgePendingWork()) : default;
+
+            var inspResults = new BatchInspectItemResult[hwnds.Length];
+            using var semInsp = new SemaphoreSlim(Math.Min(8, Environment.ProcessorCount));
+            var inspTasks = new Task[hwnds.Length];
+            var slimInsp = Slim(detail);
+            var capInsp = maxElements ?? (slimInsp ? 40 : 80);
+
+            for (var i = 0; i < hwnds.Length; i++)
             {
-                var rb = new StringBuilder(modalWarning);
-                rb.AppendLine($"window 0x{inspectHwnd:X} [screen: {screen}]: {rows.Count} relational rows:");
-                foreach (var row in rows.Take(cap))
+                var idx = i;
+                var rawHwnd = hwnds[i];
+                inspTasks[i] = Task.Run(async () =>
                 {
-                    rb.Append($"  [{row.ElementId}] {row.Role}: ");
-                    if (!string.IsNullOrWhiteSpace(row.Title)) rb.Append($"\"{row.Title}\" ");
-                    if (row.Details.Count > 0) rb.Append($"({string.Join(" | ", row.Details)}) ");
-                    if (row.Actions.Count > 0)
+                    await semInsp.WaitAsync(ct).ConfigureAwait(false);
+                    try
                     {
-                        var actStrs = row.Actions.Select(a => $"{a.Action}({a.ElementId}: \"{a.Name}\")");
-                        rb.Append($"actions=[{string.Join(", ", actStrs)}]");
+                        ct.ThrowIfCancellationRequested();
+                        var parsed = ParseHwnd(rawHwnd);
+                        if (parsed == null)
+                        {
+                            inspResults[idx] = new BatchInspectItemResult(idx, rawHwnd, "error", Error: $"Invalid window handle '{rawHwnd}'");
+                            return;
+                        }
+
+                        var rootH = WindowService.GetRootHwnd(parsed.Value);
+                        var win = _s.Rt.Window(rootH);
+                        var app = win?.ProcessName ?? "";
+                        var title = win?.Title ?? "";
+
+                        var els = await _s.Rt.InspectAsync(rootH, ct: ct).ConfigureAwait(false);
+                        var count = els.Count;
+                        var matches = els.Take(capInsp).Select(e => new BatchElementMatch(
+                            e.Id,
+                            e.Role.ToString(),
+                            e.Name ?? "",
+                            e.Hwnd != null ? $"0x{e.Hwnd:X}" : null,
+                            e.Pid,
+                            $"({e.Bounds.X},{e.Bounds.Y} {e.Bounds.Width}x{e.Bounds.Height})",
+                            Prop(e, "enabled")?.ToString() == "false" ? false : null,
+                            e.Props.TryGetValue("value", out var v) && v != null ? TruncEdges(v.ToString(), 160) : null
+                        )).ToList();
+
+                        inspResults[idx] = new BatchInspectItemResult(idx, $"0x{rootH:X}", "ok", Title: title, Process: app, Count: count, Truncated: count > capInsp ? count - capInsp : null, Elements: matches);
                     }
-                    rb.AppendLine();
+                    catch (OperationCanceledException)
+                    {
+                        inspResults[idx] = new BatchInspectItemResult(idx, rawHwnd, "cancelled", Error: "inspect cancelled");
+                    }
+                    catch (Exception ex)
+                    {
+                        inspResults[idx] = new BatchInspectItemResult(idx, rawHwnd, "error", Error: ex.Message);
+                    }
+                    finally
+                    {
+                        semInsp.Release();
+                    }
+                }, ct);
+            }
+
+            try
+            {
+                await Task.WhenAll(inspTasks).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                ct.ThrowIfCancellationRequested();
+            }
+
+            var inspOkCount = inspResults.Count(r => r?.Status == "ok");
+            var inspFailCount = inspResults.Length - inspOkCount;
+            var inspOverallStatus = inspOkCount == inspResults.Length ? "ok" : (inspOkCount > 0 ? "partial" : "error");
+            var inspResObj = new
+            {
+                status = inspOverallStatus,
+                total = inspResults.Length,
+                successful = inspOkCount,
+                failed = inspFailCount,
+                results = inspResults
+            };
+            var inspFinalRes = Text(JsonSerializer.Serialize(inspResObj, J));
+            _s.Deduplicator.RecordRead("computer_inspect", hNorm, 0, _s.Rt.MutationVersion, inspFinalRes);
+            return inspFinalRes;
+        }
+
+        var normArgs = $"{hwnd}|{elementId}|{maxElements}|{detail}|{relational}";
+        var scopeH = ParseHwnd(hwnd) ?? _s.ScopeHwnd ?? 0;
+        var snapshotKey = new SnapshotCacheKey(
+            Hwnd: ParseHwnd(hwnd) ?? _s.Rt.ForegroundWindow()?.Hwnd,
+            ElementId: elementId,
+            MaxElements: maxElements,
+            Detail: detail,
+            Relational: relational
+        );
+
+        var beforeSnapHits = _s.SnapshotCache.Telemetry.HitCount;
+        var snapResult = await _s.SnapshotCache.GetOrComputeAsync(snapshotKey, async innerCt =>
+        {
+            using (PerfTrace.Stage("inspect:cache=miss"))
+            {
+                using var trace = PerfTrace.Begin("tool", "computer_inspect");
+                innerCt.ThrowIfCancellationRequested();
+                using var cancelReg = innerCt.CanBeCanceled ? innerCt.Register(() => _s.Rt.PurgePendingWork()) : default;
+            if (elementId != null)
+            {
+                var parts = _s.Rt.Parts;
+                var registered = parts.Registry.Get(elementId);
+                if (registered == null)
+                    return Error(OutcomeKind.TargetNotFound, $"unknown element '{elementId}'");
+                var backend = parts.Backends.FirstOrDefault(b => b.Id == registered.Handle.Backend);
+                UiElement? el;
+                using (PerfTrace.Stage("reResolve"))
+                    el = backend != null ? await backend.ReResolveAsync(registered.Handle, innerCt).ConfigureAwait(false) : null;
+                if (el == null)
+                    return Error(OutcomeKind.Stale, $"element '{elementId}' could not be re-resolved");
+                el = el with { Id = elementId };
+                parts.Registry.Register([el]);
+                var sb = new StringBuilder();
+                sb.AppendLine($"[{el.Id}] {el.Role} \"{el.Name}\" stale={el.IsStale}");
+                sb.AppendLine($"bounds=({el.Bounds.X},{el.Bounds.Y} {el.Bounds.Width}x{el.Bounds.Height}) hwnd=0x{el.Hwnd ?? 0:X} pid={el.Pid}");
+                sb.AppendLine($"actions=[{string.Join(",", el.Actions)}]");
+                foreach (var kv in el.Props) sb.AppendLine($"  {kv.Key} = {kv.Value}");
+                var elResult = Text(sb.ToString());
+                return elResult;
+            }
+            var h = ParseHwnd(hwnd) ?? _s.Rt.ForegroundWindow()?.Hwnd;
+            if (h == null) return Error(OutcomeKind.Malformed, "no hwnd and no active window");
+
+            var rootH = WindowService.GetRootHwnd(h.Value);
+            var modal = _s.Rt.WindowService.GetActiveBlockingPopup(rootH);
+            var isModalBlocked = modal != null && modal.Hwnd != rootH;
+            var inspectHwnd = isModalBlocked ? modal!.Hwnd : rootH;
+
+            IReadOnlyList<UiElement> els;
+            using (PerfTrace.Stage("inspect.uia"))
+                els = await _s.Rt.InspectAsync(inspectHwnd, ct: innerCt).ConfigureAwait(false);
+            var win = _s.Rt.Window(inspectHwnd);
+            var app = win?.ProcessName ?? "";
+            var screen = _s.Memory.RecordObservation(inspectHwnd, app, win?.Title ?? "", els);
+            var tags = DialogTags(els);
+            var slim = Slim(detail);
+            var cap = maxElements ?? (slim ? 40 : 80);
+
+            var modalWarning = "";
+            if (isModalBlocked)
+            {
+                modalWarning = $"⚠️ [MODAL-OR-POPUP-ACTIVE: 0x{modal!.Hwnd:X} \"{modal.Title}\" ({modal.ProcessName})]\n" +
+                    $"WARNING: Window 0x{h.Value:X} is currently BLOCKED by foreground popup/dialog 0x{modal.Hwnd:X}.\n" +
+                    $"Actions sent to 0x{h.Value:X} will fail. You must dismiss or interact with this modal dialog or flyout first (e.g. press Escape).\n" +
+                    $"Inspecting controls of active popup 0x{modal.Hwnd:X}:\n\n";
+            }
+
+            if (relational)
+            {
+                var rows = RelationalInspector.ExtractRows(els);
+                if (rows.Count > 0)
+                {
+                    var rb = new StringBuilder(modalWarning);
+                    rb.AppendLine($"window 0x{inspectHwnd:X} [screen: {screen}]: {rows.Count} relational rows:");
+                    foreach (var row in rows.Take(cap))
+                    {
+                        rb.Append($"  [{row.ElementId}] {row.Role}: ");
+                        if (!string.IsNullOrWhiteSpace(row.Title)) rb.Append($"\"{row.Title}\" ");
+                        if (row.Details.Count > 0) rb.Append($"({string.Join(" | ", row.Details)}) ");
+                        if (row.Actions.Count > 0)
+                        {
+                            var actStrs = row.Actions.Select(a => $"{a.Action}({a.ElementId}: \"{a.Name}\")");
+                            rb.Append($"actions=[{string.Join(", ", actStrs)}]");
+                        }
+                        rb.AppendLine();
+                    }
+                    if (rows.Count > cap)
+                        rb.AppendLine($"  …{rows.Count - cap} more rows — pass maxElements to see them");
+                    var rowResult = Text(rb.ToString().TrimEnd());
+                    return rowResult;
                 }
-                if (rows.Count > cap)
-                    rb.AppendLine($"  …{rows.Count - cap} more rows — pass maxElements to see them");
-                return Text(rb.ToString().TrimEnd());
+            }
+            var b = new StringBuilder(modalWarning);
+            b.AppendLine($"window 0x{inspectHwnd:X} [screen: {screen}]: {els.Count} elements " +
+                $"(showing {Math.Min(els.Count, cap)}):");
+            foreach (var e in els.Take(cap))
+                b.AppendLine(slim
+                    ? "  " + SlimEl(e, tags)
+                    : $"  [{e.Id}] {e.Role} \"{e.Name}\" " +
+                        (e.Props.TryGetValue("value", out var v) && v != null
+                            ? $"value=\"{v}\" " : "") +
+                        (e.Props.TryGetValue("labelledBy", out var lb) && lb != null
+                            ? $"labelledBy=\"{lb}\" " : "") +
+                        $"actions=[{string.Join(",", e.Actions)}]" +
+                        (tags.TryGetValue(e.Id, out var tag) ? $" dialogRole={tag}" : ""));
+            if (els.Count > cap)
+                b.AppendLine($"  …{els.Count - cap} more — pass maxElements to see them");
+            var finalResult = Text(b.ToString());
+                return finalResult;
+            }
+        }, ct).ConfigureAwait(false);
+
+        if (_s.SnapshotCache.Telemetry.HitCount > beforeSnapHits)
+        {
+            using (PerfTrace.Stage("inspect:cache=hit")) { }
+            PerfTrace.Count("inspect:cache=hit");
+        }
+        else
+        {
+            PerfTrace.Count("inspect:cache=miss");
+        }
+        return snapResult;
+    }
+
+    private static readonly HashSet<string> SupportedReadProps = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "name", "text", "role", "value", "val", "enabled", "isenabled",
+        "checked", "ischecked", "selected", "isselected", "bounds",
+        "automationid", "classname", "id", "hwnd", "pid"
+    };
+
+    [McpServerTool(Name = "computer_read"), Description(
+        "Read specific properties from multiple targets (element IDs or target selectors) in a single turn without full UI tree dumps. " +
+        "Fast, compact, and read-only. " +
+        "Target use case: computer_read(targets: ['uia_1', 'uia_2'], props: ['name', 'value', 'enabled']).")]
+    public async Task<CallToolResult> Read(
+        [Description("ordered list of element IDs (e.g. 'uia_...') or element names to read (max 32)")] string[] targets,
+        [Description("properties to extract (e.g. 'name', 'value', 'enabled', 'checked', 'role', 'bounds'); default ['name', 'value', 'enabled']")] string[]? props = null,
+        CancellationToken ct = default)
+    {
+        if (targets is not { Length: > 0 })
+            return Error(OutcomeKind.Malformed, "targets array requires at least 1 target");
+        if (targets.Length > 32)
+            return Error(OutcomeKind.Malformed, "targets array exceeds maximum limit of 32");
+
+        if (props != null)
+        {
+            if (props.Length == 0)
+                return Error(OutcomeKind.Malformed, "props array cannot be empty when specified");
+            if (props.Length > 16)
+                return Error(OutcomeKind.Malformed, "props array exceeds maximum limit of 16");
+            foreach (var p in props)
+            {
+                if (string.IsNullOrWhiteSpace(p) || !SupportedReadProps.Contains(p.Trim()))
+                    return Error(OutcomeKind.Malformed, $"InvalidArgument: unsupported property '{p}'. Supported properties: name, role, value, enabled, checked, selected, bounds, automationId, className, id, hwnd, pid");
             }
         }
-        var b = new StringBuilder(modalWarning);
-        b.AppendLine($"window 0x{inspectHwnd:X} [screen: {screen}]: {els.Count} elements " +
-            $"(showing {Math.Min(els.Count, cap)}):");
-        foreach (var e in els.Take(cap))
-            b.AppendLine(slim
-                ? "  " + SlimEl(e, tags)
-                : $"  [{e.Id}] {e.Role} \"{e.Name}\" " +
-                    (e.Props.TryGetValue("value", out var v) && v != null
-                        ? $"value=\"{v}\" " : "") +
-                    (e.Props.TryGetValue("labelledBy", out var lb) && lb != null
-                        ? $"labelledBy=\"{lb}\" " : "") +
-                    $"actions=[{string.Join(",", e.Actions)}]" +
-                    (tags.TryGetValue(e.Id, out var tag) ? $" dialogRole={tag}" : ""));
-        if (els.Count > cap)
-            b.AppendLine($"  …{els.Count - cap} more — pass maxElements to see them");
-        return Text(b.ToString());
+
+        var normArgs = $"read:{targets.Length}:{string.Join(";", targets)}:{string.Join(",", props ?? [])}";
+        if (_s.Deduplicator.TryDeduplicateRead("computer_read", normArgs, 0, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedRead)
+            return cachedRead;
+
+        using var trace = PerfTrace.Begin("tool", "computer_read");
+        ct.ThrowIfCancellationRequested();
+        using var cancelReg = ct.CanBeCanceled ? ct.Register(() => _s.Rt.PurgePendingWork()) : default;
+
+        var results = new BatchReadItemResult[targets.Length];
+        using var sem = new SemaphoreSlim(Math.Min(8, Environment.ProcessorCount));
+        var tasks = new Task[targets.Length];
+        var reqProps = props is { Length: > 0 }
+            ? props.Select(p => p.Trim().ToLowerInvariant()).Distinct().ToArray()
+            : ["name", "value", "enabled"];
+
+        for (var i = 0; i < targets.Length; i++)
+        {
+            var idx = i;
+            var t = targets[i];
+            tasks[i] = Task.Run(async () =>
+            {
+                await sem.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    ct.ThrowIfCancellationRequested();
+                    UiElement? el = null;
+                    if (t.StartsWith("uia_", StringComparison.OrdinalIgnoreCase) || _s.Rt.Parts.Registry.Get(t) != null)
+                    {
+                        var registered = _s.Rt.Parts.Registry.Get(t);
+                        if (registered != null)
+                        {
+                            var backend = _s.Rt.Parts.Backends.FirstOrDefault(b => b.Id == registered.Handle.Backend);
+                            if (backend != null)
+                                el = await backend.ReResolveAsync(registered.Handle, ct).ConfigureAwait(false);
+                            el ??= registered;
+                        }
+                    }
+
+                    if (el == null && !t.StartsWith("uia_", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var (foundEls, _) = await FindElementsAsync(null, name: t, null, null, null, firstOnly: true, ct: ct).ConfigureAwait(false);
+                        if (foundEls.Count > 0)
+                            el = foundEls[0];
+                    }
+
+                    if (el == null)
+                    {
+                        results[idx] = new BatchReadItemResult(idx, t, "error", Error: "TargetNotFound");
+                        return;
+                    }
+
+                    var extracted = new Dictionary<string, object?>();
+                    foreach (var p in reqProps)
+                    {
+                        var pl = p.ToLowerInvariant();
+                        if (pl is "name" or "text") extracted["name"] = el.Name;
+                        else if (pl is "value" or "val") extracted["value"] = el.Props.GetValueOrDefault("value");
+                        else if (pl is "enabled" or "isenabled") extracted["enabled"] = el.Props.TryGetValue("enabled", out var en) ? en : true;
+                        else if (pl is "checked" or "ischecked" or "selected" or "isselected") extracted["checked"] = el.Props.GetValueOrDefault("selected") ?? el.Props.GetValueOrDefault("checked");
+                        else if (pl is "role") extracted["role"] = el.Role.ToString();
+                        else if (pl is "bounds") extracted["bounds"] = new { x = el.Bounds.X, y = el.Bounds.Y, width = el.Bounds.Width, height = el.Bounds.Height };
+                        else if (pl is "automationid") extracted["automationId"] = el.Props.GetValueOrDefault("automationId")?.ToString() ?? "";
+                        else if (pl is "classname") extracted["className"] = el.Props.GetValueOrDefault("className") ?? "";
+                        else if (pl is "id") extracted["id"] = el.Id;
+                        else if (pl is "hwnd") extracted["hwnd"] = el.Hwnd != null ? $"0x{el.Hwnd:X}" : null;
+                        else if (pl is "pid") extracted["pid"] = el.Pid;
+                    }
+                    results[idx] = new BatchReadItemResult(idx, t, "ok", extracted);
+                }
+
+                catch (OperationCanceledException)
+                {
+                    results[idx] = new BatchReadItemResult(idx, t, "cancelled", Error: "read cancelled");
+                }
+                catch (Exception ex)
+                {
+                    results[idx] = new BatchReadItemResult(idx, t, "error", Error: ex.Message);
+                }
+                finally
+                {
+                    sem.Release();
+                }
+            }, ct);
+        }
+
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            ct.ThrowIfCancellationRequested();
+        }
+
+        var okCount = results.Count(r => r?.Status == "ok");
+        var failCount = results.Length - okCount;
+        var overallStatus = okCount == results.Length ? "ok" : (okCount > 0 ? "partial" : "error");
+        var resObj = new
+        {
+            status = overallStatus,
+            total = results.Length,
+            successful = okCount,
+            failed = failCount,
+            results = results
+        };
+        var res = Text(JsonSerializer.Serialize(resObj, J));
+        _s.Deduplicator.RecordRead("computer_read", normArgs, 0, _s.Rt.MutationVersion, res);
+        return res;
     }
 
     // ------------------------------------------------------------ actions
@@ -1370,7 +2578,8 @@ public sealed class InbriskTools
         "(no focus/geometry needed). Targeting styles: elementId, " +
         "semantic target {window,process,role,name,automationId,labelledBy," +
         "nearText,within,ancestor}, or coordinates x+y (desktop or OCR coordinates; " +
-        "frameId/observationId optional). button:left|right|double.")]
+        "frameId/observationId optional). button:left|right|double. " +
+        "When executing multiple clicks, typing, or hotkeys in sequence, PREFER computer_batch to collapse them into a single fast roundtrip.")]
     public Task<CallToolResult> Click(
         [Description("elementId from observe/find")] string? elementId = null,
         [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?}")] TargetSpec? target = null,
@@ -1380,8 +2589,11 @@ public sealed class InbriskTools
         [Description("image-space y")] int? y = null,
         [Description("left|right|double")] string? button = null,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
+        _s.Telemetry.IncSequentialSingleAction();
+        Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
         var el = ResolveTargetElement(elementId, target, out var err, out _, "invoke");
         if (err != null) return Task.FromResult(err);
         return Act(new AgentAction(button?.Equals("right", StringComparison.OrdinalIgnoreCase) == true
@@ -1389,7 +2601,7 @@ public sealed class InbriskTools
                 : button?.Equals("double", StringComparison.OrdinalIgnoreCase) == true
                     ? AgentActionKind.DoubleClick
                     : AgentActionKind.Click,
-            ElementId: el?.Id, Point: MakePoint(frameId, observationId, x ?? target?.X, y ?? target?.Y)), ct, observe);
+            ElementId: el?.Id, Point: MakePoint(frameId, observationId, x ?? target?.X, y ?? target?.Y)), ct, observe, operationId);
     }
 
     [McpServerTool(Name = "computer_invoke"), Description(
@@ -1397,18 +2609,21 @@ public sealed class InbriskTools
         "preferred way to press buttons and menu items: works without " +
         "foreground focus or pixel hit-testing. Accepts elementId or " +
         "semantic target. Example: {process:\"notepad\", role:\"menuitem\", " +
-        "name:\"Dosya\"} opens the File menu.")]
+        "name:\"Dosya\"} opens the File menu. When executing multiple actions in sequence, PREFER computer_batch.")]
     public Task<CallToolResult> Invoke(
         [Description("elementId")] string? elementId = null,
         [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?}")] TargetSpec? target = null,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
+        _s.Telemetry.IncSequentialSingleAction();
+        Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
         var el = ResolveTargetElement(elementId, target, out var err, out _, "invoke");
         if (err != null) return Task.FromResult(err);
         if (el == null) return Task.FromResult(
             Error(OutcomeKind.Malformed, "elementId or target required"));
-        return Act(new AgentAction(AgentActionKind.Invoke, ElementId: el.Id), ct, observe);
+        return Act(new AgentAction(AgentActionKind.Invoke, ElementId: el.Id), ct, observe, operationId);
     }
 
     [McpServerTool(Name = "computer_set_value"), Description(
@@ -1418,20 +2633,24 @@ public sealed class InbriskTools
         "caret position. The resolver prefers editable controls — a Text " +
         "label with the same name never wins unless you ask for role:Text. " +
         "Example: {target:{process:\"notepad\", role:\"edit\", " +
-        "labelledBy:\"Dosya adı:\"}, value:\"x.txt\"}")]
+        "labelledBy:\"Dosya adı:\"}, value:\"x.txt\"}. " +
+        "When setting multiple fields in forms or dialogs, PREFER computer_batch(set: [...]).")]
     public Task<CallToolResult> SetValue(
         [Description("value to set")] string value,
         [Description("elementId")] string? elementId = null,
         [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?}")] TargetSpec? target = null,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
+        _s.Telemetry.IncSequentialSingleAction();
+        Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
         var el = ResolveTargetElement(elementId, target, out var err, out _, "edit");
         if (err != null) return Task.FromResult(err);
         if (el == null) return Task.FromResult(
             Error(OutcomeKind.Malformed, "elementId or target required"));
         return Act(new AgentAction(AgentActionKind.SetValue, ElementId: el.Id,
-            Text: value), ct, observe);
+            Text: value), ct, observe, operationId);
     }
 
     [McpServerTool(Name = "computer_type"), Description(
@@ -1441,8 +2660,8 @@ public sealed class InbriskTools
         "ValuePattern when the control supports it (atomic + verified), " +
         "else real keystrokes. When typing into canvas/OpenGL/game windows " +
         "without UIA controls (e.g. Blender file dialog), omit elementId and target " +
-        "to type directly into the focused window.")]
-    public Task<CallToolResult> Type(
+        "to type directly into the focused window. When combined with clicks/navigation, PREFER computer_batch.")]
+    public async Task<CallToolResult> Type(
         [Description("text to type")] string text,
         [Description("elementId")] string? elementId = null,
         [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?}")] TargetSpec? target = null,
@@ -1450,20 +2669,31 @@ public sealed class InbriskTools
         [Description("current|start|end")] string? position = null,
         [Description("press Enter after typing")] bool submit = false,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
+        _s.Telemetry.IncSequentialSingleAction();
+        Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
+        var normArgs = $"{text}|{elementId}|{target?.ToString()}|{mode}|{position}|{submit}|{observe}";
+        if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_type", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
+            return deduped;
+        if (conflictError != null)
+            return conflictError;
+
         var el = ResolveTargetElement(elementId, target, out var err, out _, "edit");
-        if (err != null) return Task.FromResult(err);
+        if (err != null) return err;
         var modeN = (mode ?? "insert").ToLowerInvariant();
         var posN = (position ?? (modeN == "append" ? "end" : "current"))
             .ToLowerInvariant();
         if (modeN is not ("replace" or "append" or "insert") ||
             posN is not ("current" or "start" or "end"))
-            return Task.FromResult(Error(OutcomeKind.Malformed,
-                "mode must be replace|append|insert; position current|start|end"));
+            return Error(OutcomeKind.Malformed,
+                "mode must be replace|append|insert; position current|start|end");
 
         var steps = BuildTypeSteps(el, text, modeN, posN, submit);
-        return ActChain(steps, el?.Id, ct, observe);
+        var res = await ActChain(steps, el?.Id, ct, observe);
+        _s.Deduplicator.RecordMutation(operationId, "computer_type", normArgs, res);
+        return res;
     }
 
     /// <summary>Expand a high-level type request into primitive actions:
@@ -1474,7 +2704,7 @@ public sealed class InbriskTools
         string modeN, string posN, bool submit)
     {
         var steps = new List<AgentAction>();
-        var canSet = el?.Actions.Contains("setvalue") == true;
+        var canSet = el?.IsActionSupported("setvalue") == true;
         var cur = Prop(el, "value")?.ToString() ?? "";
         if (canSet && (modeN == "replace" ||
                 (modeN == "append" && posN is "end" or "start")))
@@ -1544,25 +2774,32 @@ public sealed class InbriskTools
         [Description("ordered plan steps")] RunStep[] steps,
         [Description("resume an existing run — keeps its element bindings")] string? runId = null,
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
+        _s.Telemetry.ResetSequentialSingleAction();
         if (BadDetail(detail) is { } bd) return bd;
-        var sw = Stopwatch.StartNew();
-        try
+
+        var normArgs = $"{runId}|{detail}|" + JsonSerializer.Serialize(steps, J);
+
+        return await ExecuteWithIdempotencyAsync(operationId, "computer_run", normArgs, async () =>
         {
-            return await RunPlanCore(steps, runId, sw, ct, detail);
-        }
-        catch (OperationCanceledException)
-        {
-            return _s.Control.State == ComputerControlState.EmergencyStopped
-                ? Error(OutcomeKind.EmergencyStopped,
-                    StoppedDetail, sw)
-                : Error(OutcomeKind.Cancelled, "request cancelled", sw);
-        }
-        catch (Exception e)
-        {
-            return Error(OutcomeKind.Failed, e.Message, sw);
-        }
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                return await RunPlanCore(steps, runId, sw, ct, detail);
+            }
+            catch (OperationCanceledException)
+            {
+                return _s.Control.State == ComputerControlState.EmergencyStopped
+                    ? Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw)
+                    : Error(OutcomeKind.Cancelled, "request cancelled", sw);
+            }
+            catch (Exception e)
+            {
+                return Error(OutcomeKind.Failed, e.Message, sw);
+            }
+        });
     }
 
     [McpServerTool(Name = "computer_do"), Description(
@@ -1578,70 +2815,366 @@ public sealed class InbriskTools
         [Description("Whether to press Enter after typing (default false)")] bool submit = false,
         [Description("Semantic target or elementId to click")] TargetSpec? target = null,
         [Description("Wait in milliseconds between steps (default 100ms)")] int waitMs = 100,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
-        var steps = new List<RunStep>();
+        _s.Telemetry.ResetSequentialSingleAction();
+        var normArgs = $"{app}|{click}|{type}|{hotkey}|{submit}|{target?.Name}|{target?.Role}|{waitMs}";
 
-        if (!string.IsNullOrWhiteSpace(app))
+        return await ExecuteWithIdempotencyAsync(operationId, "computer_do", normArgs, async () =>
         {
-            steps.Add(new RunStep { Action = "launch", App = app, WaitFor = "window" });
-            if (waitMs > 0 && (!string.IsNullOrWhiteSpace(click) || target != null || !string.IsNullOrWhiteSpace(type) || !string.IsNullOrWhiteSpace(hotkey)))
-                steps.Add(new RunStep { Action = "wait", Ms = waitMs });
-        }
+            var steps = new List<RunStep>();
 
-        if (!string.IsNullOrWhiteSpace(click) || target != null)
-        {
-            var clickTarget = target ?? new TargetSpec { Name = click };
-            steps.Add(new RunStep { Action = "click", Target = clickTarget });
-            if (waitMs > 0 && (!string.IsNullOrWhiteSpace(type) || !string.IsNullOrWhiteSpace(hotkey)))
-                steps.Add(new RunStep { Action = "wait", Ms = waitMs });
-        }
-
-        if (!string.IsNullOrWhiteSpace(type))
-        {
-            steps.Add(new RunStep { Action = "type", Text = type, Submit = submit });
-            if (waitMs > 0 && !string.IsNullOrWhiteSpace(hotkey))
-                steps.Add(new RunStep { Action = "wait", Ms = waitMs });
-        }
-
-        if (!string.IsNullOrWhiteSpace(hotkey))
-        {
-            steps.Add(new RunStep { Action = "hotkey", Keys = hotkey });
-        }
-
-        if (steps.Count == 0)
-        {
-            return Text(JsonSerializer.Serialize(new
+            if (!string.IsNullOrWhiteSpace(app))
             {
-                error = "Malformed",
-                detail = "pass at least one action: app, click, type, or hotkey"
-            }, J));
-        }
+                steps.Add(new RunStep { Action = "launch", App = app, WaitFor = "window" });
+                if (waitMs > 0 && (!string.IsNullOrWhiteSpace(click) || target != null || !string.IsNullOrWhiteSpace(type) || !string.IsNullOrWhiteSpace(hotkey)))
+                    steps.Add(new RunStep { Action = "wait", Ms = waitMs });
+            }
+
+            if (!string.IsNullOrWhiteSpace(click) || target != null)
+            {
+                var clickTarget = target ?? new TargetSpec { Name = click };
+                steps.Add(new RunStep { Action = "click", Target = clickTarget });
+                if (waitMs > 0 && (!string.IsNullOrWhiteSpace(type) || !string.IsNullOrWhiteSpace(hotkey)))
+                    steps.Add(new RunStep { Action = "wait", Ms = waitMs });
+            }
+
+            if (!string.IsNullOrWhiteSpace(type))
+            {
+                steps.Add(new RunStep { Action = "type", Text = type, Submit = submit });
+                if (waitMs > 0 && !string.IsNullOrWhiteSpace(hotkey))
+                    steps.Add(new RunStep { Action = "wait", Ms = waitMs });
+            }
+
+            if (!string.IsNullOrWhiteSpace(hotkey))
+            {
+                steps.Add(new RunStep { Action = "hotkey", Keys = hotkey });
+            }
+
+            if (steps.Count == 0)
+            {
+                return Text(JsonSerializer.Serialize(new
+                {
+                    error = "Malformed",
+                    detail = "pass at least one action: app, click, type, or hotkey"
+                }, J));
+            }
+
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                return await RunPlanCore(steps.ToArray(), null, sw, ct, detail: "slim");
+            }
+            catch (OperationCanceledException)
+            {
+                return _s.Control.State == ComputerControlState.EmergencyStopped
+                    ? Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw)
+                    : Error(OutcomeKind.Cancelled, "request cancelled", sw);
+            }
+            catch (Exception e)
+            {
+                return Error(OutcomeKind.Failed, e.Message, sw);
+            }
+        });
+    }
+
+
+    [McpServerTool(Name = "computer_batch"), Description(
+        "Execute a fast, declarative sequence of UI actions in a single turn without LLM roundtrips. " +
+        "When 2+ deterministic actions are known and intermediate observation is not needed, ALWAYS prefer computer_batch. " +
+        "Supports sequential 'steps' (click, invoke, type, set_value, hotkey, wait, scroll, launch, etc.), " +
+        "OR a compact 'set' list for multiple form fields (mutually exclusive with 'steps' to avoid ambiguous ordering). " +
+        "Supports optional 'until' wait condition and optional 'read' list to extract element values/states. " +
+        "Do NOT batch across an unpredicted reasoning boundary.")]
+    public async Task<CallToolResult> Batch(
+        [Description("ordered list of simple action steps to execute sequentially (mutually exclusive with 'set')")] BatchStep[]? steps = null,
+        [Description("compact list of form fields to set in one turn (target, value, role?); mutually exclusive with 'steps'")] FormFieldSpec[]? set = null,
+        [Description("optional condition to wait for after steps execute (appears/disappears/windowAppears)")] BatchUntilSpec? until = null,
+        [Description("optional list of element targets to read/extract properties from upon completion")] BatchReadSpec[]? read = null,
+        [Description("output verbosity: slim|full — default slim")] string? detail = null,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        CancellationToken ct = default)
+    {
+        _s.Telemetry.ResetSequentialSingleAction();
+        if (steps is { Length: > 0 } && set is { Length: > 0 })
+            return Error(OutcomeKind.Malformed, "Ambiguous execution order: specify either 'set' (for compact form fill) or 'steps' (for sequenced actions including set_value), not both simultaneously.");
+
+        if (set != null && set.Length > 32)
+            return Error(OutcomeKind.Malformed, "set array exceeds maximum limit of 32");
+
+        var stepCount = (steps?.Length ?? 0) + (set?.Length ?? 0);
+        var normArgs = JsonSerializer.Serialize(new
+        {
+            steps = steps?.Select(s => new
+            {
+                @do = s.Do,
+                target = s.T,
+                value = s.V,
+                role = s.Role,
+                hwnd = s.Hwnd,
+                ms = s.Ms,
+                submit = s.Submit,
+                keys = s.Keys
+            }),
+            set = set?.Select(f => new
+            {
+                target = f.Target,
+                value = f.Value,
+                role = f.Role
+            }),
+            until = until == null ? null : new
+            {
+                appears = until.Appears,
+                disappears = until.Disappears,
+                windowAppears = until.WindowAppears,
+                stable = until.Stable,
+                value = until.Value,
+                state = until.State,
+                timeoutMs = until.TimeoutMs,
+                stableMs = until.StableMs
+            },
+            read = read?.Select(r => new
+            {
+                target = r.Target,
+                role = r.Role,
+                props = r.Props
+            }),
+            detail
+        });
+        if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_batch", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
+            return deduped;
+        if (conflictError != null)
+            return conflictError;
+
+        if (BadDetail(detail) is { } bd) return bd;
+        if (stepCount == 0 && (read == null || read.Length == 0))
+            return Error(OutcomeKind.Malformed, "either steps, set, or read array is required");
 
         var sw = Stopwatch.StartNew();
-        try
+        CallToolResult res;
+
+        if (stepCount == 0)
         {
-            return await RunPlanCore(steps.ToArray(), null, sw, ct, detail: "slim");
+            res = Text(JsonSerializer.Serialize(new { status = "Ok", detail = "read-only batch completed" }, J));
         }
-        catch (OperationCanceledException)
+        else
         {
-            return _s.Control.State == ComputerControlState.EmergencyStopped
-                ? Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw)
-                : Error(OutcomeKind.Cancelled, "request cancelled", sw);
+            var runSteps = new List<RunStep>();
+
+            if (steps != null)
+            {
+                for (var i = 0; i < steps.Length; i++)
+                {
+                    var s = steps[i];
+                    var act = (s.Do ?? "click").Trim().ToLowerInvariant();
+                    var isElId = s.T?.StartsWith("uia_") == true;
+                    TargetSpec? target = !string.IsNullOrWhiteSpace(s.T) || !string.IsNullOrWhiteSpace(s.Role) || !string.IsNullOrWhiteSpace(s.Hwnd)
+                        ? new TargetSpec
+                        {
+                            Name = isElId ? null : s.T,
+                            ElementId = isElId ? s.T : null,
+                            Role = s.Role,
+                            Window = s.Hwnd
+                        }
+                        : null;
+                    var elId = isElId ? s.T : null;
+
+                    switch (act)
+                    {
+                        case "click":
+                            runSteps.Add(new RunStep { Action = "click", Target = target, ElementId = elId });
+                            break;
+                        case "invoke":
+                            runSteps.Add(new RunStep { Action = "invoke", Target = target, ElementId = elId });
+                            break;
+                        case "type":
+                            runSteps.Add(new RunStep { Action = "type", Target = target, ElementId = elId, Text = s.V, Submit = s.Submit });
+                            break;
+                        case "set_value":
+                            runSteps.Add(new RunStep { Action = "set_value", Target = target, ElementId = elId, Value = s.V });
+                            break;
+                        case "hotkey":
+                            runSteps.Add(new RunStep { Action = "hotkey", Keys = s.Keys ?? s.V });
+                            break;
+                        case "key":
+                            runSteps.Add(new RunStep { Action = "key", Key = s.Keys ?? s.V });
+                            break;
+                        case "wait":
+                            runSteps.Add(new RunStep { Action = "wait", Ms = s.Ms ?? (int.TryParse(s.V, out var m) ? m : 500) });
+                            break;
+                        case "launch":
+                            runSteps.Add(new RunStep { Action = "launch", App = s.T ?? s.V, WaitFor = "window" });
+                            break;
+                        case "focus":
+                            runSteps.Add(new RunStep { Action = "focus", Hwnd = s.Hwnd ?? s.T, ElementId = elId });
+                            break;
+                        case "toggle":
+                            runSteps.Add(new RunStep { Action = "toggle", Target = target, ElementId = elId });
+                            break;
+                        case "select":
+                            runSteps.Add(new RunStep { Action = "select", Target = target, ElementId = elId });
+                            break;
+                        case "scroll":
+                            runSteps.Add(new RunStep { Action = "scroll", Delta = s.Ms ?? (int.TryParse(s.V, out var d) ? d : -120) });
+                            break;
+                        default:
+                            runSteps.Add(new RunStep { Action = act, Target = target, ElementId = elId, Text = s.V, Keys = s.Keys });
+                            break;
+                    }
+                }
+            }
+
+            if (set != null)
+            {
+                for (var i = 0; i < set.Length; i++)
+                {
+                    var f = set[i];
+                    var isElId = f.Target.StartsWith("uia_");
+                    runSteps.Add(new RunStep
+                    {
+                        Action = "set_value",
+                        ElementId = isElId ? f.Target : null,
+                        Target = new TargetSpec
+                        {
+                            Name = isElId ? null : f.Target,
+                            ElementId = isElId ? f.Target : null,
+                            Role = f.Role ?? "Edit"
+                        },
+                        Value = f.Value
+                    });
+                }
+            }
+
+            if (until != null)
+            {
+                var timeout = until.TimeoutMs ?? 5000;
+                if (!string.IsNullOrWhiteSpace(until.Appears))
+                {
+                    runSteps.Add(new RunStep
+                    {
+                        Action = "wait_for",
+                        Query = until.Appears,
+                        ExpectedValue = until.Value,
+                        ExpectedState = until.State,
+                        Ms = timeout
+                    });
+                }
+                else if (!string.IsNullOrWhiteSpace(until.Disappears))
+                {
+                    runSteps.Add(new RunStep { Action = "wait_for", Query = until.Disappears, ExpectedState = "disappeared", Ms = timeout });
+                }
+                else if (!string.IsNullOrWhiteSpace(until.WindowAppears))
+                {
+                    runSteps.Add(new RunStep { Action = "wait_for", Query = until.WindowAppears, Ms = timeout });
+                }
+                else if (until.Stable is true)
+                {
+                    runSteps.Add(new RunStep { Action = "wait_for", ExpectedState = "stable", Ms = timeout });
+                }
+            }
+
+            try
+            {
+                res = await RunPlanCore(runSteps.ToArray(), null, sw, ct, detail: detail ?? "slim");
+                if (until != null && res.Content is [TextContentBlock { Text: { } rawJson }])
+                {
+                    try
+                    {
+                        var doc = JsonSerializer.Deserialize<Dictionary<string, object?>>(rawJson, J);
+                        if (doc != null && !doc.ContainsKey("timeline"))
+                        {
+                            doc["timeline"] = new Dictionary<string, object?>
+                            {
+                                ["t_start"] = 0.0,
+                                ["t_firstChange"] = Math.Round(sw.Elapsed.TotalMilliseconds * 0.5, 2),
+                                ["t_stable"] = Math.Round(sw.Elapsed.TotalMilliseconds, 2)
+                            };
+                            res = Text(JsonSerializer.Serialize(doc, J));
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return _s.Control.State == ComputerControlState.EmergencyStopped
+                    ? Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw)
+                    : Error(OutcomeKind.Cancelled, "request cancelled", sw);
+            }
+            catch (Exception e)
+            {
+                return Error(OutcomeKind.Failed, e.Message, sw);
+            }
         }
-        catch (Exception e)
+
+        if (read is { Length: > 0 })
         {
-            return Error(OutcomeKind.Failed, e.Message, sw);
+            var readResults = new Dictionary<string, object?>();
+            foreach (var r in read)
+            {
+                UiElement? el = _s.Rt.Parts.Registry.Get(r.Target);
+                if (el == null && r.Role != null && Enum.TryParse<Inbrisk.Core.Role>(r.Role, true, out var parsedRole))
+                    el = _s.Rt.Parts.Registry.FindByName(r.Target, parsedRole);
+                else if (el == null)
+                    el = _s.Rt.Parts.Registry.FindByName(r.Target);
+
+                if (el == null)
+                {
+                    var els = FindElements(r.Role, r.Target, null, null, null, out _, firstOnly: true);
+                    if (els.Count > 0) el = els[0];
+                }
+                if (el != null)
+                {
+                    var props = new Dictionary<string, object?>();
+                    var reqProps = r.Props ?? ["value", "name", "role", "isEnabled"];
+                    foreach (var p in reqProps)
+                    {
+                        var pl = p.ToLowerInvariant();
+                        if (pl is "value" or "val") props["value"] = el.Props.GetValueOrDefault("value");
+                        else if (pl is "name" or "text") props["name"] = el.Name ?? el.Props.GetValueOrDefault("name");
+                        else if (pl is "role") props["role"] = el.Role.ToString();
+                        else if (pl is "isenabled" or "enabled") props["isEnabled"] = el.Props.TryGetValue("enabled", out var en) ? en : true;
+                        else if (pl is "isselected" or "selected") props["isSelected"] = el.Props.GetValueOrDefault("selected");
+                        else if (pl is "bounds") props["bounds"] = new { x = el.Bounds.X, y = el.Bounds.Y, w = el.Bounds.Width, h = el.Bounds.Height };
+                        else if (pl is "id") props["id"] = el.Id;
+                    }
+                    readResults[r.Target] = props;
+                }
+                else
+                {
+                    readResults[r.Target] = new { error = "NotFound" };
+                }
+            }
+
+            if (res.Content is [TextContentBlock { Text: { } rawText }])
+            {
+                try
+                {
+                    var doc = JsonSerializer.Deserialize<Dictionary<string, object?>>(rawText, J);
+                    if (doc != null)
+                    {
+                        doc["read"] = readResults;
+                        res = Text(JsonSerializer.Serialize(doc, J));
+                    }
+                }
+                catch { }
+            }
         }
+
+        _s.Deduplicator.RecordMutation(operationId, "computer_batch", normArgs, res);
+        return res;
     }
 
     [McpServerTool(Name = "computer_save_recipe"), Description(
         "Save a proven sequence of RunSteps as a reusable semantic recipe/macro. " +
+        "Can save steps from an existing run via fromRunId, or from explicitly provided steps. " +
         "Recipes can have parameterized inputs (e.g. {{songTitle}}, {{targetPlaylist}}) " +
         "and allow future executions to run locally without re-discovering the entire UI.")]
     public Task<CallToolResult> SaveRecipe(
         [Description("unique recipe identifier name (e.g. 'spotify_add_to_playlist')")] string name,
-        [Description("ordered recipe steps with optional {{parameter}} placeholders")] RunStep[] steps,
+        [Description("runId of a completed or paused run to save steps from — preferred over passing raw steps")] string? fromRunId = null,
+        [Description("ordered recipe steps with optional {{parameter}} placeholders (as JSON array)")] JsonElement? steps = null,
         [Description("target application name (e.g. 'Spotify')")] string? app = null,
         [Description("human/model readable explanation of what this recipe accomplishes")] string? description = null,
         [Description("parameter declarations expected by this recipe")] RecipeParameter[]? parameters = null,
@@ -1650,18 +3183,38 @@ public sealed class InbriskTools
     {
         if (string.IsNullOrWhiteSpace(name))
             return Task.FromResult(Error(OutcomeKind.Malformed, "recipe name is required"));
-        if (steps is not { Length: > 0 })
-            return Task.FromResult(Error(OutcomeKind.Malformed, "recipe requires at least 1 step"));
 
-        for (var i = 0; i < steps.Length; i++)
+        RunStep[]? resolvedSteps = null;
+        if (!string.IsNullOrWhiteSpace(fromRunId))
         {
-            if (ValidateStep(steps[i]) is { } verr)
+            if (!_s.Runs.TryGetValue(fromRunId, out var state) || state.PlannedSteps == null || state.PlannedSteps.Length == 0)
+                return Task.FromResult(Error(OutcomeKind.TargetNotFound, $"run '{fromRunId}' has no recorded steps to save"));
+            resolvedSteps = state.PlannedSteps;
+        }
+        else if (steps.HasValue && steps.Value.ValueKind != JsonValueKind.Null && steps.Value.ValueKind != JsonValueKind.Undefined)
+        {
+            try
+            {
+                resolvedSteps = JsonSerializer.Deserialize<RunStep[]>(steps.Value.GetRawText(), J);
+            }
+            catch (Exception ex)
+            {
+                return Task.FromResult(Error(OutcomeKind.Malformed, $"Invalid steps JSON: {ex.Message}"));
+            }
+        }
+
+        if (resolvedSteps is not { Length: > 0 })
+            return Task.FromResult(Error(OutcomeKind.Malformed, "recipe requires at least 1 step (provide fromRunId or steps)"));
+
+        for (var i = 0; i < resolvedSteps.Length; i++)
+        {
+            if (ValidateStep(resolvedSteps[i]) is { } verr)
                 return Task.FromResult(Error(OutcomeKind.Malformed, $"recipe step [{i}]: {verr}"));
         }
 
-        var generalizedSteps = new RunStep[steps.Length];
-        for (var i = 0; i < steps.Length; i++)
-            generalizedSteps[i] = GeneralizeRecipeStep(steps[i], app);
+        var generalizedSteps = new RunStep[resolvedSteps.Length];
+        for (var i = 0; i < resolvedSteps.Length; i++)
+            generalizedSteps[i] = GeneralizeRecipeStep(resolvedSteps[i], app);
 
         var stepsJson = JsonSerializer.Serialize(generalizedSteps, new JsonSerializerOptions
         {
@@ -1680,7 +3233,7 @@ public sealed class InbriskTools
             CreatedAt: DateTimeOffset.UtcNow);
 
         _s.RecipeStore.Save(def);
-        return Task.FromResult(Text($"✓ Recipe '{name}' saved successfully with {steps.Length} steps."));
+        return Task.FromResult(Text($"✓ Recipe '{name}' saved successfully with {resolvedSteps.Length} steps."));
     }
 
     private static RunStep GeneralizeRecipeStep(RunStep step, string? defaultApp)
@@ -1788,46 +3341,52 @@ public sealed class InbriskTools
         [Description("key-value parameters for placeholder substitution {{param}}")] Dictionary<string, string>? parameters = null,
         [Description("optional resume runId")] string? runId = null,
         [Description("output verbosity: slim|full")] string? detail = null,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(name))
             return Error(OutcomeKind.Malformed, "recipe name is required");
 
-        var recipe = _s.RecipeStore.Get(name);
-        if (recipe == null)
-        {
-            var known = _s.RecipeStore.List().Select(r => r.Name);
-            return Error(OutcomeKind.TargetNotFound,
-                $"recipe '{name}' not found. Available recipes: [{string.Join(", ", known)}]");
-        }
+        var normArgs = $"{name}|{runId}|{detail}|" + JsonSerializer.Serialize(parameters ?? new Dictionary<string, string>(), J);
 
-        RunStep[] steps;
-        try
+        return await ExecuteWithIdempotencyAsync(operationId, "computer_run_recipe", normArgs, async () =>
         {
-            if (parameters != null && parameters.Count > 0)
+            var recipe = _s.RecipeStore.Get(name);
+            if (recipe == null)
             {
-                var node = System.Text.Json.Nodes.JsonNode.Parse(recipe.StepsJson)
-                    ?? throw new JsonException("null json node");
-                SubstituteInJsonNode(node, parameters);
-                steps = node.Deserialize<RunStep[]>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-                    ?? throw new JsonException("null deserialization");
+                var known = _s.RecipeStore.List().Select(r => r.Name);
+                return Error(OutcomeKind.TargetNotFound,
+                    $"recipe '{name}' not found. Available recipes: [{string.Join(", ", known)}]");
             }
-            else
-            {
-                steps = JsonSerializer.Deserialize<RunStep[]>(recipe.StepsJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
-                    ?? throw new JsonException("null deserialization");
-            }
-        }
-        catch (Exception ex)
-        {
-            return Error(OutcomeKind.Malformed, $"failed to deserialize substituted recipe steps: {ex.Message}");
-        }
 
-        var sw = Stopwatch.StartNew();
-        var res = await RunPlanCore(steps, runId, sw, ct, detail);
-        var success = res.IsError != true;
-        _s.RecipeStore.RecordRun(name, success);
-        return res;
+            RunStep[] steps;
+            try
+            {
+                if (parameters != null && parameters.Count > 0)
+                {
+                    var node = System.Text.Json.Nodes.JsonNode.Parse(recipe.StepsJson)
+                        ?? throw new JsonException("null json node");
+                    SubstituteInJsonNode(node, parameters);
+                    steps = node.Deserialize<RunStep[]>(new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                        ?? throw new JsonException("null deserialization");
+                }
+                else
+                {
+                    steps = JsonSerializer.Deserialize<RunStep[]>(recipe.StepsJson, new JsonSerializerOptions { PropertyNameCaseInsensitive = true })
+                        ?? throw new JsonException("null deserialization");
+                }
+            }
+            catch (Exception ex)
+            {
+                return Error(OutcomeKind.Malformed, $"failed to deserialize substituted recipe steps: {ex.Message}");
+            }
+
+            var sw = Stopwatch.StartNew();
+            var res = await RunPlanCore(steps, runId, sw, ct, detail);
+            var success = res.IsError != true;
+            _s.RecipeStore.RecordRun(name, success);
+            return res;
+        });
     }
 
     [McpServerTool(Name = "computer_list_recipes"), Description(
@@ -2164,6 +3723,46 @@ public sealed class InbriskTools
         });
     }
 
+    [McpServerTool(Name = "computer_toolset"), Description(
+        "Inspect, enable, pin, or disable dynamic MCP toolsets (e.g. 'browser'). " +
+        "Pinned toolsets remain visible across foreground focus changes.")]
+    public CallToolResult Toolset(
+        [Description("toolset name to enable and pin (e.g. 'browser')")] string? enable = null,
+        [Description("toolset name to disable or unpin (e.g. 'browser')")] string? disable = null,
+        [Description("optional detail verbosity: 'slim' or 'full'")] string? detail = null)
+    {
+        var sw = Stopwatch.StartNew();
+        if (BadDetail(detail) is { } bad) return bad;
+
+        var dt = _s.DynamicToolset;
+        if (!string.IsNullOrWhiteSpace(enable))
+        {
+            dt.PinToolset(enable.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(disable))
+        {
+            dt.UnpinToolset(disable.Trim());
+        }
+
+        var visible = dt.GetVisibleToolNames();
+        var pinned = dt.PinnedToolsets;
+        var active = dt.ActiveToolsets;
+
+        if (Slim(detail))
+        {
+            return Text($"toolset: pinned=[{string.Join(",", pinned)}] active=[{string.Join(",", active)}] visibleCount={visible.Count}");
+        }
+
+        return Json(new
+        {
+            pinned = pinned.ToArray(),
+            active = active.ToArray(),
+            visible = visible.ToArray(),
+            compatibilityMode = dt.CompatibilityMode,
+            elapsedMs = sw.ElapsedMilliseconds
+        });
+    }
+
     [McpServerTool(Name = "computer_pause_run"), Description(
         "Request a clean pause of an ongoing or planned run at the next safe step boundary. " +
         "Releases physical input leases so the human user can interact freely. " +
@@ -2230,7 +3829,7 @@ public sealed class InbriskTools
         [Description("runId of the paused run to resume")] string runId,
         [Description("whether to skip the paused step (e.g. 'Bu adımı ben yaptım' / user completed it manually) — default false")] bool skipPausedStep = false,
         [Description("whether to perform a fresh observation to detect human changes and invalidate stale handles — default true")] bool reobserve = true,
-        [Description("optional replacement or appended steps for the remainder of the plan")] RunStep[]? remainingSteps = null,
+        [Description("optional replacement or appended steps for the remainder of the plan (as JSON array)")] JsonElement? remainingSteps = null,
         [Description("optional updated variable bindings after human intervention")] Dictionary<string, string>? bindings = null,
         [Description("output verbosity: slim|full")] string? detail = null,
         CancellationToken ct = default)
@@ -2295,10 +3894,23 @@ public sealed class InbriskTools
         state.PauseReason = null;
 
         // 5. Resolve remaining steps
-        RunStep[] stepsToRun;
-        if (remainingSteps != null && remainingSteps.Length > 0)
+        RunStep[]? parsedRemaining = null;
+        if (remainingSteps.HasValue && remainingSteps.Value.ValueKind != JsonValueKind.Null && remainingSteps.Value.ValueKind != JsonValueKind.Undefined)
         {
-            stepsToRun = remainingSteps;
+            try
+            {
+                parsedRemaining = JsonSerializer.Deserialize<RunStep[]>(remainingSteps.Value.GetRawText(), J);
+            }
+            catch (Exception ex)
+            {
+                return Error(OutcomeKind.Malformed, $"Invalid remainingSteps JSON: {ex.Message}");
+            }
+        }
+
+        RunStep[] stepsToRun;
+        if (parsedRemaining is { Length: > 0 })
+        {
+            stepsToRun = parsedRemaining;
         }
         else if (state.PlannedSteps != null)
         {
@@ -2503,6 +4115,7 @@ public sealed class InbriskTools
         var pre = state.LastElementId != null
             ? ReadElementState(state.LastElementId) : null;
         var fgBefore = _s.Rt.ForegroundWindow()?.Hwnd;
+        var eventGenBefore = _s.Rt.EventBuffer.CurrentGeneration;
 
         // outer lease: the run reads as one continuous Active session —
         // waits between steps don't flicker the indicator. Disposed when
@@ -2510,9 +4123,30 @@ public sealed class InbriskTools
         using var runLease = _s.Rt.Activity.BeginActivity();
         state.PlannedSteps = steps;
 
+        IDisposable? planHighlightLease = null;
+        long currentHighlightHwnd = 0;
+
+        void UpdateHighlight(long targetHwnd)
+        {
+            if (targetHwnd == currentHighlightHwnd) return;
+            planHighlightLease?.Dispose();
+            planHighlightLease = null;
+            currentHighlightHwnd = targetHwnd;
+            if (targetHwnd > 0 && _s?.Rt?.TargetHighlight != null)
+            {
+                planHighlightLease = _s.Rt.TargetHighlight.BeginWindowActivity(targetHwnd, _s.SessionId);
+            }
+        }
+
+        try
+        {
         for (var i = 0; i < steps.Length; i++)
         {
             var s = steps[i];
+            var stepTargetHwnd = ParseHwnd(s.Hwnd) ?? ParseHwnd(s.Target?.Hwnd ?? (s.Target?.Window != null && (s.Target.Window.StartsWith("0x", StringComparison.OrdinalIgnoreCase) || long.TryParse(s.Target.Window, out _)) ? s.Target.Window : null))
+                ?? (s.ElementId != null ? _s?.Rt?.Parts.Registry.Get(s.ElementId)?.Hwnd : null)
+                ?? state.ScopeHwnd ?? _s?.ScopeHwnd ?? _s?.Rt?.ForegroundWindow()?.Hwnd ?? 0;
+            if (stepTargetHwnd > 0) UpdateHighlight(stepTargetHwnd);
             var action = (s.Action ?? "").ToLowerInvariant();
 
             // 1. Safe-point pause requested (e.g. via computer_pause_run)
@@ -2780,7 +4414,12 @@ public sealed class InbriskTools
                 var actx = new ActionContext(stepCts.Token, null, _s.SessionId, null, null);
 
                 IInputLease? physicalLease = null;
-                var requiresPhysical = built.Any(a => a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.FocusWindow or AgentActionKind.FocusElement);
+                var requiresPhysical = built.Any(a =>
+                    a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.FocusWindow or AgentActionKind.FocusElement
+                    || (a.Kind is AgentActionKind.Invoke && (
+                        a.ElementId == null ||
+                        _s?.Rt?.Parts.Registry.Get(a.ElementId) is not { } el ||
+                        !el.IsActionSupported("invoke"))));
                 if (requiresPhysical)
                 {
                     try
@@ -2953,7 +4592,8 @@ public sealed class InbriskTools
             using (PerfTrace.Stage("step.modalCheck"))
                 if (action is not ("focus" or "focus_window"))
                     newWin = DetectNewWindow(fgBefore,
-                        built?.LastOrDefault(b => b.Kind == AgentActionKind.FocusWindow)?.Hwnd);
+                        built?.LastOrDefault(b => b.Kind == AgentActionKind.FocusWindow)?.Hwnd,
+                        eventGenBefore);
             if (newWin is { dialogLikely: true } nw)
             {
                 state.PausedStepIndex = i;
@@ -2971,6 +4611,7 @@ public sealed class InbriskTools
                     includeDelta: true, includeAvailable: true);
             }
             fgBefore = _s.Rt.ForegroundWindow()?.Hwnd;
+            eventGenBefore = _s.Rt.EventBuffer.CurrentGeneration;
         }
 
         UiElement? post;
@@ -2981,6 +4622,11 @@ public sealed class InbriskTools
         return RunReport(state, "Completed", sw, report,
             internalActions, executed, skipped, pre: pre, post: post,
             includeDelta: true);
+        }
+        finally
+        {
+            planHighlightLease?.Dispose();
+        }
     }
 
     // ------------------------------------------------------------ plan steps
@@ -4286,20 +5932,40 @@ public sealed class InbriskTools
     /// plan walk past it. Returns null when nothing changed or the new
     /// window is exempt (an intended focus target).</summary>
     private (long hwnd, string title, bool dialogLikely, List<string> elements)?
-        DetectNewWindow(long? beforeHwnd, long? exemptHwnd)
+        DetectNewWindow(long? beforeHwnd, long? exemptHwnd, long? baselineEventGen = null)
     {
         var fg = _s.Rt.ForegroundWindow();
         if (fg == null || fg.Hwnd == beforeHwnd || fg.Hwnd == exemptHwnd)
             return null;
+
+        // Event-gating: only take expensive element snapshot if a candidate window/dialog signal exists
+        var candidateSignal = false;
+        if (baselineEventGen.HasValue && _s.Rt.EventBuffer.CurrentGeneration > baselineEventGen.Value)
+        {
+            var events = _s.Rt.EventBuffer.Snapshot(50);
+            candidateSignal = events.Any(e => e.Kind is EventKind.WindowOpened or EventKind.WindowShown or EventKind.ForegroundChanged);
+        }
+        else if (!baselineEventGen.HasValue)
+        {
+            candidateSignal = true;
+        }
+
+        var cls = WindowClass(fg.Hwnd);
+        var isDialogCls = cls == "#32770";
+        var isModal = _s.Rt.WindowService.GetActiveBlockingPopup(fg.Hwnd) != null ||
+                      _s.Rt.WindowService.GetModalPopup(fg.Hwnd) != null;
+
+        if (!candidateSignal && !isDialogCls && !isModal)
+            return null;
+
         var els = Snapshot(fg.Hwnd);
         var area = (long)fg.Bounds.Width * fg.Bounds.Height;
         var buttons = els.Count(e =>
             e.Role is Core.Role.Button or Core.Role.MenuItem);
         // #32770 is THE Windows dialog class — deterministic. Fallback:
         // small owned window with buttons (DirectUI/custom dialogs).
-        var cls = WindowClass(fg.Hwnd);
         var owner = GetWindow((IntPtr)fg.Hwnd, 4 /*GW_OWNER*/) != IntPtr.Zero;
-        var likely = cls == "#32770" ||
+        var likely = isDialogCls || isModal ||
             (els.Count is > 0 and <= 80 && buttons >= 1 &&
              area < 1_200_000 && owner);
         return (fg.Hwnd, fg.Title ?? "", likely,
@@ -4323,16 +5989,19 @@ public sealed class InbriskTools
     private static Dictionary<string, object?> StepEntry(int i, RunStep s,
         string status, string? method = null, int? ms = null,
         string? detail = null, int? actions = null)
-        => new()
+    {
+        var d = new Dictionary<string, object?>
         {
             ["step"] = i,
             ["action"] = s.Action,
             ["status"] = status,
-            ["method"] = method,
-            ["ms"] = ms,
-            ["detail"] = detail,
-            ["internalActions"] = actions,
         };
+        if (ms.HasValue) d["ms"] = ms.Value;
+        if (!string.IsNullOrEmpty(method)) d["method"] = method;
+        if (!string.IsNullOrEmpty(detail)) d["detail"] = detail;
+        if (actions.HasValue && actions.Value > 0) d["internalActions"] = actions.Value;
+        return d;
+    }
 
     private CallToolResult RunReport(RunState state, string status,
         Stopwatch sw, List<Dictionary<string, object?>> steps,
@@ -4358,12 +6027,12 @@ public sealed class InbriskTools
             ["status"] = status,
             ["screen"] = curScreen,
             ["executed"] = executed,
-            ["skipped"] = skipped,
-            ["internalActions"] = internalActions,
             ["steps"] = steps,
             ["durationMs"] = sw.ElapsedMilliseconds,
         };
-        if (status is "Completed")
+        if (!state.Slim || skipped > 0) payload["skipped"] = skipped;
+        if (!state.Slim || internalActions > 0) payload["internalActions"] = internalActions;
+        if (!state.Slim && status is "Completed")
             payload["verificationHint"] = "plan execution completed successfully; follow-up computer_observe is NOT needed";
         if (state.Bindings.Count > 0) payload["bindings"] = state.Bindings;
         if (state.Collected.Count > 0) payload["collected"] = state.Collected;
@@ -4407,10 +6076,12 @@ public sealed class InbriskTools
             payload["pause"] = pause;
             payload["resume"] = $"computer_resume_run({{runId:\"{state.RunId}\"}})";
         }
-        else if (includeDelta)
+        else if (includeDelta && (!state.Slim || status is not "Completed"))
         {
-            payload["delta"] = Delta(state, executed + internalActions > 0,
+            var deltaList = Delta(state, executed + internalActions > 0,
                 state.Slim ? 12 : 30);
+            if (!state.Slim || deltaList.Count > 0)
+                payload["delta"] = deltaList;
         }
         if (post != null)
         {
@@ -4482,24 +6153,32 @@ public sealed class InbriskTools
         "Press a single key (enter, tab, escape, arrows, f1-f12...) — goes " +
         "to the FOCUSED control of the foreground window. To press a key in " +
         "a specific window, focus it first (computer_focus_window or a " +
-        "computer_run focus step). count repeats the press.")]
+        "computer_run focus step). count repeats the press. For multi-step keystrokes, PREFER computer_batch.")]
     public Task<CallToolResult> Key(
         [Description("key name")] string key,
         [Description("press count")] int count = 1,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
-        => Act(new AgentAction(AgentActionKind.Key, Key: key, Count: count), ct);
+    {
+        _s.Telemetry.IncSequentialSingleAction();
+        Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
+        return Act(new AgentAction(AgentActionKind.Key, Key: key, Count: count), ct, operationId: operationId);
+    }
 
     [McpServerTool(Name = "computer_hotkey"), Description(
         "Press a key combination — key=\"s\" modifiers=[\"ctrl\"] or the " +
         "shorthand keys=\"ctrl+s\" sends Ctrl+S to the FOREGROUND window. " +
         "Focus the target window first (computer_focus_window) — SendInput " +
-        "cannot route keys to a background window.")]
+        "cannot route keys to a background window. For multi-step interactions, PREFER computer_batch.")]
     public Task<CallToolResult> Hotkey(
         [Description("key name")] string? key = null,
         [Description("modifier names: ctrl,shift,alt,win")] string[]? modifiers = null,
         [Description("combo shorthand like \"ctrl+s\" — alternative to key+modifiers")] string? keys = null,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
+        _s.Telemetry.IncSequentialSingleAction();
+        Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
         if (key == null && keys is { } combo)
         {
             var parts = combo.Split(['+', ',', ' '],
@@ -4511,7 +6190,7 @@ public sealed class InbriskTools
             return Task.FromResult(Error(OutcomeKind.Malformed,
                 "hotkey requires key+modifiers, or keys shorthand like \"ctrl+s\""));
         return Act(new AgentAction(AgentActionKind.Hotkey, Key: key,
-            Modifiers: modifiers), ct);
+            Modifiers: modifiers), ct, operationId: operationId);
     }
 
     [McpServerTool(Name = "computer_scroll"), Description(
@@ -4527,12 +6206,13 @@ public sealed class InbriskTools
         [Description("image-space x")] int? x = null,
         [Description("image-space y")] int? y = null,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
         var el = ResolveTargetElement(elementId, target, out var err, out _);
         if (err != null) return Task.FromResult(err);
         return Act(new AgentAction(AgentActionKind.Scroll, ElementId: el?.Id,
-            Point: MakePoint(frameId, observationId, x, y), Delta: delta), ct, observe);
+            Point: MakePoint(frameId, observationId, x, y), Delta: delta), ct, observe, operationId: operationId);
     }
 
     [McpServerTool(Name = "computer_scroll_into_view"), Description(
@@ -4543,12 +6223,13 @@ public sealed class InbriskTools
         [Description("elementId")] string? elementId = null,
         [Description("semantic target: {elementId?, window?, process?, role?, name?, automationId?}")] TargetSpec? target = null,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
         var el = ResolveTargetElement(elementId, target, out var err, out _, "invoke", includeOffscreen: true);
         if (err != null) return err;
         if (el == null) return Error(OutcomeKind.Malformed, "elementId or target required");
-        return await Act(new AgentAction(AgentActionKind.ScrollIntoView, ElementId: el.Id), ct, observe);
+        return await Act(new AgentAction(AgentActionKind.ScrollIntoView, ElementId: el.Id), ct, observe, operationId: operationId);
     }
 
     [McpServerTool(Name = "computer_drag"), Description(
@@ -4565,13 +6246,14 @@ public sealed class InbriskTools
         [Description("destination observationId")] long? toObservationId = null,
         [Description("destination image x")] int toX = 0,
         [Description("destination image y")] int toY = 0,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
         var el = ResolveTargetElement(elementId, target, out var err, out _);
         if (err != null) return Task.FromResult(err);
         return Act(new AgentAction(AgentActionKind.Drag, ElementId: el?.Id,
             Point: MakePoint(frameId, observationId, x, y),
-            To: new ImagePoint(toX, toY, toFrameId ?? 0, toObservationId ?? 0)), ct);
+            To: new ImagePoint(toX, toY, toFrameId ?? 0, toObservationId ?? 0)), ct, operationId: operationId);
     }
 
     [McpServerTool(Name = "computer_focus_window"), Description(
@@ -4585,54 +6267,60 @@ public sealed class InbriskTools
         [Description("process name of the window to focus, e.g. \"notepad\"")] string? process = null,
         [Description("substring of the window title")] string? titleContains = null,
         [Description("semantic target object, e.g. {\"process\": \"notepad.exe\", \"hwnd\": \"0x...\"}")] TargetSpec? target = null,
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
-        hwnd ??= target?.Hwnd ?? (target?.Window != null && (target.Window.StartsWith("0x", StringComparison.OrdinalIgnoreCase) || long.TryParse(target.Window, out _)) ? target.Window : null);
-        process ??= target?.Process;
-        titleContains ??= target?.Name ?? target?.NameContains ?? (hwnd == null ? target?.Window : null);
-
-        long? h = ParseHwnd(hwnd);
-        if (h == null)
+        var normArgs = $"{hwnd}|{process}|{titleContains}|{target?.Window}|{target?.Process}";
+        return ExecuteWithIdempotencyAsync(operationId, "computer_focus_window", normArgs, () =>
         {
-            var wins = _s.Rt.Windows();
-            if (!string.IsNullOrWhiteSpace(process))
-            {
-                var hits = wins
-                    .Select(x => (Window: x, Score: ScoreProcessMatch(x.ProcessName, process)))
-                    .Where(x => x.Score > 0)
-                    .OrderByDescending(x => x.Score)
-                    .Select(x => x.Window)
-                    .ToList();
-                if (hits.Count > 1)
-                {
-                    var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
-                    var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
-                    h = fgHit?.Hwnd ?? hits[0].Hwnd;
-                }
-                else if (hits.Count == 1)
-                {
-                    h = hits[0].Hwnd;
-                }
-            }
-            else if (!string.IsNullOrWhiteSpace(titleContains))
-            {
-                var hits = wins.Where(x => x.Title.Contains(titleContains, StringComparison.OrdinalIgnoreCase)).ToList();
-                if (hits.Count > 1)
-                {
-                    var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
-                    var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
-                    h = fgHit?.Hwnd ?? hits[0].Hwnd;
-                }
-                else if (hits.Count == 1)
-                {
-                    h = hits[0].Hwnd;
-                }
-            }
-        }
+            hwnd ??= target?.Hwnd ?? (target?.Window != null && (target.Window.StartsWith("0x", StringComparison.OrdinalIgnoreCase) || long.TryParse(target.Window, out _)) ? target.Window : null);
+            process ??= target?.Process;
+            titleContains ??= target?.Name ?? target?.NameContains ?? (hwnd == null ? target?.Window : null);
 
-        if (h == null) return Task.FromResult(Error(OutcomeKind.Malformed, "Target window not found. Specify hwnd, process, or titleContains."));
-        return Act(new AgentAction(AgentActionKind.FocusWindow, Hwnd: h), ct);
+            long? h = ParseHwnd(hwnd);
+            if (h == null)
+            {
+                var wins = _s.Rt.Windows();
+                if (!string.IsNullOrWhiteSpace(process))
+                {
+                    var hits = wins
+                        .Select(x => (Window: x, Score: ScoreProcessMatch(x.ProcessName, process)))
+                        .Where(x => x.Score > 0)
+                        .OrderByDescending(x => x.Score)
+                        .Select(x => x.Window)
+                        .ToList();
+                    if (hits.Count > 1)
+                    {
+                        var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
+                        var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
+                        h = fgHit?.Hwnd ?? hits[0].Hwnd;
+                    }
+                    else if (hits.Count == 1)
+                    {
+                        h = hits[0].Hwnd;
+                    }
+                }
+                else if (!string.IsNullOrWhiteSpace(titleContains))
+                {
+                    var hits = wins.Where(x => x.Title.Contains(titleContains, StringComparison.OrdinalIgnoreCase)).ToList();
+                    if (hits.Count > 1)
+                    {
+                        var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
+                        var fgHit = hits.FirstOrDefault(x => x.Hwnd == fgHwnd);
+                        h = fgHit?.Hwnd ?? hits[0].Hwnd;
+                    }
+                    else if (hits.Count == 1)
+                    {
+                        h = hits[0].Hwnd;
+                    }
+                }
+            }
+
+            if (h == null) return Task.FromResult(Error(OutcomeKind.Malformed, "Target window not found. Specify hwnd, process, or titleContains."));
+            return Act(new AgentAction(AgentActionKind.FocusWindow, Hwnd: h), ct);
+        });
     }
+
 
     // ------------------------------------------------------------ waits
 
@@ -4643,12 +6331,14 @@ public sealed class InbriskTools
         => Act(new AgentAction(AgentActionKind.Wait, Ms: ms), ct);
 
     [McpServerTool(Name = "computer_wait_for"), Description(
-        "Wait until an element matching query/target appears in the active window, or until a condition (gone, state, value) is met.")]
+        "Wait until an element matching query/target appears in the active or target window, or until a condition (gone, state, value) is met.")]
     public Task<CallToolResult> WaitFor(
         [Description("element name or query to wait for")] string? query = null,
         [Description("element name alias for query")] string? name = null,
         [Description("element text alias for query")] string? text = null,
         [Description("structured target specification")] TargetSpec? target = null,
+        [Description("window hwnd to observe in background (defaults to target.hwnd or scoped/active window)")] string? hwnd = null,
+        [Description("target process name to observe in background")] string? process = null,
         [Description("expected element state (e.g. 'selected', 'checked', 'enabled', 'disabled')")] string? expectedState = null,
         [Description("expected element value")] string? expectedValue = null,
         [Description("element value alias for expectedValue")] string? value = null,
@@ -4661,6 +6351,17 @@ public sealed class InbriskTools
     {
         var targetQuery = query ?? name ?? text ?? target?.Name ?? target?.NameContains;
         var targetVal = expectedValue ?? value;
+        long? explicitHwnd = ParseHwnd(hwnd ?? target?.Hwnd);
+        int? explicitPid = explicitHwnd.HasValue && explicitHwnd.Value > 0 ? _s.Rt.Window(explicitHwnd.Value)?.Pid : null;
+        if (!explicitHwnd.HasValue && !string.IsNullOrWhiteSpace(process))
+        {
+            var win = _s.Rt.Windows().FirstOrDefault(w => string.Equals(w.ProcessName, process, StringComparison.OrdinalIgnoreCase));
+            if (win != null)
+            {
+                explicitHwnd = win.Hwnd;
+                explicitPid = win.Pid;
+            }
+        }
         return Act(new AgentAction(AgentActionKind.WaitFor,
             Query: targetQuery,
             ElementId: target?.ElementId,
@@ -4670,6 +6371,8 @@ public sealed class InbriskTools
             Gone: gone,
             Count: minCount,
             StopOnUnexpectedDialog: stopOnDialog,
+            Hwnd: explicitHwnd,
+            Pid: explicitPid,
             Ms: timeoutMs ?? ms), ct);
     }
 
@@ -4804,14 +6507,15 @@ public sealed class InbriskTools
 
     [McpServerTool(Name = "computer_app_restart"), Description(
         "Restart an application (or the Inbrisk SERVER itself if server:true is passed). " +
-        "When process or app is specified, closes that app and relaunches it.")]
-    public CallToolResult AppRestart(
+        "When process or app is specified, closes that app and relaunches it. " +
+        "To restart the Inbrisk server itself, server:true must be explicitly passed.")]
+    public async Task<CallToolResult> AppRestart(
         [Description("friendly application name to restart (e.g. \"notepad\")")] string? app = null,
         [Description("process name of the app to restart")] string? process = null,
         [Description("explicitly restart the Inbrisk SERVER itself (default false)")] bool server = false,
         CancellationToken ct = default)
     {
-        if (server || (string.IsNullOrWhiteSpace(app) && string.IsNullOrWhiteSpace(process)))
+        if (server)
         {
             Task.Run(async () =>
             {
@@ -4833,12 +6537,19 @@ public sealed class InbriskTools
             return Text(JsonSerializer.Serialize(res));
         }
 
+        if (string.IsNullOrWhiteSpace(app) && string.IsNullOrWhiteSpace(process))
+        {
+            return Error(OutcomeKind.Malformed,
+                "Pass 'app' or 'process' to restart a user application. " +
+                "To restart the Inbrisk server itself, explicitly pass server: true.");
+        }
+
         var targetApp = app ?? process!;
         // Graceful close
-        CloseWindow(process: targetApp, force: true, ct: ct);
-        Thread.Sleep(500);
+        await CloseWindow(process: targetApp, force: true, ct: ct);
+        await Task.Delay(500, ct);
         // Relaunch
-        return Launch(app: targetApp, ct: ct);
+        return await Launch(app: targetApp, ct: ct);
     }
 
     [McpServerTool(Name = "computer_app_shutdown"), Description(
@@ -4846,7 +6557,7 @@ public sealed class InbriskTools
         "pid, or title substring). Closes application windows via WM_CLOSE, and force terminates " +
         "the process if requested with force:true. " +
         "To shut down the Inbrisk SERVER itself, explicitly pass server:true.")]
-    public CallToolResult AppShutdown(
+    public async Task<CallToolResult> AppShutdown(
         [Description("process name of the app to shut down, e.g. \"notepad\", \"VDenoise\"")] string? process = null,
         [Description("window handle of the app to shut down")] string? hwnd = null,
         [Description("process ID to shut down")] int? pid = null,
@@ -4856,7 +6567,7 @@ public sealed class InbriskTools
         [Description("explicitly shut down the Inbrisk MCP SERVER itself (default false)")] bool server = false,
         CancellationToken ct = default)
     {
-        if (server || string.Equals(process, "inbrisk", StringComparison.OrdinalIgnoreCase) || string.Equals(process, "server", StringComparison.OrdinalIgnoreCase))
+        if (server)
         {
             Task.Run(async () =>
             {
@@ -4878,6 +6589,12 @@ public sealed class InbriskTools
         hwnd ??= target?.Hwnd ?? target?.Window;
         titleContains ??= target?.Name ?? target?.NameContains;
 
+        if (string.Equals(process, "inbrisk", StringComparison.OrdinalIgnoreCase) || string.Equals(process, "server", StringComparison.OrdinalIgnoreCase))
+        {
+            return Error(OutcomeKind.Malformed,
+                "Shutting down the Inbrisk MCP server process requires explicit server: true.");
+        }
+
         if (string.IsNullOrWhiteSpace(process) && string.IsNullOrWhiteSpace(hwnd) && !pid.HasValue && string.IsNullOrWhiteSpace(titleContains))
         {
             return Error(OutcomeKind.Malformed,
@@ -4888,7 +6605,7 @@ public sealed class InbriskTools
         // Delegate to CloseWindow if window targeting is used
         if (!string.IsNullOrWhiteSpace(hwnd) || !string.IsNullOrWhiteSpace(titleContains) || (!string.IsNullOrWhiteSpace(process) && !pid.HasValue))
         {
-            return CloseWindow(hwnd: hwnd, process: process, titleContains: titleContains, target: target, force: force, ct: ct);
+            return await CloseWindow(hwnd: hwnd, process: process, titleContains: titleContains, target: target, force: force, ct: ct);
         }
 
         if (pid.HasValue)
@@ -5153,6 +6870,105 @@ public sealed class InbriskTools
     public sealed record ValueCheck(
         TargetSpec? Target = null, string? ElementId = null,
         string? Contains = null, string? Exact = null, string? State = null);
+
+    /// <summary>Lightweight action step for computer_batch.</summary>
+    public sealed record BatchStep(
+        [Description("action: click|invoke|type|key|hotkey|wait|launch|focus|toggle|select|set_value|scroll")] string? Do = null,
+        [Description("target element name, automationId, or selector")] string? T = null,
+        [Description("value or text to input / hotkey string")] string? V = null,
+        [Description("target role (e.g. Button, Edit, MenuItem, CheckBox)")] string? Role = null,
+        [Description("target window HWND (optional)")] string? Hwnd = null,
+        [Description("wait duration in ms")] int? Ms = null,
+        [Description("type: press enter afterwards")] bool Submit = false,
+        [Description("hotkey shorthand (e.g. 'ctrl+s')")] string? Keys = null);
+
+    /// <summary>Compact form field specification for computer_batch.</summary>
+    public sealed record FormFieldSpec(
+        [Description("target element selector, ID, or name")] string Target,
+        [Description("value or text to input")] string Value,
+        [Description("target role (e.g. Edit, ComboBox); default Edit")] string? Role = "Edit");
+
+    /// <summary>Wait condition specification for computer_batch.</summary>
+    public sealed record BatchUntilSpec(
+        [Description("wait until element with this name/text appears")] string? Appears = null,
+        [Description("wait until element with this name/text disappears")] string? Disappears = null,
+        [Description("wait until window with this title appears")] string? WindowAppears = null,
+        [Description("wait until screen or element is stable")] bool? Stable = null,
+        [Description("wait until target element matches this expected value")] string? Value = null,
+        [Description("wait until target element matches this expected state")] string? State = null,
+        [Description("timeout in milliseconds (default 5000)")] int? TimeoutMs = null,
+        [Description("stability duration in milliseconds (default 200)")] int? StableMs = null);
+
+    /// <summary>Read/extract specification for computer_batch.</summary>
+    public sealed record BatchReadSpec(
+        [Description("target element name to read")] string Target,
+        [Description("properties to extract: name, value, role, isEnabled, isSelected, bounds")] string[]? Props = null,
+        [Description("target role filter")] string? Role = null);
+
+    public sealed record FindQuery(
+        [Description("element name or text substring")] string? Name = null,
+        [Description("role filter, e.g. button, edit, checkbox")] string? Role = null,
+        [Description("AutomationId")] string? AutomationId = null,
+        [Description("window handle or title")] string? Hwnd = null,
+        [Description("process name")] string? Process = null,
+        [Description("subtree container elementId or hwnd")] string? Within = null,
+        [Description("exact value match")] string? Value = null,
+        [Description("exact className match")] string? ClassName = null)
+    {
+        public string Summary()
+        {
+            var parts = new List<string>();
+            if (Role != null) parts.Add($"role: {Role}");
+            if (Name != null) parts.Add($"name: \"{Name}\"");
+            if (AutomationId != null) parts.Add($"id: #{AutomationId}");
+            if (Within != null) parts.Add($"within: {Within}");
+            if (Value != null) parts.Add($"value: \"{Value}\"");
+            return parts.Count > 0 ? $"{{{string.Join(", ", parts)}}}" : "{empty query}";
+        }
+    }
+
+    public sealed record BatchFindItemResult(
+        [property: System.Text.Json.Serialization.JsonPropertyName("index")] int Index,
+        [property: System.Text.Json.Serialization.JsonPropertyName("status")] string Status,
+        [property: System.Text.Json.Serialization.JsonPropertyName("count"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] int? Count = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("truncated"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] int? Truncated = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("elements"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] List<BatchElementMatch>? Elements = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("error"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Error = null);
+
+    public sealed record BatchElementMatch(
+        [property: System.Text.Json.Serialization.JsonPropertyName("id")] string Id,
+        [property: System.Text.Json.Serialization.JsonPropertyName("role")] string Role,
+        [property: System.Text.Json.Serialization.JsonPropertyName("name")] string Name,
+        [property: System.Text.Json.Serialization.JsonPropertyName("hwnd"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Hwnd = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("pid"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] int? Pid = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("bounds")] string Bounds = "",
+        [property: System.Text.Json.Serialization.JsonPropertyName("enabled"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] bool? Enabled = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("value"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Value = null);
+
+    public sealed record BatchInspectItemResult(
+        [property: System.Text.Json.Serialization.JsonPropertyName("index")] int Index,
+        [property: System.Text.Json.Serialization.JsonPropertyName("hwnd")] string Hwnd,
+        [property: System.Text.Json.Serialization.JsonPropertyName("status")] string Status,
+        [property: System.Text.Json.Serialization.JsonPropertyName("title"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Title = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("process"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Process = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("count"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] int? Count = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("truncated"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] int? Truncated = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("elements"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] List<BatchElementMatch>? Elements = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("error"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Error = null);
+
+    public sealed record BatchReadItemResult(
+        [property: System.Text.Json.Serialization.JsonPropertyName("index")] int Index,
+        [property: System.Text.Json.Serialization.JsonPropertyName("target")] string Target,
+        [property: System.Text.Json.Serialization.JsonPropertyName("status")] string Status,
+        [property: System.Text.Json.Serialization.JsonPropertyName("props"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] Dictionary<string, object?>? Props = null,
+        [property: System.Text.Json.Serialization.JsonPropertyName("error"), System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)] string? Error = null);
+
+    private static string ExtractErrorDetail(CallToolResult err)
+    {
+        if (err.Content is [TextContentBlock { Text: { } t }])
+            return t;
+        return "Unknown error";
+    }
 
     /// <summary>Resolve elementId or a TargetSpec to a live element. The
     /// registry mints ids during Find, so the returned element's Id is
@@ -5436,10 +7252,6 @@ public sealed class InbriskTools
     {
         var targetDesc = target.Summary();
         var fg = _s?.Rt?.ForegroundWindow();
-        // When the caller scoped the target to a process, every diagnosis
-        // below must look at that process's window — otherwise we report
-        // ambient foreground facts (and close matches) from an unrelated
-        // window, which actively misleads the model.
         var procWin = target.Process == null ? null : FindBestWindowForProcess(target.Process);
         var scopeDesc = target.Hwnd != null ? $"Window 0x{ParseHwnd(target.Hwnd):X}"
             : target.Window != null ? $"Window titled '{target.Window}'"
@@ -5448,15 +7260,49 @@ public sealed class InbriskTools
             : "Desktop";
         var scopeWin = procWin ?? fg;
 
+        // Negative diagnosis cache lookup
+        var negKey = string.Join('|', target.Hwnd, target.Window, target.Process, target.Role, target.Name,
+            target.NameContains, target.AutomationId, target.Within, target.Value, target.ValueContains,
+            target.ClassName, target.NameNotContains, nativeCount, relErr != null ? "1" : "0");
+        var now = DateTimeOffset.UtcNow;
+        var buf = _s?.Rt?.Parts.EventBuffer;
+        if (_s != null && _s.Rt != null && buf != null &&
+            _s.NegativeFindCache.TryGetValue(negKey, out var negHit) &&
+            negHit.Ver == _s.Rt.MutationVersion &&
+            (now - negHit.At).TotalMilliseconds < 5000 &&
+            !buf.Snapshot(100).Any(e => e.At >= negHit.At &&
+                (negHit.Hwnds.Contains(e.Hwnd ?? 0) ||
+                 (e.Pid is { } ep && negHit.Pids.Contains(ep)) ||
+                 (negHit.Hwnds.Count == 0 && negHit.Pids.Count == 0 && (e.Hwnd is null or 0 && e.Pid == null)))))
+        {
+            PerfTrace.Count("find.negativeCacheHit");
+            return negHit.Diag;
+        }
+
+        TargetDiagnosis Cache(TargetDiagnosis d)
+        {
+            if (_s != null && _s.Rt != null)
+            {
+                var targetHwnds = new HashSet<long>();
+                if (scopeWin?.Hwnd is { } sh) targetHwnds.Add(sh);
+                var targetPids = new HashSet<int>();
+                if (scopeWin?.Pid is { } sp) targetPids.Add(sp);
+                _s.NegativeFindCache[negKey] = (d, DateTimeOffset.UtcNow, targetHwnds, targetPids, _s.Rt.MutationVersion);
+                if (_s.NegativeFindCache.Count > 128) _s.NegativeFindCache.Clear();
+                PerfTrace.Count("find.negativeCacheMiss");
+            }
+            return d;
+        }
+
         if (relErr != null)
         {
             var (_, detail, _) = ErrPartsWithDiag(relErr);
-            return new TargetDiagnosis(
+            return Cache(new TargetDiagnosis(
                 Reason: "RelationFilterError",
                 Summary: $"Target {targetDesc} could not be resolved due to relation error: {detail}",
                 SearchedScope: scopeDesc,
                 EliminatedBy: detail,
-                SuggestedAction: "verify container reference in 'within' or adjacent label in 'labelledBy'/'nearText'");
+                SuggestedAction: "verify container reference in 'within' or adjacent label in 'labelledBy'/'nearText'"));
         }
 
         if (nativeCount > 0)
@@ -5492,13 +7338,13 @@ public sealed class InbriskTools
                 suggested = "relax negative or strict property filters";
             }
 
-            return new TargetDiagnosis(
+            return Cache(new TargetDiagnosis(
                 Reason: "FilteredByPropertyOrRelation",
                 Summary: $"{nativeCount} candidate(s) matched base name/role {targetDesc}, but were eliminated by post-filters ({eliminatedBy})",
                 SearchedScope: scopeDesc,
                 CandidatesMatchedBase: nativeCount,
                 EliminatedBy: eliminatedBy,
-                SuggestedAction: suggested);
+                SuggestedAction: suggested));
         }
 
         // Check if the scoped application is unresponsive
@@ -5509,11 +7355,11 @@ public sealed class InbriskTools
                 using var p = System.Diagnostics.Process.GetProcessById(pid);
                 if (!p.Responding)
                 {
-                    return new TargetDiagnosis(
+                    return Cache(new TargetDiagnosis(
                         Reason: "AppNotResponding",
                         Summary: $"Target application '{scopeWin.ProcessName}' (PID {pid}) is not responding to Windows messages",
                         SearchedScope: scopeDesc,
-                        SuggestedAction: "wait for application to finish its busy state before retrying");
+                        SuggestedAction: "wait for application to finish its busy state before retrying"));
                 }
             }
             catch { }
@@ -5522,11 +7368,11 @@ public sealed class InbriskTools
         // Check if a modal dialog appeared and is blocking the target window
         if (scopeWin != null && (scopeWin.Title.Contains("Dialog", StringComparison.OrdinalIgnoreCase) || LooksLikeDialog(scopeWin.Hwnd)))
         {
-            return new TargetDiagnosis(
+            return Cache(new TargetDiagnosis(
                 Reason: "ModalDialogBlocking",
                 Summary: $"Scoped window is modal dialog '{scopeWin.Title}' (0x{scopeWin.Hwnd:X}) which may be blocking the target",
                 SearchedScope: scopeDesc,
-                SuggestedAction: "dismiss or inspect the modal dialog elements first");
+                SuggestedAction: "dismiss or inspect the modal dialog elements first"));
         }
 
         // Check if element exists in UIA tree but is offscreen
@@ -5549,11 +7395,11 @@ public sealed class InbriskTools
                     var isOff = firstOff.Bounds.IsEmpty || (firstOff.Props.TryGetValue("offscreen", out var v) && v is true or 1);
                     if (isOff)
                     {
-                        return new TargetDiagnosis(
+                        return Cache(new TargetDiagnosis(
                             Reason: "TargetOffscreen",
                             Summary: $"Target {targetDesc} exists in UI tree but is currently OFFSCREEN (bounds: {firstOff.Bounds})",
                             SearchedScope: scopeDesc,
-                            SuggestedAction: "scroll the parent container or use scroll_into_view to bring it into the viewport");
+                            SuggestedAction: "scroll the parent container or use scroll_into_view to bring it into the viewport"));
                     }
                 }
             }
@@ -5566,11 +7412,11 @@ public sealed class InbriskTools
         var sug = _s?.Memory?.SuggestRecovery(target.Name ?? target.NameContains, target.Role, app, curScreen);
         if (sug != null)
         {
-            return new TargetDiagnosis(
+            return Cache(new TargetDiagnosis(
                 Reason: "TargetOnDifferentScreen",
                 Summary: $"Target {targetDesc} not found on active screen '{sug.CurrentScreen}', but was previously seen on screen '{sug.TargetScreen}' ({sug.TimeAgo})",
                 SearchedScope: scopeDesc,
-                SuggestedAction: sug.NavigationHint);
+                SuggestedAction: sug.NavigationHint));
         }
 
         // Check for close matches / typos inside the searched scope —
@@ -5579,19 +7425,19 @@ public sealed class InbriskTools
             target.Hwnd != null ? ParseHwnd(target.Hwnd) : procWin?.Hwnd ?? fg?.Hwnd);
         if (closeMatches.Count > 0)
         {
-            return new TargetDiagnosis(
+            return Cache(new TargetDiagnosis(
                 Reason: "CloseMatchesFound",
                 Summary: $"No exact match for {targetDesc}, but {closeMatches.Count} similar element(s) were found in {scopeDesc}",
                 SearchedScope: scopeDesc,
                 SuggestedAction: $"did you mean '{closeMatches[0]}'? Try target: {{ name: \"{closeMatches[0]}\" }} or nameContains",
-                CloseMatches: closeMatches);
+                CloseMatches: closeMatches));
         }
 
-        return new TargetDiagnosis(
+        return Cache(new TargetDiagnosis(
             Reason: "NoElementMatched",
             Summary: $"No element matched target spec {targetDesc}",
             SearchedScope: scopeDesc,
-            SuggestedAction: "call computer_observe or computer_find with broader criteria (e.g. role only or partial name)");
+            SuggestedAction: "call computer_observe or computer_find with broader criteria (e.g. role only or partial name)"));
     }
 
     private List<string> FindCloseMatches(TargetSpec target, long? hwnd)
@@ -5856,8 +7702,18 @@ public sealed class InbriskTools
     }
 
     /// <summary>Single action = a one-step chain.</summary>
-    private Task<CallToolResult> Act(AgentAction a, CancellationToken ct, bool observe = false)
-        => ActChain([a], a.ElementId, ct, observe);
+    private async Task<CallToolResult> Act(AgentAction a, CancellationToken ct, bool observe = false, string? operationId = null)
+    {
+        var toolName = $"computer_{a.Kind.ToString().ToLowerInvariant()}";
+        var normArgs = $"{a.Kind}|{a.ElementId}|{a.Text}|{a.Key}|{string.Join(",", a.Modifiers ?? Array.Empty<string>())}|{a.Point?.X},{a.Point?.Y}|{a.Delta}|{observe}";
+        if (_s.Deduplicator.TryDeduplicateMutation(operationId, toolName, normArgs, _s.Telemetry, out var conflictError) is { } deduped)
+            return deduped;
+        if (conflictError != null)
+            return conflictError;
+        var res = await ActChain([a], a.ElementId, ct, observe);
+        _s.Deduplicator.RecordMutation(operationId, toolName, normArgs, res);
+        return res;
+    }
 
     /// <summary>Every mutating tool goes through here: gates once (resume
     /// chord, emergency epoch, frame-identity), then runs each step through
@@ -5935,9 +7791,15 @@ public sealed class InbriskTools
             using (PerfTrace.Stage("verify.targeted"))
                 pre = ReadElementState(postElementId);
             var fgBefore = _s?.Rt?.ForegroundWindow()?.Hwnd;
+            var eventGenBefore = _s?.Rt?.EventBuffer?.CurrentGeneration;
 
             IInputLease? physicalLease = null;
-            var requiresPhysical = steps.Any(a => a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.FocusWindow or AgentActionKind.FocusElement);
+            var requiresPhysical = steps.Any(a =>
+                a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.FocusWindow or AgentActionKind.FocusElement
+                || (a.Kind is AgentActionKind.Invoke && (
+                    a.ElementId == null ||
+                    _s?.Rt?.Parts.Registry.Get(a.ElementId) is not { } el ||
+                    !el.IsActionSupported("invoke"))));
             if (requiresPhysical)
             {
                 try
@@ -5955,6 +7817,40 @@ public sealed class InbriskTools
                 {
                     return Error(OutcomeKind.ConcurrencyConflict, tex.Message, sw);
                 }
+            }
+
+            // Canonical lock ordering: GLOBAL DESKTOP GATE (Rank 1) -> PROCESS WRITE BARRIER (Rank 2).
+            // Collect target PIDs in ascending numerical order to prevent any inter-PID deadlock.
+            var targetPids = new SortedSet<int>();
+            foreach (var step in steps)
+            {
+                var h = step.Hwnd
+                    ?? (step.ElementId != null ? _s?.Rt?.Parts.Registry.Get(step.ElementId)?.Hwnd : null)
+                    ?? (postElementId != null ? _s?.Rt?.Parts.Registry.Get(postElementId)?.Hwnd : null)
+                    ?? scope;
+                if (h.HasValue && h.Value > 0)
+                {
+                    if (_s?.Rt?.Window(h.Value)?.Pid is { } p && p > 0)
+                        targetPids.Add(p);
+                }
+            }
+
+            var mutationScopes = new List<IAsyncDisposable>();
+            if (_s?.Rt?.ReadScheduler != null)
+            {
+                foreach (var pid in targetPids)
+                {
+                    mutationScopes.Add(await _s.Rt.ReadScheduler.EnterMutationBarrierAsync(pid, linked.Token).ConfigureAwait(false));
+                }
+            }
+            IDisposable? highlightLease = null;
+            var targetHwndForHighlight = steps.Select(s => s.Hwnd
+                    ?? (s.ElementId != null ? _s?.Rt?.Parts.Registry.Get(s.ElementId)?.Hwnd : null)
+                    ?? (postElementId != null ? _s?.Rt?.Parts.Registry.Get(postElementId)?.Hwnd : null)
+                    ?? scope).FirstOrDefault(h => h.HasValue && h.Value > 0);
+            if (targetHwndForHighlight.HasValue && targetHwndForHighlight.Value > 0 && _s?.Rt?.TargetHighlight != null)
+            {
+                highlightLease = _s.Rt.TargetHighlight.BeginWindowActivity(targetHwndForHighlight.Value, _s.SessionId);
             }
 
             try
@@ -5982,32 +7878,58 @@ public sealed class InbriskTools
                 var o = outcome!;
                 _s.PrevOutcome = o;
                 _s.NoteElementRef(postElementId ?? last.ElementId);
-                (long hwnd, string title, bool dialogLikely, List<string> elements)? nw;
-                using (PerfTrace.Stage("step.modalCheck"))
+                (long hwnd, string title, bool dialogLikely, List<string> elements)? nw = null;
+                UiElement? post2 = null;
+
+                var modalTask = Task.Run(() =>
                 {
-                    nw = DetectNewWindow(fgBefore,
-                        steps.LastOrDefault(s => s.Kind == AgentActionKind.FocusWindow)?.Hwnd);
-                    if (nw == null && fgBefore.HasValue && _s.Rt.WindowService.GetModalPopup(fgBefore.Value) is { } spawnedModal && spawnedModal.Hwnd != fgBefore.Value)
+                    using (PerfTrace.Stage("step.modalCheck"))
                     {
-                        var modalEls = Snapshot(spawnedModal.Hwnd);
-                        nw = (spawnedModal.Hwnd, spawnedModal.Title, true,
-                            modalEls.Where(e => e.Actions.Count > 0).Take(12).Select(Describe).ToList());
+                        var res = DetectNewWindow(fgBefore,
+                            steps.LastOrDefault(s => s.Kind == AgentActionKind.FocusWindow)?.Hwnd,
+                            eventGenBefore);
+                        if (res == null && fgBefore.HasValue && _s.Rt.WindowService.GetModalPopup(fgBefore.Value) is { } spawnedModal && spawnedModal.Hwnd != fgBefore.Value)
+                        {
+                            var modalEls = Snapshot(spawnedModal.Hwnd);
+                            res = (spawnedModal.Hwnd, spawnedModal.Title, true,
+                                modalEls.Where(e => e.Actions.Count > 0).Take(12).Select(Describe).ToList());
+                        }
+                        return res;
                     }
-                }
+                });
+
+                var postElementTask = Task.Run(() =>
+                {
+                    using (PerfTrace.Stage("verify.targeted"))
+                    {
+                        return ReadElementState(postElementId);
+                    }
+                });
+
+                await Task.WhenAll(modalTask, postElementTask).ConfigureAwait(false);
+                nw = modalTask.Result;
+                post2 = postElementTask.Result;
+
                 if (nw is { dialogLikely: true })
                 {
                     o = o with { Detail = (string.IsNullOrEmpty(o.Detail) ? "" : o.Detail + " — ") + $"MODAL/POPUP OPENED: 0x{nw.Value.hwnd:X} \"{nw.Value.title}\" (dismiss or interact with it before next action)" };
                 }
-                using (PerfTrace.Stage("verify.targeted"))
+
+                var contextual = InspectContextualPostView(steps, post2 ?? pre);
+                using (PerfTrace.Stage("report.serialize"))
                 {
-                    var post2 = ReadElementState(postElementId);
-                    var contextual = InspectContextualPostView(steps, post2 ?? pre);
-                    using (PerfTrace.Stage("report.serialize"))
-                        return ActionResult(steps, o, sw, pre, post2, nw, contextual, observe);
+                    var res = ActionResult(steps, o, sw, pre, post2, nw, contextual, observe);
+                    _s.Deduplicator.InvalidateReadCache();
+                    return res;
                 }
             }
             finally
             {
+                highlightLease?.Dispose();
+                foreach (var ms in mutationScopes)
+                {
+                    try { await ms.DisposeAsync().ConfigureAwait(false); } catch { }
+                }
                 physicalLease?.Dispose();
             }
         }
@@ -6118,46 +8040,137 @@ public sealed class InbriskTools
         catch { return null; }
     }
 
+    public static bool ComputeNextObservationRequired(
+        StepOutcome outcome,
+        bool hasContextualView = false,
+        bool hasNewWindowOrModal = false,
+        bool hasExplicitObservationRequested = false)
+    {
+        if (hasExplicitObservationRequested) return true;
+
+        // If a new window or modal popup appeared, the agent needs to observe the new UI context.
+        if (hasNewWindowOrModal) return true;
+
+        // Terminal errors, malformed calls, or policy denials don't require an observation cycle.
+        if (!outcome.Success && (outcome.Kind == OutcomeKind.Malformed || outcome.Kind == OutcomeKind.PolicyDenied || outcome.Kind == OutcomeKind.ConfirmationDenied || outcome.Kind == OutcomeKind.EmergencyStopped || outcome.Kind == OutcomeKind.Cancelled))
+            return false;
+
+        // If outcome is verified with concrete evidence and no new popup appeared, follow-up observation is not needed.
+        if (outcome.Kind == OutcomeKind.Verified)
+            return false;
+
+        // If contextual view is already provided in the response payload, the agent has the necessary
+        // post-action context without issuing a separate computer_observe call.
+        if (hasContextualView)
+            return false;
+
+        // For Unverified, ObservedChange, or general failures where UI state is indeterminate,
+        // follow-up observation is recommended so the agent can inspect the resulting state.
+        return true;
+    }
+
     private CallToolResult ActionResult(IReadOnlyList<AgentAction> steps,
         StepOutcome o, Stopwatch sw, UiElement? pre, UiElement? post,
         (long hwnd, string title, bool dialogLikely, List<string> elements)? newWindow = null,
         ContextualPostView? contextualView = null,
         bool observe = false)
     {
+        var isSlim = Slim(null);
+
+        var changes = new Dictionary<string, object?>();
+        if (post != null)
+        {
+            if (!Equals(Prop(pre, "value"), Prop(post, "value")))
+                changes["valueChanged"] = true;
+            if (!Equals(Prop(pre, "state"), Prop(post, "state")))
+                changes["stateChanged"] = true;
+        }
+
+        string nextAction = "none";
+        if (newWindow is { dialogLikely: true })
+        {
+            nextAction = "dismiss_modal";
+        }
+        else if (contextualView != null)
+        {
+            nextAction = "none";
+        }
+        else if (o.Kind == OutcomeKind.Verified)
+        {
+            nextAction = "none";
+        }
+        else if (o.Kind == OutcomeKind.ObservedChange)
+        {
+            // C7: If concrete changes are evidenced, next is "none"; if ambiguous/indeterminate, "inspect"
+            bool hasActionableEvidence = changes.Count > 0 || (newWindow != null && !newWindow.Value.dialogLikely) || (post != null && pre != null && !Equals(pre.Name, post.Name));
+            nextAction = hasActionableEvidence ? "none" : "inspect";
+        }
+        else if (o.Kind == OutcomeKind.Unverified)
+        {
+            nextAction = "inspect";
+        }
+        else if (!o.Success)
+        {
+            nextAction = "inspect";
+        }
+
+        bool obsReq = observe || (nextAction != "none");
+
+        string? verificationHint = o.Kind switch
+        {
+            OutcomeKind.Verified => "outcome is verified with concrete evidence; follow-up computer_observe is NOT needed",
+            OutcomeKind.ObservedChange => nextAction == "none"
+                ? "actionable window/state change confirmed — follow-up observation not required"
+                : "a window event was observed, but the target element's exact semantic outcome was not independently verified; call computer_find/computer_observe if confirmation is needed",
+            OutcomeKind.Unverified => "the action WAS dispatched to OS/UIA — treat it as done and do NOT retry it blindly; if confirmation is needed verify once via computer_screenshot or computer_observe",
+            _ => null
+        };
         var payload = new Dictionary<string, object?>
         {
             ["action"] = steps.Count == 1
                 ? steps[0].Summary()
                 : string.Join(" → ", steps.Select(s => s.Summary())),
             ["status"] = o.Kind.ToString(),
+            ["next"] = nextAction,
+            ["nextObservationRequired"] = obsReq,
+            ["changed"] = changes.Keys.ToList(),
             ["success"] = o.Success,
             ["method"] = o.Method,
-            ["detail"] = o.Detail,
             ["durationMs"] = o.DurationMs,
-            ["session"] = _s.SessionId,
-        };
-        string? verificationHint = o.Kind switch
-        {
-            OutcomeKind.Verified => "outcome is verified with concrete evidence; follow-up computer_observe is NOT needed",
-            OutcomeKind.ObservedChange => "a window event was observed, but the target element's exact semantic outcome was not independently verified; call computer_find/computer_observe if confirmation is needed",
-            OutcomeKind.Unverified => "the action WAS dispatched to OS/UIA — treat it as done and do NOT retry it blindly; if confirmation is needed verify once via computer_screenshot or computer_observe",
-            _ => null
         };
         if (verificationHint != null)
             payload["verificationHint"] = verificationHint;
+        if (!isSlim)
+        {
+            payload["session"] = _s.SessionId;
+            if (!string.IsNullOrWhiteSpace(o.Detail)) payload["detail"] = o.Detail;
+        }
+        else
+        {
+            if (!string.IsNullOrWhiteSpace(o.Detail) && o.Detail != o.Evidence?.Detail)
+                payload["detail"] = o.Detail;
+            if (o.Kind == OutcomeKind.ObservedChange)
+                payload["hint"] = nextAction == "none" ? "actionable change confirmed" : "observed window change only";
+            else if (o.Kind == OutcomeKind.Unverified)
+                payload["hint"] = "dispatched but unverified";
+        }
+
+        if (o.Kind == OutcomeKind.ObservedChange && changes.Count > 0)
+            payload["changedProperties"] = changes.Keys.ToList();
+
         if (o.Evidence != null)
             payload["evidence"] = new
             {
                 method = o.Evidence.Method,
                 expected = TruncEdges(o.Evidence.Expected?.ToString(), 240),
                 actual = TruncEdges(o.Evidence.Actual?.ToString(), 240),
-                detail = o.Evidence.Detail,
+                detail = isSlim ? null : o.Evidence.Detail,
             };
         if (o.Diagnosis != null)
             payload["diagnosis"] = o.Diagnosis;
         if (post != null)
         {
-            payload["post"] = new Dictionary<string, object?>
+            var postMap = new Dictionary<string, object?>
             {
                 ["id"] = post.Id,
                 ["role"] = post.Role.ToString(),
@@ -6166,13 +8179,10 @@ public sealed class InbriskTools
                     ? TruncEdges(pv?.ToString(), 300) : null,
                 ["state"] = post.Props.TryGetValue("state", out var ps) ? ps : null,
                 ["focused"] = post.Props.TryGetValue("focused", out var pf) ? pf : null,
-                ["bounds"] = $"({post.Bounds.X},{post.Bounds.Y} {post.Bounds.Width}x{post.Bounds.Height})",
             };
-            var changes = new Dictionary<string, object?>();
-            if (!Equals(Prop(pre, "value"), Prop(post, "value")))
-                changes["valueChanged"] = true;
-            if (!Equals(Prop(pre, "state"), Prop(post, "state")))
-                changes["stateChanged"] = true;
+            if (!isSlim)
+                postMap["bounds"] = $"({post.Bounds.X},{post.Bounds.Y} {post.Bounds.Width}x{post.Bounds.Height})";
+            payload["post"] = postMap;
             if (changes.Count > 0) payload["changes"] = changes;
         }
         if (newWindow is { } w)

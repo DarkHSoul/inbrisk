@@ -92,8 +92,14 @@ public static class SelfInstaller
                 // install dir. If the installed binary is already identical,
                 // this is a no-op reinstall; otherwise defer honestly rather
                 // than swapping binaries under an active session.
-                var same = InstallLayout.SelfSha256() == Sha256Of(
-                    Path.Combine(targetDir, InstallLayout.ExeName));
+                // Compare the managed payload (inbrisk.dll), not the apphost
+                // exe — the exe sha stays identical across source changes.
+                var localDll = Path.Combine(InstallLayout.ProcessDir, "inbrisk.dll");
+                var targetDll = Path.Combine(targetDir, "inbrisk.dll");
+                var same = File.Exists(localDll) && File.Exists(targetDll)
+                    ? Sha256Of(localDll) == Sha256Of(targetDll)
+                    : InstallLayout.SelfSha256() == Sha256Of(
+                        Path.Combine(targetDir, InstallLayout.ExeName));
                 if (same)
                 {
                     WriteUninstallEntry(Path.Combine(targetDir, InstallLayout.ExeName),

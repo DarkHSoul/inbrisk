@@ -73,13 +73,14 @@ public static class SetupApp
         {
             try
             {
+                Inbrisk.Platform.Windows.Native.DesktopBridge.TrySwitchCurrentThread();
                 UiTheme.Resolve(UserSettings.Load().Theme);
                 if (Application.Current == null)
                 {
                     var app = new Application();
                     app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
                 }
-                var win = new SetupWindow(installerMode);
+                Window win = installerMode ? new SetupWindow(true) : new InbriskControlWindow();
                 win.ShowDialog();
             }
             catch (Exception ex)
@@ -868,35 +869,32 @@ public sealed class SetupWindow : Window
 
         var state = new TextBlock { FontSize = 16, FontWeight = FontWeights.SemiBold,
             Margin = new Thickness(0, 0, 0, 10) };
+        var toggle = Btn("⏻ Kontrol", primary: true);
+        toggle.FontSize = 15; toggle.Padding = new Thickness(20, 10, 20, 10);
         void Render()
         {
             var stopped = File.Exists(InstallLayout.EmergencyMarkerPath);
             state.Text = stopped ? "■  EMERGENCY STOPPED" : "●  control active";
             state.Foreground = stopped ? UiTheme.Err : UiTheme.Ok;
+            toggle.Content = stopped ? "⏻ Kapalı — açmak için tıkla" : "⏻ Açık — durdurmak için tıkla";
+            toggle.Background = stopped ? UiTheme.Err : UiTheme.Accent;
+            toggle.Foreground = stopped ? Brushes.White : Brushes.Black;
         }
         Render();
 
-        var stop = Btn("STOP computer control", primary: true);
-        stop.Background = new SolidColorBrush(Color.FromRgb(0xD8, 0x32, 0x32));
-        stop.Foreground = Brushes.White; stop.FontSize = 15;
-        stop.Padding = new Thickness(20, 10, 20, 10);
-        var resume = Btn("Resume");
-        resume.FontSize = 15; resume.Padding = new Thickness(20, 10, 20, 10);
         var row = new StackPanel { Orientation = Orientation.Horizontal,
             Margin = new Thickness(0, 0, 0, 16) };
-        row.Children.Add(stop); row.Children.Add(resume);
+        row.Children.Add(toggle);
         p.Children.Add(state);
         p.Children.Add(row);
 
-        stop.Click += (_, _) =>
+        toggle.Click += (_, _) =>
         {
-            File.WriteAllText(InstallLayout.EmergencyMarkerPath,
-                DateTimeOffset.UtcNow.ToString("O"));
-            Render();
-        };
-        resume.Click += (_, _) =>
-        {
-            try { File.Delete(InstallLayout.EmergencyMarkerPath); } catch { }
+            if (File.Exists(InstallLayout.EmergencyMarkerPath))
+                try { File.Delete(InstallLayout.EmergencyMarkerPath); } catch { }
+            else
+                File.WriteAllText(InstallLayout.EmergencyMarkerPath,
+                    DateTimeOffset.UtcNow.ToString("O"));
             Render();
         };
 

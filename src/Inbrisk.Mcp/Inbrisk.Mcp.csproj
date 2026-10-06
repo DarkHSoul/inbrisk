@@ -34,4 +34,8 @@
     <ProjectReference Include="..\Inbrisk.Sdk\Inbrisk.Sdk.csproj" />
     <ProjectReference Include="..\Inbrisk.Setup\Inbrisk.Setup.csproj" />
   </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Inbrisk.Tests" />
+  </ItemGroup>
 </Project>

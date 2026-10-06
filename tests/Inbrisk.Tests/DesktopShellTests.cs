@@ -12,12 +12,9 @@ namespace Inbrisk.Tests;
 // McpTools_* tests spin up a REAL InbriskRuntime (UIA dispatcher, WinEvent
 // hooks, HUD/indicator threads). Running them in parallel with the desktop
 // collection's UI-touching tests made AppStatus flaky under load — every
-// UI-touching test must serialize through the shared collection.
-[Collection("desktop")]
 public class DesktopShellTests
 {
-    private readonly DesktopFixture _fx;
-    public DesktopShellTests(DesktopFixture fx) => _fx = fx;
+    public DesktopShellTests() { }
 
     [Fact]
     public void Hud_InitialState_IsHidden()
@@ -283,7 +280,7 @@ public class DesktopShellTests
     [Fact]
     public void McpTools_AppStatus_ReturnsLifecycleInfo()
     {
-        using var session = new McpSession(EmergencyControl.Process);
+        using var session = new McpSession(EmergencyControl.ForTests(), startEvents: false);
         var tools = new InbriskTools(session);
 
         var result = tools.AppStatus();
@@ -298,16 +295,15 @@ public class DesktopShellTests
     }
 
     [Fact]
-    public void Hud_AlwaysVisible_ShowsStandbyByDefault()
+    public void Hud_ConnectedIdle_StartsHiddenByDefault()
     {
-        using var hud = new ActivityHudService(enabled: true, animationsEnabled: true, alwaysVisible: true);
+        using var hud = new ActivityHudService(enabled: true, animationsEnabled: true, alwaysVisible: false);
         hud.Start();
         Assert.True(hud.WaitForReady());
         Assert.NotEqual(IntPtr.Zero, hud.Hwnd);
-        Thread.Sleep(300);
-        Assert.Equal(HudState.Standby, hud.State);
-        Assert.Equal("Inbrisk Hazır", hud.CurrentText);
-        Assert.True(NativeMethods.IsWindowVisible(hud.Hwnd));
+        Thread.Sleep(100);
+        // NEW CONTRACT: NO ACTIVE MCP WORK = NO PERIMETER WALL / NO STANDBY HUD
+        Assert.Equal(HudState.Hidden, hud.State);
     }
 
     // --------------------------------------------------------------
@@ -410,5 +406,21 @@ public class DesktopShellTests
             Assert.DoesNotContain("durduruldu", hud.CurrentText);
         }
         finally { act.Dispose(); hud.Dispose(); }
+    }
+
+    [Fact]
+    public void Hud_Cursor_IsInteractiveHandCursor()
+    {
+        using var hud = new ActivityHudService();
+        hud.Start();
+        Assert.True(hud.WaitForReady());
+
+        const int GclpHcursor = -12;
+        var hClassCursor = NativeMethods.GetClassLongPtrW(hud.Hwnd, GclpHcursor);
+        Assert.NotEqual(IntPtr.Zero, hClassCursor);
+
+        // Verify WM_SETCURSOR handling returns TRUE (1)
+        var handled = NativeMethods.SendMessageW(hud.Hwnd, NativeMethods.WM_SETCURSOR, hud.Hwnd, (IntPtr)1);
+        Assert.Equal(new IntPtr(1), handled);
     }
 }

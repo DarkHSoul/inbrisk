@@ -204,10 +204,36 @@ public static class AppIconExtractor
         using (var g = Graphics.FromImage(bmp))
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using var brush = new SolidBrush(Color.FromArgb(230, 0xB7, 0xFF, 0x3C));
-            g.FillEllipse(brush, 4, 4, size - 8, size - 8);
-            using var innerBrush = new SolidBrush(Color.FromArgb(255, 0x1B, 0x1B, 0x1F));
-            g.FillEllipse(innerBrush, 8, 8, size - 16, size - 16);
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            // Outer flame teardrop path
+            using var path = new GraphicsPath();
+            var cx = size / 2.0f;
+            var cy = size / 2.0f;
+            var r = (size - 4) / 2.0f;
+
+            // Flame silhouette
+            path.AddBezier(cx, 2.0f, cx + r, cy - 2.0f, cx + r, size - 2.0f, cx, size - 2.0f);
+            path.AddBezier(cx, size - 2.0f, cx - r, size - 2.0f, cx - r, cy - 2.0f, cx, 2.0f);
+            path.CloseFigure();
+
+            using var brush = new LinearGradientBrush(
+                new PointF(cx, 2.0f),
+                new PointF(cx, size - 2.0f),
+                Color.FromArgb(245, 0xFF, 0x6B, 0x4A),  // Top bright ember
+                Color.FromArgb(250, 0xE5, 0x4B, 0x35)); // Bottom deep ember
+            g.FillPath(brush, path);
+
+            // Inner flame highlight
+            using var innerPath = new GraphicsPath();
+            var ir = r * 0.45f;
+            var icy = cy + (r * 0.2f);
+            innerPath.AddBezier(cx, cy - 2.0f, cx + ir, icy, cx + ir, size - 4.0f, cx, size - 4.0f);
+            innerPath.AddBezier(cx, size - 4.0f, cx - ir, size - 4.0f, cx - ir, icy, cx, cy - 2.0f);
+            innerPath.CloseFigure();
+
+            using var innerBrush = new SolidBrush(Color.FromArgb(220, 0xFF, 0xE0, 0x82)); // Warm gold inner glow
+            g.FillPath(innerBrush, innerPath);
         }
         return bmp;
     }

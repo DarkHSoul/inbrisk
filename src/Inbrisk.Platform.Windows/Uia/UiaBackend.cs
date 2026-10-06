@@ -14,15 +14,17 @@ public sealed class UiaBackend : IElementBackend
 {
     private readonly UiaDispatcher _uia;
     private readonly IWindowService _windows;
+    private readonly UiaReadScheduler? _readScheduler;
     private readonly ConcurrentDictionary<string, IUIAutomationElement> _live = new();
     private int _idCounter;
 
     public BackendId Id => BackendId.Uia;
 
-    public UiaBackend(UiaDispatcher dispatcher, IWindowService windows)
+    public UiaBackend(UiaDispatcher dispatcher, IWindowService windows, UiaReadScheduler? readScheduler = null)
     {
         _uia = dispatcher;
         _windows = windows;
+        _readScheduler = readScheduler;
     }
 
     // ------------------------------------------------------------------
@@ -32,46 +34,66 @@ public sealed class UiaBackend : IElementBackend
     public IReadOnlyList<UiElement> Inspect(long hwnd, InspectOptions options, CancellationToken ct = default)
     {
         var callTicks = Stopwatch.GetTimestamp();
-        return _uia.Run(uia =>
-        {
-            ct.ThrowIfCancellationRequested();
-            var queueMs = (Stopwatch.GetTimestamp() - callTicks)
-                * 1000.0 / Stopwatch.Frequency;
-            var sw = Stopwatch.StartNew();
-            UiaPerf.TakeReads();
-            var root = uia.ElementFromHandle(new IntPtr(hwnd));
-            if (root == null) return (IReadOnlyList<UiElement>)Array.Empty<UiElement>();
+        var pid = _windows.GetWindow(hwnd)?.Pid ?? 0;
+        var work = CreateInspectWork(callTicks, hwnd, options, ct);
 
-            var results = new List<UiElement>();
-            var ownerTitle = _windows.GetWindow(hwnd)?.Title;
-            // Shared pipeline with Find: each node's children arrive via one
-            // FindAllBuildCache — every child's props, patterns and state
-            // resolve locally instead of ~15 live cross-process reads per
-            // element. DFS is kept (not a flat Descendants fetch) because
-            // the ancestry path then comes free from the descent and
-            // depth/offscreen pruning stays exact.
-            var childrenCache = TryCreateCache(uia, out _,
-                parentScope: false);
-            Walk(uia, root, options, results, new List<AncestryStep>(),
-                depth: 0, isRoot: true, ownerHwnd: hwnd, ownerTitle,
-                childrenCache, elCached: false);
-            var (live, cachedReads) = UiaPerf.TakeReads();
-            UiaPerf.Write(new
-            {
-                kind = "uia.inspect",
-                at = DateTimeOffset.Now,
-                run = PerfTrace.CurrentId,
-                hwnd,
-                elements = results.Count,
-                crossProcessPropertyReads = live,
-                cachedReads,
-                comCalls = live,
-                dispatchQueueMs = Math.Round(queueMs, 2),
-                totalMs = sw.ElapsedMilliseconds,
-            });
-            return (IReadOnlyList<UiElement>)results;
-        }, ct: ct, intentName: "Inspect");
+        if (_readScheduler != null && pid > 0)
+            return _readScheduler.ScheduleRead(pid, work, 10000, ct, "Inspect");
+        return _uia.Run(u => work(u), ct: ct, intentName: "Inspect");
     }
+
+    public async Task<IReadOnlyList<UiElement>> InspectAsync(long hwnd, InspectOptions options, CancellationToken ct = default)
+    {
+        var callTicks = Stopwatch.GetTimestamp();
+        var pid = _windows.GetWindow(hwnd)?.Pid ?? 0;
+        var work = CreateInspectWork(callTicks, hwnd, options, ct);
+
+        if (_readScheduler != null && pid > 0)
+            return await _readScheduler.ScheduleReadAsync(pid, work, 10000, ct, "Inspect").ConfigureAwait(false);
+        return await _uia.RunAsync(u => work(u), ct: ct, intentName: "Inspect").ConfigureAwait(false);
+    }
+
+    private Func<IUIAutomation?, IReadOnlyList<UiElement>> CreateInspectWork(long callTicks, long hwnd, InspectOptions options, CancellationToken ct) => uia =>
+    {
+        if (uia == null) return (IReadOnlyList<UiElement>)Array.Empty<UiElement>();
+        ct.ThrowIfCancellationRequested();
+        var queueMs = (Stopwatch.GetTimestamp() - callTicks)
+            * 1000.0 / Stopwatch.Frequency;
+        var sw = Stopwatch.StartNew();
+        IUIAutomationElement? root = null;
+        try { root = uia.ElementFromHandle(new IntPtr(hwnd)); }
+        catch { return (IReadOnlyList<UiElement>)Array.Empty<UiElement>(); }
+        if (root == null) return (IReadOnlyList<UiElement>)Array.Empty<UiElement>();
+
+        var results = new List<UiElement>();
+        var ownerTitle = _windows.GetWindow(hwnd)?.Title;
+        // Shared pipeline with Find: each node's children arrive via one
+        // FindAllBuildCache — every child's props, patterns and state
+        // resolve locally instead of ~15 live cross-process reads per
+        // element. DFS is kept (not a flat Descendants fetch) because
+        // the ancestry path then comes free from the descent and
+        // depth/offscreen pruning stays exact.
+        var childrenCache = TryCreateCache(uia, out _,
+            parentScope: false);
+        Walk(uia, root, options, results, new List<AncestryStep>(),
+            depth: 0, isRoot: true, ownerHwnd: hwnd, ownerTitle,
+            childrenCache, elCached: false);
+        var (live, cachedReads) = UiaPerf.TakeReads();
+        UiaPerf.Write(new
+        {
+            kind = "uia.inspect",
+            at = DateTimeOffset.Now,
+            run = PerfTrace.CurrentId,
+            hwnd,
+            elements = results.Count,
+            crossProcessPropertyReads = live,
+            cachedReads,
+            comCalls = live,
+            dispatchQueueMs = Math.Round(queueMs, 2),
+            totalMs = sw.ElapsedMilliseconds,
+        });
+        return (IReadOnlyList<UiElement>)results;
+    };
 
     private void Walk(IUIAutomation uia, IUIAutomationElement el,
         InspectOptions opt, List<UiElement> results, List<AncestryStep> path,
@@ -171,15 +193,31 @@ public sealed class UiaBackend : IElementBackend
             string.IsNullOrEmpty(aid) ? null : aid);
     }
 
-    // ------------------------------------------------------------------
-    //  Find — server-side conditions + client-side post-filter
-    // ------------------------------------------------------------------
-
     public IReadOnlyList<UiElement> Find(FindSpec spec, CancellationToken ct = default)
     {
         var callTicks = Stopwatch.GetTimestamp();
-        return _uia.Run(uia =>
-        {
+        int pid = spec.Pid ?? (spec.Hwnd != null ? _windows.GetWindow(spec.Hwnd.Value)?.Pid : null) ?? 0;
+        var work = CreateFindWork(callTicks, spec, ct);
+
+        if (_readScheduler != null && pid > 0)
+            return _readScheduler.ScheduleRead(pid, work, 10000, ct, "Find");
+        return _uia.Run(u => work(u), ct: ct, intentName: "Find");
+    }
+
+    public async Task<IReadOnlyList<UiElement>> FindAsync(FindSpec spec, CancellationToken ct = default)
+    {
+        var callTicks = Stopwatch.GetTimestamp();
+        int pid = spec.Pid ?? (spec.Hwnd != null ? _windows.GetWindow(spec.Hwnd.Value)?.Pid : null) ?? 0;
+        var work = CreateFindWork(callTicks, spec, ct);
+
+        if (_readScheduler != null && pid > 0)
+            return await _readScheduler.ScheduleReadAsync(pid, work, 10000, ct, "Find").ConfigureAwait(false);
+        return await _uia.RunAsync(u => work(u), ct: ct, intentName: "Find").ConfigureAwait(false);
+    }
+
+    private Func<IUIAutomation?, IReadOnlyList<UiElement>> CreateFindWork(long callTicks, FindSpec spec, CancellationToken ct) => uia =>
+    {
+            if (uia == null) return (IReadOnlyList<UiElement>)Array.Empty<UiElement>();
             ct.ThrowIfCancellationRequested();
             // time spent queued behind other work on the UiaDispatcher —
             // surfaced as dispatchQueueMs in the uia.find event
@@ -340,8 +378,7 @@ public sealed class UiaBackend : IElementBackend
                 totalMs = total.ElapsedMilliseconds,
             });
             return (IReadOnlyList<UiElement>)results;
-        }, ct: ct, intentName: "Find");
-    }
+        };
 
     /// <summary>Compact machine-readable description of the pushed-down
     /// UIA condition — for per-query audit logging.</summary>
@@ -830,100 +867,76 @@ public sealed class UiaBackend : IElementBackend
     //  Semantic actions
     // ------------------------------------------------------------------
 
-    public ActionResult? PerformNative(UiElement element, ActionIntent intent, CancellationToken ct = default)
+    public Func<UiElement, ActionIntent, ActionResult?>? SyntheticPerformNative { get; set; }
+    public Func<UiElement, string, PatternSupportState>? SyntheticProbePattern { get; set; }
+
+    public PatternSupportState ProbePattern(UiElement element, string action)
     {
-        var sw = Stopwatch.StartNew();
+        if (SyntheticProbePattern != null) return SyntheticProbePattern(element, action);
+        var el = Live(element);
+        if (el == null) return PatternSupportState.Unknown;
+        var pid = element.Pid ?? (element.Hwnd != null ? _windows.GetWindow(element.Hwnd.Value)?.Pid : null) ?? 0;
         try
         {
-            var method = _uia.Run(uia =>
-            {
-                ct.ThrowIfCancellationRequested();
-                var el = Live(element);
-                if (el == null) throw new InbriskException(ErrorCode.Stale, "element gone");
-                if (el.CurrentIsEnabled == 0 && intent.Kind != ActionKind.FocusElement)
-                    throw new InbriskException(ErrorCode.Disabled, "element is disabled");
+            var actionPatterns = UiaIds.PatternActions
+                .Where(p => string.Equals(p.Action, action, StringComparison.OrdinalIgnoreCase))
+                .Select(p => p.Id)
+                .ToArray();
 
-                ct.ThrowIfCancellationRequested();
-                switch (intent.Kind)
+            if (actionPatterns.Length == 0)
+            {
+                element.RecordPatternProbe(action, supported: false, isTransientFailure: false);
+                return PatternSupportState.Unsupported;
+            }
+
+            bool found = false;
+            _uia.Run(uia =>
+            {
+                foreach (var patternId in actionPatterns)
                 {
-                    case ActionKind.Invoke:
-                    case ActionKind.Click:
-                        if (Pattern<IUIAutomationInvokePattern>(el, UiaIds.InvokePattern) is { } inv)
+                    try
+                    {
+                        UiaPerf.LiveRead();
+                        if (el.GetCurrentPattern(patternId) != null)
                         {
-                            ct.ThrowIfCancellationRequested();
-                            inv.Invoke();
-                            return "UIA.InvokePattern";
+                            found = true;
+                            break;
                         }
-                        if (Pattern<IUIAutomationLegacyIAccessiblePattern>(el, UiaIds.LegacyIAccessiblePattern) is { } leg)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            leg.DoDefaultAction();
-                            return "UIA.LegacyIAccessible.DoDefaultAction";
-                        }
-                        return null; // → coordinate fallback
-                    case ActionKind.FocusElement:
-                        ct.ThrowIfCancellationRequested();
-                        el.SetFocus(); return "UIA.SetFocus";
-                    case ActionKind.SetValue:
-                        if (Pattern<IUIAutomationValuePattern>(el, UiaIds.ValuePattern) is { } val)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            if (val.CurrentIsReadOnly != 0)
-                                throw new InbriskException(ErrorCode.Disabled, "value is read-only");
-                            val.SetValue(intent.Args?.TryGetValue("text", out var t) == true ? t?.ToString() ?? "" : "");
-                            return "UIA.ValuePattern";
-                        }
-                        if (Pattern<IUIAutomationRangeValuePattern>(el, UiaIds.RangeValuePattern) is { } rv)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            var num = System.Convert.ToDouble(intent.Args?["value"] ?? 0);
-                            rv.SetValue(num); return "UIA.RangeValuePattern";
-                        }
-                        return null;
-                    case ActionKind.Toggle:
-                        if (Pattern<IUIAutomationTogglePattern>(el, UiaIds.TogglePattern) is { } tog)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            tog.Toggle();
-                            return "UIA.TogglePattern";
-                        }
-                        return null;
-                    case ActionKind.Select:
-                        if (Pattern<IUIAutomationSelectionItemPattern>(el, UiaIds.SelectionItemPattern) is { } sel)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            sel.Select();
-                            return "UIA.SelectionItemPattern";
-                        }
-                        return null;
-                    case ActionKind.Expand:
-                        if (Pattern<IUIAutomationExpandCollapsePattern>(el, UiaIds.ExpandCollapsePattern) is { } ex)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            ex.Expand();
-                            return "UIA.ExpandCollapsePattern";
-                        }
-                        return null;
-                    case ActionKind.Collapse:
-                        if (Pattern<IUIAutomationExpandCollapsePattern>(el, UiaIds.ExpandCollapsePattern) is { } col)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            col.Collapse();
-                            return "UIA.ExpandCollapsePattern";
-                        }
-                        return null;
-                    case ActionKind.ScrollIntoView:
-                        if (Pattern<IUIAutomationScrollItemPattern>(el, UiaIds.ScrollItemPattern) is { } sc)
-                        {
-                            ct.ThrowIfCancellationRequested();
-                            sc.ScrollIntoView();
-                            return "UIA.ScrollItemPattern";
-                        }
-                        return null;
-                    default:
-                        return null;
+                    }
+                    catch
+                    {
+                    }
                 }
-            }, ct: ct, intentName: intent.Kind.ToString());
+                return true;
+            }, 3000);
+
+            if (found)
+            {
+                element.RecordPatternProbe(action, supported: true);
+                return PatternSupportState.Supported;
+            }
+            else
+            {
+                element.RecordPatternProbe(action, supported: false, isTransientFailure: false);
+                return PatternSupportState.Unsupported;
+            }
+        }
+        catch
+        {
+            element.RecordPatternProbe(action, supported: false, isTransientFailure: true);
+            return PatternSupportState.Unknown;
+        }
+    }
+
+    public ActionResult? PerformNative(UiElement element, ActionIntent intent, CancellationToken ct = default)
+    {
+        if (SyntheticPerformNative != null) return SyntheticPerformNative(element, intent);
+        var sw = Stopwatch.StartNew();
+        var pid = element.Pid ?? (element.Hwnd != null ? _windows.GetWindow(element.Hwnd.Value)?.Pid : null) ?? 0;
+        _readScheduler?.NotifyMutationStarting(pid);
+        try
+        {
+            var method = _uia.Run(uia => ExecuteNativeIntent(uia, element, intent, ct), ct: ct, intentName: intent.Kind.ToString());
 
             if (method == null) return null; // backend declines → caller falls back
             return new ActionResult(true, BackendId.Uia, method,
@@ -941,6 +954,140 @@ public sealed class UiaBackend : IElementBackend
             return new ActionResult(false, BackendId.Uia, "UIA",
                 new[] { new Attempt(BackendId.Uia, "UIA", false, e.Message, sw.Elapsed) },
                 VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Internal, e.Message);
+        }
+        finally
+        {
+            _readScheduler?.NotifyMutationCompleted(pid);
+        }
+    }
+
+    public async Task<ActionResult?> PerformNativeAsync(UiElement element, ActionIntent intent, CancellationToken ct = default)
+    {
+        var sw = Stopwatch.StartNew();
+        var pid = element.Pid ?? (element.Hwnd != null ? _windows.GetWindow(element.Hwnd.Value)?.Pid : null) ?? 0;
+        IAsyncDisposable? barrier = null;
+        if (_readScheduler != null && pid > 0)
+        {
+            barrier = await _readScheduler.EnterMutationBarrierAsync(pid, ct).ConfigureAwait(false);
+        }
+        try
+        {
+            var method = await _uia.RunAsync(uia => ExecuteNativeIntent(uia, element, intent, ct), ct: ct, intentName: intent.Kind.ToString()).ConfigureAwait(false);
+
+            if (method == null) return null; // backend declines → caller falls back
+            return new ActionResult(true, BackendId.Uia, method,
+                new[] { new Attempt(BackendId.Uia, method, true, null, sw.Elapsed) },
+                VerifyResult.NotRequested, sw.Elapsed);
+        }
+        catch (InbriskException e)
+        {
+            return new ActionResult(false, BackendId.Uia, "UIA",
+                new[] { new Attempt(BackendId.Uia, "UIA", false, e.Message, sw.Elapsed) },
+                VerifyResult.NotRequested, sw.Elapsed, e.Code, e.Message);
+        }
+        catch (Exception e)
+        {
+            return new ActionResult(false, BackendId.Uia, "UIA",
+                new[] { new Attempt(BackendId.Uia, "UIA", false, e.Message, sw.Elapsed) },
+                VerifyResult.NotRequested, sw.Elapsed, ErrorCode.Internal, e.Message);
+        }
+        finally
+        {
+            if (barrier != null)
+                await barrier.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private string? ExecuteNativeIntent(IUIAutomation uia, UiElement element, ActionIntent intent, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var el = Live(element);
+        if (el == null) throw new InbriskException(ErrorCode.Stale, "element gone");
+        if (el.CurrentIsEnabled == 0 && intent.Kind != ActionKind.FocusElement)
+            throw new InbriskException(ErrorCode.Disabled, "element is disabled");
+
+        ct.ThrowIfCancellationRequested();
+        switch (intent.Kind)
+        {
+            case ActionKind.Invoke:
+            case ActionKind.Click:
+                if (Pattern<IUIAutomationInvokePattern>(el, UiaIds.InvokePattern) is { } inv)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    inv.Invoke();
+                    element.RecordPatternProbe("invoke", true);
+                    return "UIA.InvokePattern";
+                }
+                if (Pattern<IUIAutomationLegacyIAccessiblePattern>(el, UiaIds.LegacyIAccessiblePattern) is { } leg)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    leg.DoDefaultAction();
+                    element.RecordPatternProbe("invoke", true);
+                    return "UIA.LegacyIAccessible.DoDefaultAction";
+                }
+                element.RecordPatternProbe("invoke", false, isTransientFailure: false);
+                return null; // → coordinate fallback
+            case ActionKind.FocusElement:
+                ct.ThrowIfCancellationRequested();
+                el.SetFocus(); return "UIA.SetFocus";
+            case ActionKind.SetValue:
+                if (Pattern<IUIAutomationValuePattern>(el, UiaIds.ValuePattern) is { } val)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    if (val.CurrentIsReadOnly != 0)
+                        throw new InbriskException(ErrorCode.Disabled, "value is read-only");
+                    val.SetValue(intent.Args?.TryGetValue("text", out var t) == true ? t?.ToString() ?? "" : "");
+                    return "UIA.ValuePattern";
+                }
+                if (Pattern<IUIAutomationRangeValuePattern>(el, UiaIds.RangeValuePattern) is { } rv)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var num = System.Convert.ToDouble(intent.Args?["value"] ?? 0);
+                    rv.SetValue(num); return "UIA.RangeValuePattern";
+                }
+                return null;
+            case ActionKind.Toggle:
+                if (Pattern<IUIAutomationTogglePattern>(el, UiaIds.TogglePattern) is { } tog)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    tog.Toggle();
+                    return "UIA.TogglePattern";
+                }
+                return null;
+            case ActionKind.Select:
+                if (Pattern<IUIAutomationSelectionItemPattern>(el, UiaIds.SelectionItemPattern) is { } sel)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    sel.Select();
+                    return "UIA.SelectionItemPattern";
+                }
+                return null;
+            case ActionKind.Expand:
+                if (Pattern<IUIAutomationExpandCollapsePattern>(el, UiaIds.ExpandCollapsePattern) is { } ex)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    ex.Expand();
+                    return "UIA.ExpandCollapsePattern";
+                }
+                return null;
+            case ActionKind.Collapse:
+                if (Pattern<IUIAutomationExpandCollapsePattern>(el, UiaIds.ExpandCollapsePattern) is { } col)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    col.Collapse();
+                    return "UIA.ExpandCollapsePattern";
+                }
+                return null;
+            case ActionKind.ScrollIntoView:
+                if (Pattern<IUIAutomationScrollItemPattern>(el, UiaIds.ScrollItemPattern) is { } sc)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    sc.ScrollIntoView();
+                    return "UIA.ScrollItemPattern";
+                }
+                return null;
+            default:
+                return null;
         }
     }
 
@@ -963,10 +1110,16 @@ public sealed class UiaBackend : IElementBackend
     //  Staleness / re-resolution
     // ------------------------------------------------------------------
 
+    public Func<UiElement, bool>? SyntheticIsAlive { get; set; }
+
     public bool IsAlive(UiElement element)
     {
+        if (SyntheticIsAlive != null) return SyntheticIsAlive(element);
         if (!element.IsStale && !_live.ContainsKey(element.Handle.BackendRef)) return false;
-        try { _uia.Run(u => { _ = Live(element)?.GetRuntimeId(); return true; }, 3000); return true; }
+        try
+        {
+            return _uia.Run(u => { _ = Live(element)?.GetRuntimeId(); return true; }, 3000);
+        }
         catch { element.IsStale = true; return false; }
     }
 
@@ -976,108 +1129,126 @@ public sealed class UiaBackend : IElementBackend
     {
         var recipe = handle.Recipe;
         if (recipe.Hwnd is not { } hwnd) return null;
+        var work = CreateReResolveWork(handle, ct);
         try
         {
-            return _uia.Run(uia =>
-            {
-                ct.ThrowIfCancellationRequested();
-                IUIAutomationElement? root = null;
-                try { root = uia.ElementFromHandle(new IntPtr(hwnd)); }
-                catch { /* dead handle → fall through to title re-resolution */ }
-                if (root == null && recipe.OwnerTitle != null)
-                {
-                    // window was closed+reopened → hwnd changed; find by title+pid
-                    var wins = uia.GetRootElement().FindAll(TreeScope.TreeScope_Descendants,
-                        uia.CreatePropertyCondition(UiaIds.ControlTypeProperty, 50032));
-                    for (var i = 0; i < wins.Length; i++)
-                    {
-                        var w = wins.GetElement(i);
-                        try
-                        {
-                            if (w.CurrentName?.Contains(recipe.OwnerTitle,
-                                    StringComparison.OrdinalIgnoreCase) != true) continue;
-                            if (recipe.Pid is { } p && w.CurrentProcessId != p) continue;
-                            root = w; break;
-                        }
-                        catch { }
-                    }
-                }
-                if (root == null) return (UiElement?)null;
-
-                IUIAutomationElement? cur = root;
-                // one cached children fetch per level — sig props for every
-                // sibling arrive in a single cross-process call instead of
-                // three live reads per child
-                IUIAutomationCacheRequest? sigCache = null;
-                try
-                {
-                    sigCache = uia.CreateCacheRequest();
-                    sigCache.AddProperty(UiaIds.NameProperty);
-                    sigCache.AddProperty(UiaIds.ControlTypeProperty);
-                    sigCache.AddProperty(UiaIds.AutomationIdProperty);
-                    sigCache.TreeScope = TreeScope.TreeScope_Element;
-                }
-                catch { sigCache = null; }
-                foreach (var step in recipe.AncestryPath)
-                {
-                    // cached children fetch batches sibling sig props into
-                    // one call; providers that reject it fall back to plain
-                    // FindAll — a re-resolve must never die on a cache quirk
-                    IUIAutomationElementArray? children = null;
-                    var childrenCached = false;
-                    try
-                    {
-                        if (sigCache != null)
-                        {
-                            children = cur!.FindAllBuildCache(
-                                TreeScope.TreeScope_Children,
-                                uia.CreateTrueCondition(), sigCache);
-                            childrenCached = true;
-                        }
-                    }
-                    catch { children = null; childrenCached = false; }
-                    children ??= cur!.FindAll(TreeScope.TreeScope_Children,
-                        uia.CreateTrueCondition());
-                    IUIAutomationElement? next = null;
-                    var seen = 0;
-                    for (var i = 0; i < children.Length; i++)
-                    {
-                        var c = children.GetElement(i);
-                        var (r, n, a) = Sig(c, cached: childrenCached);
-                        if (r == step.Role && n == step.Name && a == step.AutomationId)
-                        {
-                            if (seen == step.IndexAmongSiblings) { next = c; break; }
-                            seen++;
-                        }
-                    }
-                    if (next == null) { cur = null; break; }
-                    cur = next;
-                }
-
-                if (cur == null) return (UiElement?)null;
-                // one cache-update call covers every property the conversion
-                // needs (patterns + state props included) instead of ~15
-                // separate live reads
-                var finalEl = cur;
-                var cachedFinal = false;
-                if (TryCreateCache(uia, out _) is { } fc)
-                {
-                    try
-                    {
-                        var u = cur.BuildUpdatedCache(fc);
-                        if (u != null) { finalEl = u; cachedFinal = true; }
-                    }
-                    catch { }
-                }
-                // the walk consumed the full ancestry (last step = the element
-                // itself) — the re-resolved element must keep the same full
-                // path or a second re-resolve would stop at its parent
-                return ToUiElement(uia, finalEl, recipe.AncestryPath.ToList(),
-                    recipe.Hwnd, recipe.OwnerTitle, cached: cachedFinal, allowOffscreen: true);
-            }, ct: ct, intentName: "ReResolve");
+            return _uia.Run(u => work(u), ct: ct, intentName: "ReResolve");
         }
         catch { return null; }
     }
+
+    public async Task<UiElement?> ReResolveAsync(ElementHandle handle, CancellationToken ct = default)
+    {
+        var recipe = handle.Recipe;
+        if (recipe.Hwnd is not { } hwnd) return null;
+        var work = CreateReResolveWork(handle, ct);
+        try
+        {
+            return await _uia.RunAsync(u => work(u), ct: ct, intentName: "ReResolve").ConfigureAwait(false);
+        }
+        catch { return null; }
+    }
+
+    private Func<IUIAutomation?, UiElement?> CreateReResolveWork(ElementHandle handle, CancellationToken ct) => uia =>
+    {
+        if (uia == null) return null;
+        var recipe = handle.Recipe;
+        if (recipe.Hwnd is not { } hwnd) return null;
+        ct.ThrowIfCancellationRequested();
+        IUIAutomationElement? root = null;
+        try { root = uia.ElementFromHandle(new IntPtr(hwnd)); }
+        catch { /* dead handle → fall through to title re-resolution */ }
+        if (root == null && recipe.OwnerTitle != null)
+        {
+            // window was closed+reopened → hwnd changed; find by title+pid
+            var wins = uia.GetRootElement().FindAll(TreeScope.TreeScope_Descendants,
+                uia.CreatePropertyCondition(UiaIds.ControlTypeProperty, 50032));
+            for (var i = 0; i < wins.Length; i++)
+            {
+                var w = wins.GetElement(i);
+                try
+                {
+                    if (w.CurrentName?.Contains(recipe.OwnerTitle,
+                            StringComparison.OrdinalIgnoreCase) != true) continue;
+                    if (recipe.Pid is { } p && w.CurrentProcessId != p) continue;
+                    root = w; break;
+                }
+                catch { }
+            }
+        }
+        if (root == null) return (UiElement?)null;
+
+        IUIAutomationElement? cur = root;
+        // one cached children fetch per level — sig props for every
+        // sibling arrive in a single cross-process call instead of
+        // three live reads per child
+        IUIAutomationCacheRequest? sigCache = null;
+        try
+        {
+            sigCache = uia.CreateCacheRequest();
+            sigCache.AddProperty(UiaIds.NameProperty);
+            sigCache.AddProperty(UiaIds.ControlTypeProperty);
+            sigCache.AddProperty(UiaIds.AutomationIdProperty);
+            sigCache.TreeScope = TreeScope.TreeScope_Element;
+        }
+        catch { sigCache = null; }
+        foreach (var step in recipe.AncestryPath)
+        {
+            // cached children fetch batches sibling sig props into
+            // one call; providers that reject it fall back to plain
+            // FindAll — a re-resolve must never die on a cache quirk
+            IUIAutomationElementArray? children = null;
+            var childrenCached = false;
+            try
+            {
+                if (sigCache != null)
+                {
+                    children = cur!.FindAllBuildCache(
+                        TreeScope.TreeScope_Children,
+                        uia.CreateTrueCondition(), sigCache);
+                    childrenCached = true;
+                }
+            }
+            catch { children = null; childrenCached = false; }
+            children ??= cur!.FindAll(TreeScope.TreeScope_Children,
+                uia.CreateTrueCondition());
+            IUIAutomationElement? next = null;
+            var seen = 0;
+            for (var i = 0; i < children.Length; i++)
+            {
+                var c = children.GetElement(i);
+                var (r, n, a) = Sig(c, cached: childrenCached);
+                if (r == step.Role && n == step.Name && a == step.AutomationId)
+                {
+                    if (seen == step.IndexAmongSiblings) { next = c; break; }
+                    seen++;
+                }
+            }
+            if (next == null) { cur = null; break; }
+            cur = next;
+        }
+
+        if (cur == null) return (UiElement?)null;
+        // one cache-update call covers every property the conversion
+        // needs (patterns + state props included) instead of ~15
+        // separate live reads
+        var finalEl = cur;
+        var cachedFinal = false;
+        if (TryCreateCache(uia, out _) is { } fc)
+        {
+            try
+            {
+                var u = cur.BuildUpdatedCache(fc);
+                if (u != null) { finalEl = u; cachedFinal = true; }
+            }
+            catch { }
+        }
+        // the walk consumed the full ancestry (last step = the element
+        // itself) — the re-resolved element must keep the same full
+        // path or a second re-resolve would stop at its parent
+        return ToUiElement(uia, finalEl, recipe.AncestryPath.ToList(),
+            recipe.Hwnd, recipe.OwnerTitle, cached: cachedFinal, allowOffscreen: true);
+    };
 
     // ------------------------------------------------------------------
     //  Conversion + role map
@@ -1173,10 +1344,12 @@ public sealed class UiaBackend : IElementBackend
         var handle = new ElementHandle(BackendId.Uia, id, recipe);
 
         _live[id] = el;
-        return new UiElement(id, BackendId.Uia, MapControlType(controlType),
+        var uie = new UiElement(id, BackendId.Uia, MapControlType(controlType),
             string.IsNullOrEmpty(name) ? null : name, bounds,
             UiaIds.ActionsFor(uia, el, cached, enabled != 0), props, handle,
             pid == 0 ? null : pid, hwnd == IntPtr.Zero ? null : hwnd.ToInt64());
+        uie.DefaultProbeFallback = a => ProbePattern(uie, a);
+        return uie;
     }
 
     private static string? SafeStr(Func<string?> f) { try { return f(); } catch { return null; } }

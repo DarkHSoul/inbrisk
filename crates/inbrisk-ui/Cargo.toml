@@ -1,0 +1,16 @@
+[package]
+name = "inbrisk-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+inbrisk-core.workspace = true
+inbrisk-protocol.workspace = true
+inbrisk-win32.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_UI_Shell"] }

@@ -45,7 +45,7 @@ public enum ErrorCode
     None, NotFound, Stale, StaleUnresolvable,
     TargetElevated, SecureDesktopActive, Timeout,
     CaptureFailed, InputBlocked, Unsupported, Disabled,
-    PolicyDenied, ConfirmationRequired, Internal,
+    PolicyDenied, ConfirmationRequired, Internal, Busy
 }
 
 public sealed class InbriskException(ErrorCode code, string message)

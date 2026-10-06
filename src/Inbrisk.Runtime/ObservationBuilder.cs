@@ -28,6 +28,7 @@ public sealed class ObservationBuilder
 
     private readonly IWindowService _windows;
     private readonly Func<long, IReadOnlyList<UiElement>> _scene;
+    private readonly Func<long, CancellationToken, Task<IReadOnlyList<UiElement>>>? _sceneAsync;
     private readonly Func<CaptureTarget, RawFrame> _captureRaw;
     private readonly RecentEventBuffer _events;
     private readonly ITelemetrySink? _telemetry;
@@ -42,10 +43,12 @@ public sealed class ObservationBuilder
         Func<long, IReadOnlyList<UiElement>> scene,
         Func<CaptureTarget, RawFrame> captureRaw,
         RecentEventBuffer events,
-        ITelemetrySink? telemetry = null)
+        ITelemetrySink? telemetry = null,
+        Func<long, CancellationToken, Task<IReadOnlyList<UiElement>>>? sceneAsync = null)
     {
         _windows = windows;
         _scene = scene;
+        _sceneAsync = sceneAsync;
         _captureRaw = captureRaw;
         _events = events;
         _telemetry = telemetry;
@@ -76,6 +79,61 @@ public sealed class ObservationBuilder
         var activeObs = obsWins.FirstOrDefault(w => w.Active);
 
         var elements = target is { } t ? _scene(t) : (IReadOnlyList<UiElement>)[];
+        var regions = monitor?.LastChangedDesktopRegions ?? (IReadOnlyList<RectPx>)[];
+        var changedKeys = _prev?.Delta is { } d
+            ? d.Added.Concat(d.Changed).Select(e => e.StableKey).ToHashSet()
+            : new HashSet<string>();
+        var recent = recentElementRefs ?? (IReadOnlyCollection<string>)Array.Empty<string>();
+        var obsElements = Prune(elements, budget, changedKeys, recent, regions, target);
+
+        var (frames, raws) = AttachPixels(policy, target, obsElements, regions, budget);
+
+        var backend = monitor?.Session.Backend.ToString()
+            ?? (frames.Count > 0 ? "oneshot" : "none");
+
+        var baseObs = baseSnapshot ?? _prev;
+        var stats = ComputeStats(obsElements, obsWins, frames);
+        var obs = new AgentObservation(
+            Interlocked.Increment(ref _obsSeq), DateTimeOffset.Now,
+            activeObs, obsWins, obsElements,
+            _events.Snapshot(budget.MaxEvents), frames, regions,
+            backend, prevOutcome, Delta: null, Stats: stats,
+            BaseObservationId: baseObs?.ObservationId);
+        obs = obs with { Delta = baseObs == null ? null : DeltaBuilder.Compute(baseObs, obs, elements) };
+        _prev = obs;
+        return new BuiltObservation(obs, raws);
+    }
+
+    /// <summary>Build the next observation asynchronously without blocking thread pool threads.</summary>
+    public async Task<BuiltObservation> BuildAsync(long? hwndHint, ObservationBudget budget,
+        VisualAttachPolicy policy, ChangeMonitor? monitor, StepOutcome? prevOutcome,
+        IReadOnlyCollection<string>? recentElementRefs = null,
+        AgentObservation? baseSnapshot = null,
+        CancellationToken ct = default)
+    {
+        var fg = _windows.GetForegroundWindow();
+        var target = hwndHint ?? fg?.Hwnd;
+
+        var wins = _windows.ListWindows();
+        var active = wins.FirstOrDefault(w => w.Hwnd == fg?.Hwnd);
+        var obsWins = wins
+            .OrderByDescending(w => w.Hwnd == fg?.Hwnd)
+            .ThenByDescending(w => w.Hwnd == target)
+            .Take(budget.MaxWindows)
+            .Select(w => new ObsWindow(w.Hwnd,
+                Trunc(w.Title, budget.MaxNameLength) ?? "",
+                w.ProcessName ?? "", w.Bounds, w.Hwnd == fg?.Hwnd))
+            .ToList();
+        var activeObs = obsWins.FirstOrDefault(w => w.Active);
+
+        IReadOnlyList<UiElement> elements = (IReadOnlyList<UiElement>)[];
+        if (target is { } t)
+        {
+            if (_sceneAsync != null)
+                elements = await _sceneAsync(t, ct).ConfigureAwait(false);
+            else
+                elements = _scene(t);
+        }
         var regions = monitor?.LastChangedDesktopRegions ?? (IReadOnlyList<RectPx>)[];
         var changedKeys = _prev?.Delta is { } d
             ? d.Added.Concat(d.Changed).Select(e => e.StableKey).ToHashSet()

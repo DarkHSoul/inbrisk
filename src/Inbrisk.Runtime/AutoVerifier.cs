@@ -3,6 +3,28 @@ using Inbrisk.Core;
 
 namespace Inbrisk.Runtime;
 
+public sealed class AutoVerifierTelemetry
+{
+    private long _eventWakeCount;
+    private long _fallbackPollCount;
+    private long _propertyCheckCount;
+
+    public long EventWakeCount => Interlocked.Read(ref _eventWakeCount);
+    public long FallbackPollCount => Interlocked.Read(ref _fallbackPollCount);
+    public long PropertyCheckCount => Interlocked.Read(ref _propertyCheckCount);
+
+    public void IncEventWake() => Interlocked.Increment(ref _eventWakeCount);
+    public void IncFallbackPoll() => Interlocked.Increment(ref _fallbackPollCount);
+    public void IncPropertyCheck() => Interlocked.Increment(ref _propertyCheckCount);
+
+    public void Reset()
+    {
+        Interlocked.Exchange(ref _eventWakeCount, 0);
+        Interlocked.Exchange(ref _fallbackPollCount, 0);
+        Interlocked.Exchange(ref _propertyCheckCount, 0);
+    }
+}
+
 /// <summary>
 /// Automatic post-action verification. For each canonical action that has a
 /// reliably-readable postcondition, re-reads ONLY the target (no full-desktop
@@ -17,14 +39,20 @@ public sealed class AutoVerifier
     private readonly IWindowService _windows;
     private readonly RecentEventBuffer _events;
 
+    public AutoVerifierTelemetry Telemetry { get; } = new();
+
     private const int PollMs = 150;
     private const int MaxPollMs = 900;
 
+    private readonly IScopedSubscriptionManager? _subscriptionManager;
+
     public AutoVerifier(ElementRegistry registry, IReadOnlyList<IElementBackend> backends,
-        IWindowService windows, RecentEventBuffer events)
+        IWindowService windows, RecentEventBuffer events,
+        IScopedSubscriptionManager? subscriptionManager = null)
     {
         _registry = registry; _backends = backends;
         _windows = windows; _events = events;
+        _subscriptionManager = subscriptionManager;
     }
 
     /// <summary>Pre-action state — taken before execution so Toggle/Click
@@ -81,10 +109,13 @@ public sealed class AutoVerifier
 
     // ---------------------------------------------------------- per kind
 
-    /// <summary>Edit controls normalize newlines (RichEdit stores \r); a
+    /// <summary>Edit controls normalize newlines (RichEdit stores \r, \r\r\n); a
     /// write is faithful when the text matches modulo line endings.</summary>
     private static string? NormEol(string? s)
-        => s?.Replace("\r\n", "\n").Replace("\r", "\n");
+    {
+        if (s == null) return null;
+        return System.Text.RegularExpressions.Regex.Replace(s, @"\r\r\n|\r\n|\r", "\n").TrimEnd();
+    }
 
     private StepOutcome? VerifyValue(PreState pre, string expected, CancellationToken ct)
     {
@@ -178,7 +209,7 @@ public sealed class AutoVerifier
 
     /// <summary>Click/Invoke/etc: element gone with window closed, own state
     /// changed, or a semantic event in its window → verified/observed. Anything else
-    /// stays honest Unverified (null).</summary>
+    /// stays honest Unverified (null). Races event vs property change vs window closed.</summary>
     private StepOutcome? VerifyActed(PreState pre, WindowInfo? window, CancellationToken ct)
     {
         var el = pre.Element;
@@ -190,32 +221,99 @@ public sealed class AutoVerifier
                     detail: "window event observed following coordinate click")
                 : null;
         }
-        // element state props that can legitimately change
-        var post = PollFor(el, e => ChangedProps(pre.Element!, e).Count > 0, ct);
-        if (post != null)
-        {
-            var changes = ChangedProps(el, post);
-            var c = changes[0];
-            return Verified("PropertyChanged", c.Before, c.After, c.Prop);
-        }
-        var last = ReRead(el);
-        if (last == null)
-        {
-            var targetHwnd = el.Hwnd ?? window?.Hwnd;
-            if (targetHwnd is { } closedHwnd && _windows.GetWindow(closedHwnd) == null)
-                return Verified("WindowClosed", detail: "window closed after action");
 
-            var evGone = AnySemanticEvent(pre, window ?? (targetHwnd is { } goneHwnd ? _windows.GetWindow(goneHwnd) : null));
-            return evGone != null
-                ? ObservedChange("SemanticEvent", actual: evGone.Kind.ToString(),
-                    detail: "window event observed, but target element was no longer found after action")
-                : null;
+        var targetHwnd = el.Hwnd ?? window?.Hwnd;
+        ISubscriptionLease? lease = null;
+        if (_subscriptionManager != null && targetHwnd.HasValue && targetHwnd.Value != 0)
+        {
+            lease = _subscriptionManager.Acquire(targetHwnd.Value, window?.Pid,
+                UiaEventKinds.PropertyChanged | UiaEventKinds.StructureChanged | UiaEventKinds.WindowClosed);
         }
-        var ev2 = AnySemanticEvent(pre, window ?? (el.Hwnd is { } h ? _windows.GetWindow(h) : null));
-        return ev2 != null
-            ? ObservedChange("SemanticEvent", actual: ev2.Kind.ToString(),
-                detail: "window event observed, but target element state was not independently verified")
-            : null;
+
+        try
+        {
+            var sw = Stopwatch.StartNew();
+            var baseline = _events.CurrentGeneration;
+
+            while (sw.ElapsedMilliseconds < MaxPollMs)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // 1. Check if window closed (definitive evidence)
+            if (targetHwnd is { } closedHwnd && _windows.GetWindow(closedHwnd) == null)
+            {
+                return Verified("WindowClosed", detail: "window closed after action");
+            }
+
+            // 2. Re-read element to check property change
+            Telemetry.IncPropertyCheck();
+            var cur = ReRead(el);
+            if (cur != null)
+            {
+                var changes = ChangedProps(pre.Element!, cur);
+                if (changes.Count > 0)
+                {
+                    _registry.Register(new[] { cur });
+                    var c = changes[0];
+                    return Verified("PropertyChanged", c.Before, c.After, c.Prop);
+                }
+            }
+            else
+            {
+                // Element is gone; if window closed, verify it
+                if (targetHwnd is { } goneHwnd && _windows.GetWindow(goneHwnd) == null)
+                {
+                    return Verified("WindowClosed", detail: "window closed after action");
+                }
+
+                // If semantic event exists in its window, report observed change
+                var evGone = AnySemanticEvent(pre, window ?? (targetHwnd is { } gh ? _windows.GetWindow(gh) : null));
+                if (evGone != null)
+                {
+                    return ObservedChange("SemanticEvent", actual: evGone.Kind.ToString(),
+                        detail: "window event observed, but target element was no longer found after action");
+                }
+            }
+
+            // 3. Check semantic event even while element still exists
+            var ev2 = AnySemanticEvent(pre, window ?? (el.Hwnd is { } h ? _windows.GetWindow(h) : null));
+            if (ev2 != null)
+            {
+                return ObservedChange("SemanticEvent", actual: ev2.Kind.ToString(),
+                    detail: "window event observed, but target element state was not independently verified");
+            }
+
+            // Race: wait for next event with bounded fallback (PollMs = 150)
+            if (_events.WaitForNextEvent(baseline, PollMs, ct))
+            {
+                baseline = _events.CurrentGeneration;
+                Telemetry.IncEventWake();
+                PerfTrace.Count("verify.eventWakeups");
+            }
+            else
+            {
+                Telemetry.IncFallbackPoll();
+                PerfTrace.Count("verify.pollWakeups");
+            }
+        }
+
+        // Bounded fallback timeout reached — final check before giving up
+        if (targetHwnd is { } finalClosed && _windows.GetWindow(finalClosed) == null)
+            return Verified("WindowClosed", detail: "window closed after action");
+
+        var finalEv = AnySemanticEvent(pre, window ?? (el.Hwnd is { } fh ? _windows.GetWindow(fh) : null));
+        if (finalEv != null)
+        {
+            return ObservedChange("SemanticEvent", actual: finalEv.Kind.ToString(),
+                detail: "window event observed, but target element state was not independently verified");
+        }
+
+            return null;
+        }
+        finally
+        {
+            lease?.Dispose();
+        }
     }
 
     // ---------------------------------------------------------- primitives
@@ -249,16 +347,22 @@ public sealed class AutoVerifier
     private UiElement? PollFor(UiElement el, Func<UiElement, bool> cond, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+        var baseline = _events.CurrentGeneration;
         while (sw.ElapsedMilliseconds < MaxPollMs)
         {
             ct.ThrowIfCancellationRequested();
             var cur = ReRead(el);
             if (cur == null) return null;
             if (cond(cur)) { _registry.Register(new[] { cur }); return cur; }
-            // event-driven fast path: a semantic event wakes the re-check
-            // instantly; PollMs stays as the bounded provider fallback
-            PerfTrace.Count(_events.WaitForEvent(PollMs, ct)
-                ? "verify.eventWakeups" : "verify.pollWakeups");
+            if (_events.WaitForNextEvent(baseline, PollMs, ct))
+            {
+                baseline = _events.CurrentGeneration;
+                PerfTrace.Count("verify.eventWakeups");
+            }
+            else
+            {
+                PerfTrace.Count("verify.pollWakeups");
+            }
         }
         return null;
     }
@@ -276,13 +380,21 @@ public sealed class AutoVerifier
     private ObservedEvent? PollEvent(PreState pre, WindowInfo? window, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+        var baseline = _events.CurrentGeneration;
         while (sw.ElapsedMilliseconds < MaxPollMs)
         {
             ct.ThrowIfCancellationRequested();
             var ev = AnySemanticEvent(pre, window);
             if (ev != null) return ev;
-            PerfTrace.Count(_events.WaitForEvent(PollMs, ct)
-                ? "verify.eventWakeups" : "verify.pollWakeups");
+            if (_events.WaitForNextEvent(baseline, PollMs, ct))
+            {
+                baseline = _events.CurrentGeneration;
+                PerfTrace.Count("verify.eventWakeups");
+            }
+            else
+            {
+                PerfTrace.Count("verify.pollWakeups");
+            }
         }
         return null;
     }

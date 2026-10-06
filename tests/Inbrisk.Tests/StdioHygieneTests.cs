@@ -8,11 +8,8 @@ namespace Inbrisk.Tests;
 /// McpSelfTest does a real handshake and flags any non-JSON-RPC stdout line —
 /// a stray banner/Console.WriteLine fails here immediately.
 /// </summary>
-[Collection("desktop")]
 public sealed class StdioHygieneTests
 {
-    private readonly DesktopFixture _fx;
-    public StdioHygieneTests(DesktopFixture fx) => _fx = fx;
 
     [Fact]
     public async Task McpStdout_IsProtocolClean()

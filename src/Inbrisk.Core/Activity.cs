@@ -21,6 +21,8 @@ public sealed class ComputerControlActivityService : IDisposable
 {
     private readonly object _gate = new();
     private readonly Timer? _idleTimer;
+    private readonly Timer? _watchdogTimer;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, ActivityToken> _activeTokens = new();
     private int _leases;
     private int _clients;
     private IDisposable? _manualLease; // SetConnected(true) holds one slot
@@ -29,29 +31,37 @@ public sealed class ComputerControlActivityService : IDisposable
     private IndicatorState _state = IndicatorState.Disconnected;
 
     /// <summary>How long Active persists after the last lease ends —
-    /// bridges the gap between rapid consecutive actions.</summary>
+    /// bridges the gap between rapid consecutive actions (settle window ~300-800ms).</summary>
     public int IdleGraceMs { get; set; }
+
+    /// <summary>Watchdog timeout after which orphaned tokens without activity are reaped.</summary>
+    public int WatchdogTimeoutMs { get; set; } = 60_000;
 
     public event Action<IndicatorState>? StateChanged;
 
-    public ComputerControlActivityService(int idleGraceMs = 700)
+    public ComputerControlActivityService(int idleGraceMs = 500)
     {
         IdleGraceMs = idleGraceMs;
         _idleTimer = new Timer(_ => OnIdleTimer(), null,
             Timeout.Infinite, Timeout.Infinite);
+        _watchdogTimer = new Timer(_ => CheckWatchdog(), null,
+            TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
     }
 
     public IndicatorState State { get { lock (_gate) return _state; } }
     public int ActiveLeases { get { lock (_gate) return _leases; } }
-    /// <summary>Attached client sessions — the indicator is visible only
-    /// while this is &gt; 0 (or a manual SetConnected(true) slot is held).</summary>
+    /// <summary>Perimeter visibility condition: strictly active work or emergency stop.</summary>
+    public bool PerimeterVisible { get { lock (_gate) return _state is IndicatorState.Active or IndicatorState.EmergencyStopped; } }
+    /// <summary>Attached client sessions.</summary>
     public int ActiveClients { get { lock (_gate) return _clients; } }
+    /// <summary>All currently active operation activity tokens.</summary>
+    public IReadOnlyCollection<ActivityToken> ActiveTokens => _activeTokens.Values.ToArray();
 
-    /// <summary>A bounded unit of computer interaction. Always Dispose —
-    /// refcounted: the border stays animated until EVERY lease ends and the
-    /// grace period expires.</summary>
-    public IDisposable BeginActivity()
+    /// <summary>A bounded unit of computer interaction with operation/session tracking.</summary>
+    public ActivityToken BeginActivity(string? operationId, string? sessionId = null)
     {
+        var token = new ActivityToken(this, Guid.NewGuid().ToString("N")[..8], operationId, sessionId);
+        _activeTokens[token.TokenId] = token;
         lock (_gate)
         {
             _leases++;
@@ -59,8 +69,13 @@ public sealed class ComputerControlActivityService : IDisposable
             _idleTimer?.Change(Timeout.Infinite, Timeout.Infinite);
         }
         Evaluate();
-        return new Lease(this);
+        return token;
     }
+
+    /// <summary>A bounded unit of computer interaction. Always Dispose —
+    /// refcounted: the border stays animated until EVERY lease ends and the
+    /// grace period expires.</summary>
+    public IDisposable BeginActivity() => BeginActivity(null, null);
 
     /// <summary>An MCP client/session attached — refcounted: the indicator
     /// stays up until EVERY session's lease is disposed. The lease is
@@ -121,6 +136,38 @@ public sealed class ComputerControlActivityService : IDisposable
         Evaluate(); // stays Active during grace; timer does the real transition
     }
 
+    internal void EndActivityToken(ActivityToken token)
+    {
+        _activeTokens.TryRemove(token.TokenId, out _);
+        EndActivity();
+    }
+
+    /// <summary>Clears all activity tokens associated with a given session id (e.g. on session disconnect).</summary>
+    public void ClearSessionActivity(string sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return;
+        foreach (var kvp in _activeTokens)
+        {
+            if (string.Equals(kvp.Value.SessionId, sessionId, StringComparison.OrdinalIgnoreCase))
+            {
+                kvp.Value.Dispose();
+            }
+        }
+    }
+
+    private void CheckWatchdog()
+    {
+        var now = Environment.TickCount64;
+        foreach (var kvp in _activeTokens)
+        {
+            var token = kvp.Value;
+            if (now - token.LastActivityTick > WatchdogTimeoutMs)
+            {
+                token.Dispose();
+            }
+        }
+    }
+
     private void OnIdleTimer()
     {
         lock (_gate)
@@ -155,7 +202,11 @@ public sealed class ComputerControlActivityService : IDisposable
         try { StateChanged?.Invoke(next); } catch { /* indicator must never take us down */ }
     }
 
-    public void Dispose() => _idleTimer?.Dispose();
+    public void Dispose()
+    {
+        _idleTimer?.Dispose();
+        _watchdogTimer?.Dispose();
+    }
 
     private sealed class Lease(ComputerControlActivityService owner) : IDisposable
     {
@@ -177,3 +228,56 @@ public sealed class ComputerControlActivityService : IDisposable
         }
     }
 }
+
+/// <summary>
+/// A traceable activity token representing an in-flight operation.
+/// Reference counted so the perimeter wall stays visible until the final active token ends.
+/// </summary>
+public sealed class ActivityToken : IDisposable
+{
+    private readonly ComputerControlActivityService _owner;
+    private int _disposed;
+
+    public string TokenId { get; }
+    public string? OperationId { get; }
+    public string? SessionId { get; }
+    public DateTimeOffset StartedAt { get; }
+    public long LastActivityTick { get; private set; }
+
+    internal ActivityToken(ComputerControlActivityService owner, string tokenId, string? operationId, string? sessionId)
+    {
+        _owner = owner;
+        TokenId = tokenId;
+        OperationId = operationId;
+        SessionId = sessionId;
+        StartedAt = DateTimeOffset.UtcNow;
+        LastActivityTick = Environment.TickCount64;
+    }
+
+    public void Touch() => LastActivityTick = Environment.TickCount64;
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            _owner.EndActivityToken(this);
+    }
+}
+
+/// <summary>
+/// Transient focus/target window highlight service.
+/// Tracks window-level activity tokens so a yellow target border appears only while
+/// Inbrisk is actively targeting/operating on a window, and deterministically disappears
+/// upon completion, failure, cancellation, timeout, exception, or session disconnect.
+/// </summary>
+public interface ITargetHighlightService : IDisposable
+{
+    IDisposable BeginWindowActivity(long hwnd, string? ownerId = null);
+    bool IsWindowHighlighted(long hwnd);
+    IReadOnlySet<long> GetHighlightedWindows();
+    void ClearAll();
+    void SetEmergency(bool stopped);
+    void OnSessionDisconnected(string ownerId);
+    void OnWindowDestroyed(long hwnd);
+    int ActiveTokenCount(long hwnd);
+}
+

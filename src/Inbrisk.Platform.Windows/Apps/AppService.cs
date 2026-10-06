@@ -24,7 +24,7 @@ namespace Inbrisk.Platform.Windows.Apps;
 /// requested signal — a real top-level window (UIA-reachable, not hung),
 /// a live process, or nothing. No fixed sleeps; bounded polling.
 /// </summary>
-public sealed class AppService : IAppService
+public sealed class AppService : IAppService, IDisposable
 {
     /// <summary>Interpreters a launch must never target — computer_launch is
     /// an app launcher, not a shell. Blocking here means arguments can never
@@ -47,8 +47,9 @@ public sealed class AppService : IAppService
     // test seams — production uses the real spawn/registry path
     internal Func<ResolvedApp, IReadOnlyList<string>?, int?>? Spawner;
     internal Func<IReadOnlyList<ResolvedApp>>? PackageEnumerator;
+    internal Func<int, bool>? ProcessAliveChecker;
 
-    internal sealed record ResolvedApp(LaunchMethod Method, string Identifier,
+    public sealed record ResolvedApp(LaunchMethod Method, string Identifier,
         string DisplayName, string[] ExeHints, int Score);
 
     private static readonly TimeSpan AppsCacheTtl = TimeSpan.FromMinutes(10);
@@ -61,23 +62,83 @@ public sealed class AppService : IAppService
     private DateTime _packagesCacheTime = DateTime.MinValue;
     private readonly object _packagesLock = new();
 
+    public static int CatalogFullScanCount;
+    public static int MemoryCacheHitCount;
+    public static int FilesystemEntriesScanned;
+    public static int ResolveCacheHitCount;
+    public static int NegativeCacheHitCount;
+
+    public static void ResetTelemetry()
+    {
+        CatalogFullScanCount = 0;
+        MemoryCacheHitCount = 0;
+        FilesystemEntriesScanned = 0;
+        ResolveCacheHitCount = 0;
+        NegativeCacheHitCount = 0;
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "inbrisk");
+            var file = Path.Combine(dir, "app-catalog.json");
+            if (File.Exists(file)) File.Delete(file);
+        }
+        catch { }
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (List<ResolvedApp> Apps, DateTime Timestamp)> _resolveCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly IEventWaiter? _eventBuffer;
+    public ScopedSubscriptionTelemetry Telemetry { get; }
+
+    private readonly ApplicationCatalogService _catalogService;
+    private readonly LaunchResolutionCache _launchCache;
+
+    public ApplicationCatalogService CatalogService => _catalogService;
+    public LaunchResolutionCache LaunchCache => _launchCache;
+    public ApplicationCatalogTelemetry CatalogTelemetry => _catalogService.Telemetry;
+
     public AppService(IWindowService windows, Func<long, bool>? uiaProbe = null,
-        Func<string, bool>? isDeniedProcess = null)
+        Func<string, bool>? isDeniedProcess = null,
+        IEventWaiter? eventBuffer = null,
+        ScopedSubscriptionTelemetry? telemetry = null,
+        ApplicationCatalogService? catalogService = null,
+        LaunchResolutionCache? launchCache = null,
+        string? storageDirectory = null,
+        Func<DateTimeOffset>? clock = null)
     {
         _windows = windows;
         _uiaProbe = uiaProbe;
         _isDeniedProcess = isDeniedProcess ?? (_ => false);
-        Task.Run(() =>
-        {
-            try { ListApps(); }
-            catch { }
-        });
+        _eventBuffer = eventBuffer;
+        Telemetry = telemetry ?? new ScopedSubscriptionTelemetry();
+
+        _catalogService = catalogService ?? new ApplicationCatalogService(
+            storageDirectory: storageDirectory,
+            clock: clock,
+            telemetry: new ApplicationCatalogTelemetry(),
+            enumerator: EnumerateAuthoritativeCatalog,
+            startMenuDirs: StartMenuDirs());
+
+        _launchCache = launchCache ?? new LaunchResolutionCache(
+            _catalogService,
+            storageDirectory: storageDirectory,
+            clock: clock,
+            telemetry: _catalogService.Telemetry);
+
     }
 
     internal void InvalidateCache()
     {
         lock (_appsLock) _cachedApps = null;
         lock (_packagesLock) _cachedPackages = null;
+        _resolveCache.Clear();
+        _catalogService.Invalidate();
+        _launchCache.InvalidateAll();
+    }
+
+    public void Dispose()
+    {
+        _catalogService.Dispose();
+        _launchCache.Dispose();
     }
 
     // ------------------------------------------------------------------
@@ -113,7 +174,6 @@ public sealed class AppService : IAppService
                 total);
         }
         ResolvedApp? chosen = null;
-        List<ResolvedApp>? candidates = null;
 
         if (resolved != null)
         {
@@ -133,21 +193,54 @@ public sealed class AppService : IAppService
             // ---- friendly name → existing instance first ----
             if (!spec.NewInstance && (!spec.DebugPort.HasValue || debugReady) &&
                 FindRunning(spec.App, null) is { } existing)
-                return Done(LaunchMethod.ExistingInstance, spec.App,
-                    existing.ProcessName, existing.Pid, existing.Hwnd,
-                    existing.Title, "AlreadyRunning", total, readyMs: 0);
+            {
+                var swProbe = Stopwatch.StartNew();
+                Telemetry.IncLaunchProbe();
+                bool isProbeReady = false;
+                try
+                {
+                    isProbeReady = _uiaProbe?.Invoke(existing.Hwnd) ?? true;
+                }
+                catch { }
+                swProbe.Stop();
+                long readyMs = Math.Max(1, swProbe.ElapsedMilliseconds);
+                Telemetry.SetLaunchReadyMs(readyMs);
 
-            candidates = ResolveAll(spec.App);
-            var best = PickBest(candidates, out var ambiguous);
-            if (ambiguous != null)
+                if (isProbeReady)
+                {
+                    return Done(LaunchMethod.ExistingInstance, spec.App,
+                        existing.ProcessName, existing.Pid, existing.Hwnd,
+                        existing.Title, "AlreadyRunning", total, readyMs: readyMs);
+                }
+                else
+                {
+                    return Fail("ProbeFailure", $"Existing window 0x{existing.Hwnd:X} failed UIA readiness probe", total,
+                        resolvedName: spec.App, pid: existing.Pid, state: "NotReady");
+                }
+            }
+
+            var (cachedBest, isAmbiguous, ambiguousCandidates) = _launchCache.GetOrResolve(
+                spec.App,
+                exactOnly: false,
+                newInstance: spec.NewInstance,
+                resolver: () =>
+                {
+                    var all = ResolveAll(spec.App);
+                    var picked = PickBest(all, out var ambig);
+                    return (picked, ambig != null, ambig);
+                },
+                arguments: spec.Arguments);
+
+            if (isAmbiguous && ambiguousCandidates != null)
                 return new LaunchResult(false, null, spec.App, null, null,
                     null, null, "Failed", total.ElapsedMilliseconds, 0,
                     "AmbiguousApplication",
                     $"'{spec.App}' matches several applications — refine " +
                     "(use executable:/path:/aumid: or a more specific name)",
-                    ambiguous.Select(c => new AppCandidate(c.DisplayName,
+                    ambiguousCandidates.Select(c => new AppCandidate(c.DisplayName,
                         c.Method, c.Identifier, c.Score)).ToList());
-            if (best == null)
+
+            if (cachedBest == null)
             {
                 // "open github.com" gets routed here constantly — a URL is
                 // not an app; point the model at the right tool instead of
@@ -166,7 +259,7 @@ public sealed class AppService : IAppService
                           "browser_browse{url} to open it in the browser"
                         : ""), total);
             }
-            chosen = best;
+            chosen = cachedBest;
         }
         else
         {
@@ -195,9 +288,31 @@ public sealed class AppService : IAppService
             chosen.Method != LaunchMethod.Protocol &&
             FindRunning(chosen.DisplayName, chosen.ExeHints,
                 titleMatch: spec.App != null) is { } running)
-            return Done(LaunchMethod.ExistingInstance, chosen.DisplayName,
-                running.ProcessName, running.Pid, running.Hwnd, running.Title,
-                "AlreadyRunning", total, readyMs: 0);
+        {
+            var swProbe = Stopwatch.StartNew();
+            Telemetry.IncLaunchProbe();
+            bool isProbeReady = false;
+            try
+            {
+                isProbeReady = _uiaProbe?.Invoke(running.Hwnd) ?? true;
+            }
+            catch { }
+            swProbe.Stop();
+            long readyMs = Math.Max(1, swProbe.ElapsedMilliseconds);
+            Telemetry.SetLaunchReadyMs(readyMs);
+
+            if (isProbeReady)
+            {
+                return Done(LaunchMethod.ExistingInstance, chosen.DisplayName,
+                    running.ProcessName, running.Pid, running.Hwnd, running.Title,
+                    "AlreadyRunning", total, readyMs: readyMs);
+            }
+            else
+            {
+                return Fail("ProbeFailure", $"Existing window 0x{running.Hwnd:X} failed UIA readiness probe", total,
+                    resolvedName: chosen.DisplayName, pid: running.Pid, state: "NotReady");
+            }
+        }
 
         // ---- spawn ----
         var spawnMs = total.ElapsedMilliseconds;
@@ -303,61 +418,87 @@ public sealed class AppService : IAppService
     /// also have a shortcut surface under the friendly name.</summary>
     public IReadOnlyList<AppInfo> ListApps()
     {
-        if (_cachedApps != null && (DateTime.UtcNow - _appsCacheTime) < AppsCacheTtl)
-            return _cachedApps;
+        var snapshot = _catalogService.GetSnapshot();
+        return snapshot.Apps;
+    }
 
-        lock (_appsLock)
+    internal (IReadOnlyList<AppInfo> Apps, IReadOnlyList<AppCatalogEntryDto> Entries, string? Fingerprint) EnumerateAuthoritativeCatalog()
+    {
+        Interlocked.Increment(ref CatalogFullScanCount);
+        var windir = Environment.GetFolderPath(
+            Environment.SpecialFolder.Windows);
+        var byName = new Dictionary<string, AppInfo>(
+            StringComparer.OrdinalIgnoreCase);
+        var entries = new List<AppCatalogEntryDto>();
+
+        void Add(string? name, LaunchMethod m, string launch, string kind, string identifier, string[] hints, int score, string? targetStem)
         {
-            if (_cachedApps != null && (DateTime.UtcNow - _appsCacheTime) < AppsCacheTtl)
-                return _cachedApps;
-
-            var windir = Environment.GetFolderPath(
-                Environment.SpecialFolder.Windows);
-            var byName = new Dictionary<string, AppInfo>(
-                StringComparer.OrdinalIgnoreCase);
-            void Add(string? name, LaunchMethod m, string launch, string kind)
+            if (string.IsNullOrWhiteSpace(name)) return;
+            byName.TryAdd(Norm(name), new(name, m, launch, kind));
+            entries.Add(new AppCatalogEntryDto
             {
-                if (string.IsNullOrWhiteSpace(name)) return;
-                byName.TryAdd(Norm(name), new(name, m, launch, kind));
-            }
-
-            foreach (var dir in StartMenuDirs())
-            foreach (var lnk in EnumerateLinks(dir))
-            {
-                var (isValid, _) = InspectLnk(lnk);
-                if (!isValid) continue;
-                var name = Path.GetFileNameWithoutExtension(lnk);
-                Add(name, LaunchMethod.StartMenu, $"app:\"{name}\"", "installed");
-            }
-            foreach (var (key, path) in AppPaths())
-                if (File.Exists(path))
-                    Add(Path.GetFileNameWithoutExtension(key), LaunchMethod.AppPath,
-                        $"executable:\"{key}\"",
-                        path.StartsWith(windir, StringComparison.OrdinalIgnoreCase)
-                            ? "system" : "installed");
-            foreach (var pkg in (PackageEnumerator ?? EnumeratePackages)())
-                Add(pkg.DisplayName, LaunchMethod.Aumid,
-                    $"aumid:\"{pkg.Identifier}\"",
-                    pkg.Identifier.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
-                    pkg.Identifier.StartsWith("Windows.", StringComparison.OrdinalIgnoreCase) ||
-                    // _cw5n1h2txyewy is Microsoft's publisher id — covers
-                    // GUID-named inbox PFNs (FilePicker & friends)
-                    pkg.Identifier.Contains("_cw5n1h2txyewy", StringComparison.OrdinalIgnoreCase)
-                        ? "system" : "installed");
-
-            var list = byName.Values
-                .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase).ToList();
-            _cachedApps = list;
-            _appsCacheTime = DateTime.UtcNow;
-            return list;
+                Name = name,
+                Method = m,
+                Launch = launch,
+                Kind = kind,
+                Identifier = identifier,
+                ExeHints = hints,
+                Score = score,
+                TargetStem = targetStem
+            });
         }
+
+        foreach (var dir in StartMenuDirs())
+        foreach (var lnk in EnumerateLinks(dir))
+        {
+            var (isValid, stem) = InspectLnk(lnk);
+            if (!isValid) continue;
+            var name = Path.GetFileNameWithoutExtension(lnk);
+            var hints = stem != null ? new[] { name, stem } : new[] { name };
+            Add(name, LaunchMethod.StartMenu, $"app:\"{name}\"", "installed", lnk, hints, 100, stem);
+        }
+        foreach (var (key, path) in AppPaths())
+            if (File.Exists(path))
+            {
+                var name = Path.GetFileNameWithoutExtension(key);
+                Add(name, LaunchMethod.AppPath,
+                    $"executable:\"{key}\"",
+                    path.StartsWith(windir, StringComparison.OrdinalIgnoreCase)
+                        ? "system" : "installed",
+                    path, [name], 100, null);
+            }
+        foreach (var pkg in (PackageEnumerator ?? EnumeratePackages)())
+            Add(pkg.DisplayName, LaunchMethod.Aumid,
+                $"aumid:\"{pkg.Identifier}\"",
+                pkg.Identifier.StartsWith("Microsoft.", StringComparison.OrdinalIgnoreCase) ||
+                pkg.Identifier.StartsWith("Windows.", StringComparison.OrdinalIgnoreCase) ||
+                pkg.Identifier.Contains("_cw5n1h2txyewy", StringComparison.OrdinalIgnoreCase)
+                    ? "system" : "installed",
+                pkg.Identifier, pkg.ExeHints, 100, null);
+
+        var list = byName.Values
+            .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase).ToList();
+        return (list, entries, null);
     }
 
     /// <summary>Every resolution mechanism for a friendly name, scored.</summary>
     internal List<ResolvedApp> ResolveAll(string app)
     {
-        var found = new List<ResolvedApp>();
         var norm = Norm(app);
+        if (_resolveCache.TryGetValue(norm, out var cached))
+        {
+            var ttl = cached.Apps.Count > 0 ? AppsCacheTtl : TimeSpan.FromSeconds(20);
+            if ((DateTime.UtcNow - cached.Timestamp) < ttl)
+            {
+                if (cached.Apps.Count == 0)
+                    Interlocked.Increment(ref NegativeCacheHitCount);
+                else
+                    Interlocked.Increment(ref ResolveCacheHitCount);
+                return cached.Apps;
+            }
+        }
+
+        var found = new List<ResolvedApp>();
 
         // Start Menu shortcuts — filename carries the display name.
         // The shortcut's TARGET exe joins ExeHints: "File Explorer.lnk"
@@ -436,6 +577,7 @@ public sealed class AppService : IAppService
                     Path.GetFileNameWithoutExtension(exe),
                     [Path.GetFileNameWithoutExtension(exe)], 25));
 
+        _resolveCache[norm] = (found, DateTime.UtcNow);
         return found;
     }
 
@@ -661,7 +803,11 @@ public sealed class AppService : IAppService
         try { files = Directory.EnumerateFiles(dir, "*.lnk",
             SearchOption.AllDirectories); }
         catch { yield break; }
-        foreach (var f in files) yield return f;
+        foreach (var f in files)
+        {
+            Interlocked.Increment(ref FilesystemEntriesScanned);
+            yield return f;
+        }
     }
 
     internal static IEnumerable<(string Key, string Path)> AppPaths()
@@ -1030,6 +1176,10 @@ public sealed class AppService : IAppService
             : null;
 
         WindowInfo? lastSeenWin = null;
+        var baselineGen = _eventBuffer?.CurrentGeneration ?? 0;
+        var startTicks = Stopwatch.GetTimestamp();
+        long timeToFirstWinMs = 0;
+
         while (total.ElapsedMilliseconds < deadline)
         {
             ct.ThrowIfCancellationRequested();
@@ -1039,20 +1189,76 @@ public sealed class AppService : IAppService
                     ProcessByName(hints, spawnedName))
                     return (null, null, "ProcessStarted", spawnedPid,
                         null, null, null);
+                ct.WaitHandle.WaitOne(Math.Min(150, (int)Math.Max(1, deadline - total.ElapsedMilliseconds)));
+                continue;
+            }
+
+            // Early detection: process exited before becoming ready
+            if (spawnedPid.HasValue && !ProcessAlive(spawnedPid) && !ProcessByName(hints, spawnedName))
+            {
+                return ("Failed",
+                    $"process {spawnedPid.Value} exited before becoming ready",
+                    "Failed", spawnedPid, null, null, null);
+            }
+
+            bool eventWoke = false;
+            if (_eventBuffer != null)
+            {
+                var remaining = (int)Math.Max(1, Math.Min(150, deadline - total.ElapsedMilliseconds));
+                if (_eventBuffer.WaitForNextEvent(baselineGen, remaining, ct))
+                {
+                    baselineGen = _eventBuffer.CurrentGeneration;
+                    var recents = _eventBuffer.Snapshot(5);
+                    if (recents.Any(e => e.Kind is EventKind.WindowOpened or EventKind.WindowShown or EventKind.ForegroundChanged))
+                    {
+                        eventWoke = true;
+                        Telemetry.IncLaunchEventWake();
+                    }
+                }
             }
             else
             {
-                var win = MatchWindow(spawnedPid, hints, spawnedName,
-                    app.DisplayName, requestedName);
-                if (win != null)
+                ct.WaitHandle.WaitOne(Math.Min(150, (int)Math.Max(1, deadline - total.ElapsedMilliseconds)));
+            }
+
+            if (!eventWoke)
+            {
+                Telemetry.IncLaunchFallbackPoll();
+            }
+
+            var win = MatchWindow(spawnedPid, hints, spawnedName,
+                app.DisplayName, requestedName);
+            if (win != null)
+            {
+                Telemetry.IncLaunchCandidate();
+                if (timeToFirstWinMs == 0)
+                {
+                    timeToFirstWinMs = (long)((Stopwatch.GetTimestamp() - startTicks) * 1000.0 / Stopwatch.Frequency);
+                    Telemetry.SetLaunchTimeToFirstWindowMs(timeToFirstWinMs);
+                }
+
+                if (IsSplashOrHelperWindow(win))
+                {
+                    Telemetry.IncLaunchCandidateRejected();
+                }
+                else
                 {
                     lastSeenWin = win;
-                    if (!IsHung(win.Hwnd) && (_uiaProbe?.Invoke(win.Hwnd) ?? true))
+                    Telemetry.IncLaunchProbe();
+                    var probeOk = false;
+                    try { probeOk = _uiaProbe?.Invoke(win.Hwnd) ?? true; } catch { }
+                    if (!IsHung(win.Hwnd) && probeOk)
+                    {
+                        var readyMs = (long)((Stopwatch.GetTimestamp() - startTicks) * 1000.0 / Stopwatch.Frequency);
+                        Telemetry.SetLaunchReadyMs(readyMs);
+                        if (eventWoke) Telemetry.IncLaunchEventPath();
+                        else Telemetry.IncLaunchFallbackPath();
+
                         return (null, null, "Ready", win.Pid, win.Hwnd, win.Title,
                             win.ProcessName);
+                    }
                 }
             }
-            ct.WaitHandle.WaitOne(150);
         }
 
         // If a matching top-level window was observed at any point during wait,
@@ -1091,6 +1297,16 @@ public sealed class AppService : IAppService
             $"{(readiness == LaunchReadiness.Window ? "usable window" : "process")} " +
             $"within {timeoutMs}ms — windows: {string.Join(" | ", seen)}",
             "TimedOut", spawnedPid, null, null, null);
+    }
+
+    private static bool IsSplashOrHelperWindow(WindowInfo win)
+    {
+        var t = win.Title?.ToLowerInvariant() ?? "";
+        if (t.Contains("splash") || t.Contains("loading...") || t.Contains("initializing"))
+            return true;
+        if (win.Bounds.Width <= 10 && win.Bounds.Height <= 10)
+            return true;
+        return false;
     }
 
     private WindowInfo? MatchWindow(int? pid, List<string> hints,
@@ -1152,15 +1368,18 @@ public sealed class AppService : IAppService
             .ThenBy(w => w.Hwnd)
             .FirstOrDefault();
 
-    private static bool ProcessAlive(int? pid)
+    private bool ProcessAlive(int? pid)
     {
         if (pid is not { } p) return false;
+        if (ProcessAliveChecker != null) return ProcessAliveChecker(p);
+        if (Spawner != null) return true;
         try { return !Process.GetProcessById(p).HasExited; }
         catch { return false; }
     }
 
-    private static bool ProcessByName(List<string> hints, string? spawnedName)
+    private bool ProcessByName(List<string> hints, string? spawnedName)
     {
+        if (ProcessAliveChecker != null) return false;
         try
         {
             foreach (var p in Process.GetProcesses())

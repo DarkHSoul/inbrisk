@@ -24,6 +24,12 @@ public interface IWindowService
     IReadOnlyList<WindowInfo> FindSystemDialogs();
     /// <summary>Determines if a window belongs to the host environment, terminal, IDE, or critical session.</summary>
     bool IsWindowProtected(long hwnd, out string? reason);
+    /// <summary>Optional synthetic modal popups for headless testing.</summary>
+    Dictionary<long, WindowInfo>? SyntheticModalPopups => null;
+    /// <summary>Optional synthetic foreground HWND for headless testing.</summary>
+    long? SyntheticForegroundHwnd { get => null; set { } }
+    /// <summary>Optional close window interceptor for headless testing.</summary>
+    Func<long, bool>? OnCloseWindow { get => null; set { } }
 }
 
 public interface IIntegrityService
@@ -56,20 +62,42 @@ public interface IElementBackend
 {
     BackendId Id { get; }
     IReadOnlyList<UiElement> Inspect(long hwnd, InspectOptions options, CancellationToken ct = default);
+    Task<IReadOnlyList<UiElement>> InspectAsync(long hwnd, InspectOptions options, CancellationToken ct = default) =>
+        Task.FromResult(Inspect(hwnd, options, ct));
+
     IReadOnlyList<UiElement> Find(FindSpec spec, CancellationToken ct = default);
+    Task<IReadOnlyList<UiElement>> FindAsync(FindSpec spec, CancellationToken ct = default) =>
+        Task.FromResult(Find(spec, ct));
+
     /// <summary>Try a native semantic action. Returns null if the backend
     /// cannot perform this kind of action on this element.</summary>
     ActionResult? PerformNative(UiElement element, ActionIntent intent, CancellationToken ct = default);
+    Task<ActionResult?> PerformNativeAsync(UiElement element, ActionIntent intent, CancellationToken ct = default) =>
+        Task.FromResult(PerformNative(element, intent, ct));
+
     /// <summary>Re-resolve a stale element via its recipe.</summary>
     UiElement? ReResolve(ElementHandle handle, CancellationToken ct = default);
+    Task<UiElement?> ReResolveAsync(ElementHandle handle, CancellationToken ct = default) =>
+        Task.FromResult(ReResolve(handle, ct));
+
     /// <summary>Is the underlying backend object still usable?</summary>
     bool IsAlive(UiElement element);
+
+    /// <summary>Probe whether a specific semantic action/pattern is supported on an element.</summary>
+    PatternSupportState ProbePattern(UiElement element, string action) => PatternSupportState.Unknown;
 }
 
 public interface IEventSource : IDisposable
 {
     event Action<ObservedEvent>? Event;
     void Start();
+}
+
+public interface IEventWaiter
+{
+    long CurrentGeneration { get; }
+    bool WaitForNextEvent(long baselineGeneration, int timeoutMs, CancellationToken ct = default);
+    IReadOnlyList<ObservedEvent> Snapshot(int max);
 }
 
 public interface IInputService

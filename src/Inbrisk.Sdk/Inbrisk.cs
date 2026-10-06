@@ -25,7 +25,13 @@ public sealed record InbriskOptions(
     /// bridges rapid consecutive operations into one session.</summary>
     int IndicatorIdleGraceMs = 700,
     /// <summary>Indicator colors; null = read settings.json, then defaults.</summary>
-    GlowPalette? IndicatorPalette = null);
+    GlowPalette? IndicatorPalette = null,
+    HwndMetadataCache? HwndMetadataCache = null,
+    MonitorTopologyCache? MonitorTopologyCache = null,
+    VirtualDesktopManagerHolder? VdmHolder = null,
+    ApplicationCatalogService? CatalogService = null,
+    LaunchResolutionCache? LaunchCache = null,
+    ITargetHighlightService? TargetHighlight = null);
 
 /// <summary>
 /// The Unified Computer API. Composition root: wires platform services into
@@ -35,6 +41,7 @@ public sealed record InbriskOptions(
 public sealed class InbriskRuntime : IDisposable
 {
     private readonly UiaDispatcher _uiaDispatch;
+    private readonly UiaReadScheduler _uiaReadScheduler;
     private readonly WindowService _windows;
     private readonly IntegrityService _integrity;
     private readonly SendInputService _input;
@@ -52,17 +59,23 @@ public sealed class InbriskRuntime : IDisposable
     private readonly ComputerControlActivityService _activity;
     private readonly ScreenIndicatorService _indicator;
     private readonly ActivityHudService _hud;
+    private readonly ITargetHighlightService _targetHighlight;
     private readonly IProcessProvenanceService _provenance;
     private readonly AppService _apps;
+    private readonly UiaEventSubscriptionManager _subscriptionManager;
     private readonly List<ChangeMonitor> _monitors = new();
     private readonly RecentEventBuffer _eventBuffer = new();
     private readonly IElementBackend[] _agentBackends;
+
+    public UiaEventSubscriptionManager SubscriptionManager => _subscriptionManager;
     private ObservationBuilder? _obsBuilder;
     private IVisionBackend? _vision;
     private IGroundingBackend? _grounding;
 
     public SafetyPolicy Policy => _policy;
     public IProcessProvenanceService Provenance => _provenance;
+    public UiaReadScheduler ReadScheduler => _uiaReadScheduler;
+    public RecentEventBuffer EventBuffer => _eventBuffer;
 
     /// <summary>Computer-control activity for the screen indicator —
     /// BeginActivity marks the machine as actively used.</summary>
@@ -71,6 +84,8 @@ public sealed class InbriskRuntime : IDisposable
     public ScreenIndicatorService Indicator => _indicator;
     /// <summary>The floating activity pill HUD overlay.</summary>
     public ActivityHudService Hud => _hud;
+    /// <summary>Transient focus/target window highlight service.</summary>
+    public ITargetHighlightService TargetHighlight => _targetHighlight;
 
     public event Action<ObservedEvent>? Event
     {
@@ -88,7 +103,8 @@ public sealed class InbriskRuntime : IDisposable
         _policy.AutoConfirm = opt.AutoConfirm;
 
         _uiaDispatch = new UiaDispatcher();
-        _windows = new WindowService();
+        _uiaReadScheduler = new UiaReadScheduler();
+        _windows = new WindowService(opt.HwndMetadataCache, opt.MonitorTopologyCache, opt.VdmHolder);
         _provenance = new ProcessProvenanceService(_windows);
         try
         {
@@ -101,7 +117,7 @@ public sealed class InbriskRuntime : IDisposable
         _capture = new CaptureService(_windows);
         _clipboard = new ClipboardService();
         _ocr = new OcrService();
-        _uiaBackend = new UiaBackend(_uiaDispatch, _windows);
+        _uiaBackend = new UiaBackend(_uiaDispatch, _windows, _uiaReadScheduler);
         _events = new CoalescingEventSource(new CompositeEventSource(
             new WinEventService(),
             new UiaEventService(_uiaDispatch)));
@@ -129,16 +145,32 @@ public sealed class InbriskRuntime : IDisposable
             is "0" or "off" or "false" or "disabled";
         _hud = new ActivityHudService(
             enabled: opt.Hud && userSettings.HudEnabled && !hudOff,
-            animationsEnabled: userSettings.AnimationsEnabled);
+            animationsEnabled: userSettings.AnimationsEnabled,
+            hudDockGapDip: userSettings.HudDockGapDip);
 
         _activity.StateChanged += state =>
         {
             _indicator.SetState(state);
             HudActivityPolicy.Apply(_hud, state);
+            if (state == IndicatorState.EmergencyStopped)
+                _targetHighlight.SetEmergency(true);
+            else
+                _targetHighlight.SetEmergency(false);
         };
+
+        _targetHighlight = opt.TargetHighlight ?? new TargetHighlightService();
 
         _indicator.Start();
         _hud.Start();
+
+        // Phase F Round 2: Scoped UIA Subscription Manager
+        _subscriptionManager = new UiaEventSubscriptionManager(_uiaDispatch, getGeneration: () => _eventBuffer.CurrentGeneration);
+        _subscriptionManager.Event += e =>
+        {
+            _eventBuffer.Add(e);
+            if (e is { Kind: EventKind.WindowClosed, Hwnd: { } h })
+                _registry.InvalidateWindow(h);
+        };
 
         // Readiness probe: a window counts as usable only when its UIA
         // root is reachable — runs on the dedicated UIA dispatcher.
@@ -153,11 +185,15 @@ public sealed class InbriskRuntime : IDisposable
                 }
                 catch { return false; }
             }, timeoutMs: 2000),
-            isDeniedProcess: name => _policy.DenyProcessNames.Contains(name));
+            isDeniedProcess: name => _policy.DenyProcessNames.Contains(name),
+            eventBuffer: _eventBuffer,
+            telemetry: _subscriptionManager.Telemetry,
+            catalogService: opt.CatalogService,
+            launchCache: opt.LaunchCache);
 
         _executor = new Executor(_windows, _integrity, _input, _capture,
             _agentBackends, _registry, _policy, _telemetry, _activity);
-        _wait = new WaitService(s => Find(s), _capture, _events, _registry, _windows);
+        _wait = new WaitService(s => Find(s), _capture, _events, _registry, _windows, _subscriptionManager);
 
         _events.Event += e =>
         {
@@ -277,6 +313,20 @@ public sealed class InbriskRuntime : IDisposable
     /// event has not been delivered yet.</summary>
     public long MutationVersion => _executor.MutationVersion;
 
+    public bool IsInspectCacheFresh(long hwnd, InspectOptions? options = null)
+    {
+        var opt = options ?? new InspectOptions();
+        var now = DateTimeOffset.UtcNow;
+        return _inspectCache.TryGetValue(hwnd, out var hit) &&
+            hit.Opt == opt &&
+            hit.Ver == MutationVersion &&
+            (now - hit.At).TotalMilliseconds < 5000 &&
+            !_eventBuffer.Snapshot(100).Any(e => e.At >= hit.At &&
+                (e.Hwnd == hwnd ||
+                 (e.Pid is { } ep && hit.Pids.Contains(ep)) ||
+                 (hit.Pids.Count == 0 && (e.Hwnd is null or 0 && e.Pid == null))));
+    }
+
     public IReadOnlyList<UiElement> Inspect(long hwnd, InspectOptions? options = null)
     {
         using var _ = _activity.BeginActivity();
@@ -285,16 +335,43 @@ public sealed class InbriskRuntime : IDisposable
         if (_inspectCache.TryGetValue(hwnd, out var hit) &&
             hit.Opt == opt &&
             hit.Ver == MutationVersion &&
-            (now - hit.At).TotalMilliseconds < 400 &&
+            (now - hit.At).TotalMilliseconds < 5000 &&
             !_eventBuffer.Snapshot(100).Any(e => e.At >= hit.At &&
                 (e.Hwnd == hwnd ||
                  (e.Pid is { } ep && hit.Pids.Contains(ep)) ||
-                 (e.Hwnd is null or 0 && e.Pid == null))))
+                 (hit.Pids.Count == 0 && (e.Hwnd is null or 0 && e.Pid == null)))))
         {
             PerfTrace.Count("inspect.cacheHit");
             return hit.Els;
         }
         var els = _uiaBackend.Inspect(hwnd, opt);
+        _registry.Register(els);
+        var pids = new HashSet<int>(els.Select(e => e.Pid ?? 0));
+        _inspectCache[hwnd] = (els, opt, DateTimeOffset.UtcNow, pids,
+            MutationVersion);
+        if (_inspectCache.Count > 16) _inspectCache.Clear();
+        PerfTrace.Count("inspect.cacheMiss");
+        return els;
+    }
+
+    public async Task<IReadOnlyList<UiElement>> InspectAsync(long hwnd, InspectOptions? options = null, CancellationToken ct = default)
+    {
+        using var _ = _activity.BeginActivity();
+        var opt = options ?? new InspectOptions();
+        var now = DateTimeOffset.UtcNow;
+        if (_inspectCache.TryGetValue(hwnd, out var hit) &&
+            hit.Opt == opt &&
+            hit.Ver == MutationVersion &&
+            (now - hit.At).TotalMilliseconds < 5000 &&
+            !_eventBuffer.Snapshot(100).Any(e => e.At >= hit.At &&
+                (e.Hwnd == hwnd ||
+                 (e.Pid is { } ep && hit.Pids.Contains(ep)) ||
+                 (hit.Pids.Count == 0 && (e.Hwnd is null or 0 && e.Pid == null)))))
+        {
+            PerfTrace.Count("inspect.cacheHit");
+            return hit.Els;
+        }
+        var els = await _uiaBackend.InspectAsync(hwnd, opt, ct).ConfigureAwait(false);
         _registry.Register(els);
         var pids = new HashSet<int>(els.Select(e => e.Pid ?? 0));
         _inspectCache[hwnd] = (els, opt, DateTimeOffset.UtcNow, pids,
@@ -311,6 +388,14 @@ public sealed class InbriskRuntime : IDisposable
     {
         using var _ = _activity.BeginActivity();
         var els = _executor.Find(spec, ct);
+        _registry.Register(els);
+        return els;
+    }
+
+    public async Task<IReadOnlyList<UiElement>> FindAsync(FindSpec spec, CancellationToken ct = default)
+    {
+        using var _ = _activity.BeginActivity();
+        var els = await _executor.FindAsync(spec, ct).ConfigureAwait(false);
         _registry.Register(els);
         return els;
     }
@@ -332,6 +417,21 @@ public sealed class InbriskRuntime : IDisposable
             Array.Empty<ObservedEvent>(), DateTimeOffset.Now);
     }
 
+    public async Task<Observation> ObserveAsync(long? hwnd = null, bool includeShot = false, CancellationToken ct = default)
+    {
+        var windows = _windows.ListWindows();
+        var fg = _windows.GetForegroundWindow();
+        var target = hwnd ?? fg?.Hwnd;
+        var elements = target is { } t
+            ? await InspectAsync(t, new InspectOptions(), ct).ConfigureAwait(false)
+            : (IReadOnlyList<UiElement>)Array.Empty<UiElement>();
+        FrameTransform? ft = null;
+        if (includeShot && target is { } tt)
+            ft = _capture.CaptureWindow(tt).Transform;
+        return new Observation(fg, windows, elements, ft,
+            Array.Empty<ObservedEvent>(), DateTimeOffset.Now);
+    }
+
     /// <summary>
     /// Merged scene: UIA elements + OCR text + vision elements, deduplicated.
     /// Vision/OCR results are mapped to desktop space via the capture
@@ -342,11 +442,74 @@ public sealed class InbriskRuntime : IDisposable
     {
         using var _ = _activity.BeginActivity();
         IReadOnlyList<UiElement> uia;
-        using (PerfTrace.Stage("observe.uia"))
-            uia = Inspect(hwnd);
-        RawFrame? frame = includeOcr || _vision != null || _grounding != null
-            ? CaptureRawTimed(hwnd)
-            : null;
+        RawFrame? frame = null;
+
+        if (includeOcr || _vision != null || _grounding != null)
+        {
+            var uiaTask = Task.Run(() =>
+            {
+                using (PerfTrace.Stage("observe.uia"))
+                    return Inspect(hwnd);
+            });
+            var frameTask = Task.Run(() => CaptureRawTimed(hwnd));
+            Task.WaitAll(uiaTask, frameTask);
+            uia = uiaTask.Result;
+            frame = frameTask.Result;
+        }
+        else
+        {
+            using (PerfTrace.Stage("observe.uia"))
+                uia = Inspect(hwnd);
+        }
+
+        IReadOnlyList<TextSpan> ocr;
+        using (PerfTrace.Stage("observe.ocr"))
+            ocr = includeOcr && frame != null
+                ? _ocr.Recognize(frame)
+                : (IReadOnlyList<TextSpan>)Array.Empty<TextSpan>();
+
+        var vision = new List<UiElement>();
+        if (_vision != null && frame != null)
+        {
+            using (PerfTrace.Stage("observe.vision"))
+            {
+                var vr = _vision.Analyze(frame, visionQuery ?? new VisionQuery());
+                _telemetry?.EmitPipeline(new PipelineTelemetry(DateTimeOffset.Now,
+                    "vision", Backend: vr.BackendName, DurationMs: vr.Duration.TotalMilliseconds,
+                    ElementCount: vr.Elements.Count));
+                foreach (var ve in vr.Elements)
+                    vision.Add(GroundingService.ToDesktop(ve, frame.Transform));
+            }
+        }
+
+        using (PerfTrace.Stage("observe.merge"))
+        {
+            var merged = SceneMerger.Merge(uia, ocr, vision);
+            _registry.Register(merged);
+            return merged;
+        }
+    }
+
+    public async Task<IReadOnlyList<UiElement>> ObserveSceneAsync(long hwnd,
+        bool includeOcr = true, VisionQuery? visionQuery = null, CancellationToken ct = default)
+    {
+        using var _ = _activity.BeginActivity();
+        IReadOnlyList<UiElement> uia;
+        RawFrame? frame = null;
+
+        if (includeOcr || _vision != null || _grounding != null)
+        {
+            var uiaTask = InspectAsync(hwnd, ct: ct);
+            var frameTask = Task.Run(() => CaptureRawTimed(hwnd), ct);
+            await Task.WhenAll(uiaTask, frameTask).ConfigureAwait(false);
+            uia = await uiaTask.ConfigureAwait(false);
+            frame = await frameTask.ConfigureAwait(false);
+        }
+        else
+        {
+            using (PerfTrace.Stage("observe.uia"))
+                uia = await InspectAsync(hwnd, ct: ct).ConfigureAwait(false);
+        }
 
         IReadOnlyList<TextSpan> ocr;
         using (PerfTrace.Stage("observe.ocr"))
@@ -629,10 +792,14 @@ public sealed class InbriskRuntime : IDisposable
         }
         try { _input.ReleaseAll(); } catch { }
         _activity.SetConnected(false);
+        _targetHighlight.Dispose();
         _hud.Dispose();
         _indicator.Dispose();
         _events.Dispose();
+        _subscriptionManager.Dispose();
+        _uiaReadScheduler.Dispose();
         _uiaDispatch.Dispose();
+        _apps.Dispose();
         _telemetry?.Dispose();
         _activity.Dispose();
     }

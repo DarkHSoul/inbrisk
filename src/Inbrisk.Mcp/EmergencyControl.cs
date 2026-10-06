@@ -8,6 +8,65 @@ namespace Inbrisk.Mcp;
 public enum ComputerControlState { Active, Paused, EmergencyStopped }
 public enum HumanInterventionMode { Off, PauseOnKeyboard, PauseOnMouse, PauseOnAnyInput }
 
+public interface IEmergencyHotkeyRegistrar : IDisposable
+{
+    bool PanicAvailable { get; }
+    bool ResumeAvailable { get; }
+    HotkeyChord? Resume { get; }
+    void Start(string panicHotkey, string resumeHotkey, Action onPanic, Action onResume, Action<string>? log = null);
+    void TryReacquire(string panicHotkey, string resumeHotkey, Action onPanic, Action onResume, Action<string>? log = null);
+}
+
+public sealed class RealEmergencyHotkeyRegistrar : IEmergencyHotkeyRegistrar
+{
+    private GlobalHotkeyService? _service;
+
+    public bool PanicAvailable => _service?.PanicAvailable == true;
+    public bool ResumeAvailable => _service?.ResumeAvailable == true;
+    public HotkeyChord? Resume => _service?.Resume;
+
+    public void Start(string panicHotkey, string resumeHotkey, Action onPanic, Action onResume, Action<string>? log = null)
+    {
+        _service = new GlobalHotkeyService(panicHotkey, resumeHotkey, onPanic, onResume, log ?? (_ => { }));
+        _service.Start();
+    }
+
+    public void TryReacquire(string panicHotkey, string resumeHotkey, Action onPanic, Action onResume, Action<string>? log = null)
+    {
+        var svc = new GlobalHotkeyService(panicHotkey, resumeHotkey, onPanic, onResume, log ?? (_ => { }));
+        svc.Start();
+        var old = _service;
+        _service = svc;
+        try { old?.Dispose(); } catch { }
+    }
+
+    public void Dispose()
+    {
+        _service?.Dispose();
+    }
+}
+
+public sealed class FakeEmergencyHotkeyRegistrar : IEmergencyHotkeyRegistrar
+{
+    public bool PanicAvailable { get; set; } = true;
+    public bool ResumeAvailable { get; set; } = true;
+    public HotkeyChord? Resume { get; set; }
+    public bool StartCalled { get; private set; }
+
+    public void Start(string panicHotkey, string resumeHotkey, Action onPanic, Action onResume, Action<string>? log = null)
+    {
+        StartCalled = true;
+        try { Resume = HotkeyChord.Parse(resumeHotkey); } catch { }
+    }
+
+    public void TryReacquire(string panicHotkey, string resumeHotkey, Action onPanic, Action onResume, Action<string>? log = null)
+    {
+        StartCalled = true;
+    }
+
+    public void Dispose() { }
+}
+
 /// <summary>
 /// Process-wide emergency control. One process per machine owns the panic
 /// hotkey (the "authority"); every other Inbrisk process delegates to it via
@@ -17,7 +76,10 @@ public enum HumanInterventionMode { Off, PauseOnKeyboard, PauseOnMouse, PauseOnA
 /// </summary>
 public sealed class EmergencyControl : IDisposable
 {
-    public static EmergencyControl Process { get; } = new();
+    public static EmergencyControl Process { get; internal set; } = new();
+
+    /// <summary>Testing factory: provides an Active control instance without binding global OS hotkeys.</summary>
+    public static EmergencyControl ForTests(IEmergencyHotkeyRegistrar? registrar = null) => new(registrar ?? new FakeEmergencyHotkeyRegistrar(), testActive: true);
 
     // scoped by chord + marker path: two processes delegate to each other
     // only when they share the exact same emergency configuration — a peer
@@ -28,13 +90,30 @@ public sealed class EmergencyControl : IDisposable
     private readonly object _gate = new();
     private readonly HashSet<IInputService> _inputs = new();
     private CancellationTokenSource _epoch = new();
-    private GlobalHotkeyService? _hotkeys;
+    private readonly IEmergencyHotkeyRegistrar _registrar;
     private Mutex? _ownerMutex;
     private Timer? _markerWatch;
     private ComputerControlState _state = ComputerControlState.EmergencyStopped;
     private bool _stoppedByPanic;
     private bool _peerAuthority;   // another inbrisk process owns the hotkey
     private bool _disposed;
+    private readonly bool _testMode;
+    private bool _hotkeysStarted;
+
+    public EmergencyControl() : this(new RealEmergencyHotkeyRegistrar(), testActive: false)
+    {
+    }
+
+    internal EmergencyControl(IEmergencyHotkeyRegistrar registrar, bool testActive = false)
+    {
+        _registrar = registrar;
+        if (testActive)
+        {
+            _state = ComputerControlState.Active;
+            _testMode = true;
+        }
+    }
+
     private readonly string _telemetryPath = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "inbrisk", "mcp-emergency.jsonl");
@@ -44,8 +123,8 @@ public sealed class EmergencyControl : IDisposable
 
     public string PanicHotkey { get; private set; } = "Ctrl+Alt+Pause";
     public string ResumeHotkey { get; private set; } = "Ctrl+Alt+Shift+Pause";
-    public bool PanicAvailable => _hotkeys?.PanicAvailable == true;
-    public bool ResumeAvailable => _hotkeys?.ResumeAvailable == true;
+    public bool PanicAvailable => _registrar.PanicAvailable;
+    public bool ResumeAvailable => _registrar.ResumeAvailable;
     /// <summary>Panic coverage exists but is owned by a peer process.</summary>
     public bool PanicDelegated { get { lock (_gate) return _peerAuthority; } }
     public ComputerControlState State { get { lock (_gate) return _state; } }
@@ -63,20 +142,20 @@ public sealed class EmergencyControl : IDisposable
 
     public void StartHotkeys(string? panic = null, string? resume = null)
     {
-        if (_hotkeys != null) return;
+        if (_hotkeysStarted) return;
+        _hotkeysStarted = true;
         PanicHotkey = panic ?? "Ctrl+Alt+Pause";
         ResumeHotkey = resume ?? "Ctrl+Alt+Shift+Pause";
         try
         {
-            _hotkeys = new GlobalHotkeyService(PanicHotkey, ResumeHotkey,
+            _registrar.Start(PanicHotkey, ResumeHotkey,
                 () => ApplyStop("panic hotkey"), () => ApplyResume("local resume hotkey"), Log);
-            _hotkeys.Start();
 
             // Authority: whoever holds the panic chord. If our registration
             // failed, check whether a peer already owns it — if so, panic
             // still works (they write the marker, we watch it). If the chord
             // is held by a foreign app, no authority exists → stay stopped.
-            if (_hotkeys.PanicAvailable)
+            if (_registrar.PanicAvailable)
                 BecomeAuthority();
             else
                 lock (_gate) _peerAuthority = DetectPeerAuthority();
@@ -85,13 +164,13 @@ public sealed class EmergencyControl : IDisposable
             lock (_gate)
             {
                 _stoppedByPanic = stoppedMarker;
-                if ((PanicAvailable || _peerAuthority) && !stoppedMarker)
+                if ((_registrar.PanicAvailable || _peerAuthority || _testMode) && !stoppedMarker)
                     _state = ComputerControlState.Active;
             }
             FireStateChanged();
             if (stoppedMarker)
                 Log("Emergency stop marker restored — control remains stopped");
-            if (!PanicAvailable)
+            if (!_registrar.PanicAvailable && !_testMode)
                 Log(_peerAuthority
                     ? $"Panic hotkey {PanicHotkey} owned by peer Inbrisk process — delegated via stop marker"
                     : $"Emergency hotkey unavailable: {PanicHotkey}; computer control remains disabled " +
@@ -118,8 +197,11 @@ public sealed class EmergencyControl : IDisposable
     {
         lock (_gate)
         {
-            if (_state != ComputerControlState.Active ||
-                !(PanicAvailable || _peerAuthority))
+            if (_state != ComputerControlState.Active)
+                return null;
+            if (_testMode)
+                return _epoch.Token;
+            if (!(_registrar.PanicAvailable || _peerAuthority))
                 return null;
             // belt-and-suspenders: marker may have appeared between watcher ticks
             if (File.Exists(StopMarkerPath)) return null;
@@ -130,7 +212,7 @@ public sealed class EmergencyControl : IDisposable
     public bool IsLocalResumeKey(string? key, IReadOnlyList<string>? modifiers)
     {
         if (key == null) return false;
-        var resume = _hotkeys?.Resume;
+        var resume = _registrar.Resume;
         if (resume == null) return false;
         try
         {
@@ -210,29 +292,20 @@ public sealed class EmergencyControl : IDisposable
     /// unavailable at startup. Runs on the marker-watch timer thread.</summary>
     private void TryReacquireAuthority()
     {
-        GlobalHotkeyService? svc = null;
+        if (_testMode) return;
         try
         {
-            svc = new GlobalHotkeyService(PanicHotkey, ResumeHotkey,
+            _registrar.TryReacquire(PanicHotkey, ResumeHotkey,
                 () => ApplyStop("panic hotkey"),
                 () => ApplyResume("local resume hotkey"), Log);
-            svc.Start();
         }
         catch { /* construction/start failure → stay stopped, retry next tick */ }
-        if (svc == null) return;
 
         lock (_gate)
         {
-            if (_disposed || _stoppedByPanic)
-            {
-                // raced with a real panic — abandon the new service
-                try { svc.Dispose(); } catch { }
-                return;
-            }
-            var old = _hotkeys;
-            _hotkeys = svc;
-            try { old?.Dispose(); } catch { }
-            if (svc.PanicAvailable)
+            if (_disposed || _stoppedByPanic) return;
+
+            if (_registrar.PanicAvailable)
             {
                 _peerAuthority = false;
                 BecomeAuthority();
@@ -241,7 +314,7 @@ public sealed class EmergencyControl : IDisposable
             {
                 _peerAuthority = DetectPeerAuthority();
             }
-            if ((PanicAvailable || _peerAuthority) &&
+            if ((_registrar.PanicAvailable || _peerAuthority) &&
                 !File.Exists(StopMarkerPath))
             {
                 _epoch.Dispose();
@@ -282,13 +355,17 @@ public sealed class EmergencyControl : IDisposable
     {
         lock (_gate)
         {
-            if (!_stoppedByPanic || !(PanicAvailable || _peerAuthority) || _disposed) return;
+            try { File.Delete(StopMarkerPath); }
+            catch (Exception e) { Log($"stop marker delete failed: {e.Message}"); }
+
+            if (_disposed) return;
+            // SyncMarker invokes this every 150ms while no marker exists —
+            // skip the teardown and broadcast unless we were actually stopped.
+            if (_state == ComputerControlState.Active && !_stoppedByPanic) return;
             _epoch.Dispose();
             _epoch = new CancellationTokenSource();
             _stoppedByPanic = false;
             _state = ComputerControlState.Active;
-            try { File.Delete(StopMarkerPath); }
-            catch (Exception e) { Log($"stop marker delete failed: {e.Message}"); }
             foreach (var input in _inputs)
                 try { input.ClearEmergency(); } catch { }
         }
@@ -297,14 +374,18 @@ public sealed class EmergencyControl : IDisposable
     }
 
     /// <summary>
-    /// Invoked strictly by local user UI (e.g. system tray click) — never via MCP.
+    /// Invoked strictly by local user UI (e.g. control window or tray click) — never via MCP.
     /// </summary>
     public void TriggerLocalPanic(string source = "local user UI") => ApplyStop(source);
 
     /// <summary>
-    /// Invoked strictly by local user UI (e.g. system tray click) — never via MCP.
+    /// Invoked strictly by local user UI (e.g. control window or tray click) — never via MCP.
     /// </summary>
-    public void TriggerLocalResume(string source = "local user UI") => ApplyResume(source);
+    public void TriggerLocalResume(string source = "local user UI")
+    {
+        try { File.Delete(StopMarkerPath); } catch { }
+        ApplyResume(source);
+    }
 
     private void Log(string message)
     {
@@ -333,7 +414,7 @@ public sealed class EmergencyControl : IDisposable
             _inputs.Clear();
         }
         _markerWatch?.Dispose();
-        _hotkeys?.Dispose();
+        _registrar.Dispose();
         try { _ownerMutex?.ReleaseMutex(); } catch { }
         try { _ownerMutex?.Dispose(); } catch { }
         EmergencyGate.ClearOwner(Environment.ProcessId);

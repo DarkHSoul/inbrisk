@@ -12,6 +12,91 @@ public enum ProcessOwnership
     System
 }
 
+public enum LifecycleIntent
+{
+    Unknown,
+    Ephemeral,
+    Reusable,
+    UserUseful,
+    TaskArtifact
+}
+
+public enum CleanupDisposition
+{
+    KeepOpen,
+    CloseWhenDone,
+    AskBeforeClose
+}
+
+public sealed record LifecycleDecision(
+    bool CanClose,
+    CleanupDisposition Disposition,
+    string? Reason);
+
+public static class LifecycleDecisionEngine
+{
+    public static LifecycleDecision Decide(
+        ProcessOwnership ownership,
+        bool openedByAgent,
+        LifecycleIntent intent,
+        bool isProtected = false,
+        bool explicitUserClose = false)
+    {
+        if (isProtected || ownership == ProcessOwnership.System)
+        {
+            return new LifecycleDecision(
+                CanClose: false,
+                Disposition: CleanupDisposition.KeepOpen,
+                Reason: "Protected window/system process cannot be closed by automated cleanup.");
+        }
+
+        if (ownership == ProcessOwnership.User || !openedByAgent)
+        {
+            if (explicitUserClose)
+            {
+                return new LifecycleDecision(
+                    CanClose: true,
+                    Disposition: CleanupDisposition.CloseWhenDone,
+                    Reason: "User explicitly commanded closure of user-owned window.");
+            }
+
+            return new LifecycleDecision(
+                CanClose: false,
+                Disposition: CleanupDisposition.KeepOpen,
+                Reason: "User-owned application cannot be closed without explicit user override. When in doubt, leave it open.");
+        }
+
+        // Agent-owned resource
+        return intent switch
+        {
+            LifecycleIntent.Ephemeral => new LifecycleDecision(
+                CanClose: true,
+                Disposition: CleanupDisposition.CloseWhenDone,
+                Reason: "Ephemeral helper window may be closed when its task finishes."),
+
+            LifecycleIntent.Reusable => new LifecycleDecision(
+                CanClose: true,
+                Disposition: CleanupDisposition.KeepOpen,
+                Reason: "Reusable application remains open for follow-up actions."),
+
+            LifecycleIntent.UserUseful => new LifecycleDecision(
+                CanClose: true,
+                Disposition: CleanupDisposition.KeepOpen,
+                Reason: "Application with user-useful content (e.g. document, browser, calculator) remains open."),
+
+            LifecycleIntent.TaskArtifact => new LifecycleDecision(
+                CanClose: true,
+                Disposition: CleanupDisposition.KeepOpen,
+                Reason: "Task artifact document/result remains open for user review."),
+
+            _ => new LifecycleDecision(
+                CanClose: true,
+                Disposition: CleanupDisposition.KeepOpen,
+                Reason: "Agent-owned resource with unclassified/unknown intent defaults to KEEP OPEN ('When in doubt, leave it open').")
+        };
+    }
+}
+
 public sealed record ProcessProvenance(
     int Pid,
     string ProcessName,
@@ -20,15 +105,19 @@ public sealed record ProcessProvenance(
     bool OpenedByAgent,
     bool UsedInCurrentTask,
     DateTimeOffset RegisteredAt,
-    string? LaunchArgument = null)
+    string? LaunchArgument = null,
+    LifecycleIntent Intent = LifecycleIntent.Unknown)
 {
     public bool SafeToClose => OpenedByAgent && Ownership == ProcessOwnership.Agent;
+    public CleanupDisposition Disposition => LifecycleDecisionEngine.Decide(Ownership, OpenedByAgent, Intent).Disposition;
 }
 
 public interface IProcessProvenanceService
 {
     void RegisterInitial(int pid, string processName, long? hwnd = null);
-    void RegisterAgentLaunch(int pid, string processName, long? hwnd = null, string? launchArg = null);
+    void RegisterAgentLaunch(int pid, string processName, long? hwnd = null, string? launchArg = null, LifecycleIntent intent = LifecycleIntent.Unknown);
+    void SetLifecycleIntent(long hwnd, LifecycleIntent intent);
+    void SetLifecycleIntentProcess(int pid, LifecycleIntent intent);
     void MarkUsedProcess(int pid);
     void MarkUsedWindow(long hwnd);
     ProcessProvenance? GetProvenance(int pid);
@@ -67,7 +156,7 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
         if (hwnd.HasValue) _byHwnd.TryAdd(hwnd.Value, prov);
     }
 
-    public void RegisterAgentLaunch(int pid, string processName, long? hwnd = null, string? launchArg = null)
+    public void RegisterAgentLaunch(int pid, string processName, long? hwnd = null, string? launchArg = null, LifecycleIntent intent = LifecycleIntent.Unknown)
     {
         if (hwnd.HasValue) _hwndToPid[hwnd.Value] = pid;
         var prov = new ProcessProvenance(
@@ -78,7 +167,8 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
             OpenedByAgent: true,
             UsedInCurrentTask: true,
             RegisteredAt: DateTimeOffset.UtcNow,
-            LaunchArgument: launchArg
+            LaunchArgument: launchArg,
+            Intent: intent
         );
         _byPid[pid] = prov;
         if (hwnd.HasValue) _byHwnd[hwnd.Value] = prov;
@@ -90,9 +180,35 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
         }
         if (!string.IsNullOrWhiteSpace(launchArg))
         {
+            _launchedProcessNames[launchArg] = prov;
             var stem = System.IO.Path.GetFileNameWithoutExtension(launchArg);
             if (!string.IsNullOrWhiteSpace(stem))
                 _launchedProcessNames[stem] = prov;
+        }
+    }
+
+    public void SetLifecycleIntent(long hwnd, LifecycleIntent intent)
+    {
+        if (_byHwnd.TryGetValue(hwnd, out var hp))
+        {
+            _byHwnd[hwnd] = hp with { Intent = intent };
+        }
+        if (_hwndToPid.TryGetValue(hwnd, out var pid) && _byPid.TryGetValue(pid, out var pp))
+        {
+            _byPid[pid] = pp with { Intent = intent };
+        }
+    }
+
+    public void SetLifecycleIntentProcess(int pid, LifecycleIntent intent)
+    {
+        if (_byPid.TryGetValue(pid, out var pp))
+        {
+            _byPid[pid] = pp with { Intent = intent };
+        }
+        foreach (var kvp in _byHwnd)
+        {
+            if (kvp.Value.Pid == pid)
+                _byHwnd[kvp.Key] = kvp.Value with { Intent = intent };
         }
     }
 
@@ -152,7 +268,8 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
                     OpenedByAgent: true,
                     UsedInCurrentTask: true,
                     RegisteredAt: DateTimeOffset.UtcNow,
-                    LaunchArgument: lp.LaunchArgument
+                    LaunchArgument: lp.LaunchArgument,
+                    Intent: lp.Intent
                 );
                 _byPid[pid] = prov;
                 return prov;
@@ -169,35 +286,82 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
             return hwndProv;
 
         if (_hwndToPid.TryGetValue(hwnd, out var pid) && _byPid.TryGetValue(pid, out var prov))
-            return prov;
+        {
+            // If the process is a shared container like ApplicationFrameHost, don't adopt by PID alone
+            if (!string.Equals(prov.ProcessName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(prov.ProcessName, "ApplicationFrameHost.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                return prov;
+            }
+        }
 
         if (_windowService?.GetWindow(hwnd) is { } w)
         {
             _hwndToPid[hwnd] = w.Pid;
             if (_byHwnd.TryGetValue(hwnd, out var p))
                 return p;
-            if (_byPid.TryGetValue(w.Pid, out var existing))
-                return existing;
 
+            // 1. Process name matching (excluding generic hosts)
             if (!string.IsNullOrWhiteSpace(w.ProcessName))
             {
                 var clean = w.ProcessName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? w.ProcessName[..^4] : w.ProcessName;
-                if (_launchedProcessNames.TryGetValue(w.ProcessName, out var lp) ||
-                    _launchedProcessNames.TryGetValue(clean, out lp))
+                if (!string.Equals(clean, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase))
                 {
-                    var adopted = new ProcessProvenance(
-                        Pid: w.Pid,
-                        ProcessName: w.ProcessName,
-                        MainHwnd: hwnd,
-                        Ownership: ProcessOwnership.Agent,
-                        OpenedByAgent: true,
-                        UsedInCurrentTask: true,
-                        RegisteredAt: DateTimeOffset.UtcNow,
-                        LaunchArgument: lp.LaunchArgument
-                    );
-                    _byPid[w.Pid] = adopted;
-                    _byHwnd[hwnd] = adopted;
-                    return adopted;
+                    if (_launchedProcessNames.TryGetValue(w.ProcessName, out var lp) ||
+                        _launchedProcessNames.TryGetValue(clean, out lp))
+                    {
+                        var adopted = new ProcessProvenance(
+                            Pid: w.Pid,
+                            ProcessName: w.ProcessName,
+                            MainHwnd: hwnd,
+                            Ownership: ProcessOwnership.Agent,
+                            OpenedByAgent: true,
+                            UsedInCurrentTask: true,
+                            RegisteredAt: DateTimeOffset.UtcNow,
+                            LaunchArgument: lp.LaunchArgument,
+                            Intent: lp.Intent
+                        );
+                        _byPid[w.Pid] = adopted;
+                        _byHwnd[hwnd] = adopted;
+                        return adopted;
+                    }
+                }
+            }
+
+            // 2. ApplicationFrameHost or hosted window matching by Title or LaunchArgument
+            foreach (var registered in _launchedProcessNames.Values)
+            {
+                if (registered.OpenedByAgent)
+                {
+                    bool titleMatch = !string.IsNullOrWhiteSpace(w.Title) &&
+                        (!string.IsNullOrWhiteSpace(registered.LaunchArgument) && w.Title.Contains(registered.LaunchArgument, StringComparison.OrdinalIgnoreCase) ||
+                         !string.IsNullOrWhiteSpace(registered.ProcessName) && w.Title.Contains(registered.ProcessName, StringComparison.OrdinalIgnoreCase));
+
+                    if (titleMatch)
+                    {
+                        var adopted = new ProcessProvenance(
+                            Pid: w.Pid,
+                            ProcessName: w.ProcessName,
+                            MainHwnd: hwnd,
+                            Ownership: ProcessOwnership.Agent,
+                            OpenedByAgent: true,
+                            UsedInCurrentTask: true,
+                            RegisteredAt: DateTimeOffset.UtcNow,
+                            LaunchArgument: registered.LaunchArgument,
+                            Intent: registered.Intent
+                        );
+                        _byHwnd[hwnd] = adopted;
+                        return adopted;
+                    }
+                }
+            }
+
+            if (_byPid.TryGetValue(w.Pid, out var existing))
+            {
+                if (!string.Equals(existing.ProcessName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(existing.ProcessName, "ApplicationFrameHost.exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    return existing;
                 }
             }
         }

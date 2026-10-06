@@ -115,7 +115,11 @@ public sealed class UiaQueueCancellationTests
             }, timeoutMs: 5000, intentName: $"Item-{idx}")));
         }
 
-        await Task.Delay(50);
+        using var queueWaitCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        while (dispatcher.QueuedCount < 3 && !queueWaitCts.IsCancellationRequested)
+        {
+            await Task.Yield();
+        }
         var genBefore = dispatcher.CurrentGeneration;
 
         // 3. Purge queue

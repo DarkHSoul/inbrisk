@@ -1,0 +1,18 @@
+[package]
+name = "inbrisk-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+inbrisk-core.workspace = true
+inbrisk-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+once_cell.workspace = true
+windows.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
