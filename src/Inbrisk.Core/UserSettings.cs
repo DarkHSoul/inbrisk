@@ -48,6 +48,14 @@ public sealed class UserSettings
     /// <summary>Tool profile: "core" (streamlined essential tools for fast reasoning) | "full" (all tools). Default "core".</summary>
     public string? ToolProfile { get; set; } = "core";
     /// <summary>
+    /// Permit computer_launch path:/executable: launches of script and
+    /// installer files (.bat/.cmd/.ps1/.vbs/.js/.wsf/.msi/.hta/.reg/…).
+    /// Default false — such targets fail with ConfirmationRequired.
+    /// INBRISK_ALLOW_SCRIPT_LAUNCH=1 grants the same consent per process.
+    /// Human-edited only; the MCP surface never writes this setting.
+    /// </summary>
+    public bool AllowScriptLaunch { get; set; } = false;
+    /// <summary>
     /// Processes protected from AI close/kill/termination actions.
     /// Immutable to AI; only editable by the human user via settings.
     /// </summary>
@@ -76,6 +84,20 @@ public sealed class UserSettings
     /// or "Ask" (pause and request human takeover/confirmation). Default: "Deny".
     /// </summary>
     public string ProtectionMode { get; set; } = "Deny";
+
+    /// <summary>
+    /// Local consent for caller-supplied script execution — browser_evaluate
+    /// and adapter script-exec actions (CDP Runtime.evaluate, Blender bpy
+    /// exec/eval). Dangerous class, default OFF: like the F04 shell-typing
+    /// gate, this can only be granted by a local channel the model cannot
+    /// forge — an edit to this file (setup app or manual) or the
+    /// INBRISK_ALLOW_SCRIPT_EXECUTION env var on the host process, which
+    /// wins both ways (truthy allows, set-but-falsy force-denies).
+    /// AutoConfirm and tool-call flags are never consulted. Every attempt,
+    /// allowed or denied, is appended to the hash-chained audit log
+    /// (mcp-scriptexec.jsonl).
+    /// </summary>
+    public bool AllowScriptExecution { get; set; } = false;
 
     [JsonIgnore]
     public static string SettingsPath => Path.Combine(DataDir, "settings.json");

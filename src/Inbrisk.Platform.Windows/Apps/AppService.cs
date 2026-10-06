@@ -29,7 +29,7 @@ public sealed class AppService : IAppService, IDisposable
     /// <summary>Interpreters a launch must never target — computer_launch is
     /// an app launcher, not a shell. Blocking here means arguments can never
     /// be smuggled into `cmd /c`, `powershell -Command`, mshta, rundll32…</summary>
-    private static readonly HashSet<string> ShellHosts = new(
+    internal static readonly HashSet<string> ShellHosts = new(
         StringComparer.OrdinalIgnoreCase)
     {
         "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe",
@@ -43,6 +43,10 @@ public sealed class AppService : IAppService, IDisposable
     private readonly IWindowService _windows;
     private readonly Func<long, bool>? _uiaProbe;
     private readonly Func<string, bool> _isDeniedProcess;
+    /// <summary>Session reaper bookkeeping — every pid WE spawn is recorded
+    /// here so session teardown can close it. Reused/existing instances are
+    /// never tracked (the spawn call returns no pid for them).</summary>
+    private readonly SessionProcessTracker? _processTracker;
 
     // test seams — production uses the real spawn/registry path
     internal Func<ResolvedApp, IReadOnlyList<string>?, int?>? Spawner;
@@ -118,9 +122,11 @@ public sealed class AppService : IAppService, IDisposable
         ApplicationCatalogService? catalogService = null,
         LaunchResolutionCache? launchCache = null,
         string? storageDirectory = null,
-        Func<DateTimeOffset>? clock = null)
+        Func<DateTimeOffset>? clock = null,
+        SessionProcessTracker? processTracker = null)
     {
         _windows = windows;
+        _processTracker = processTracker;
         _uiaProbe = uiaProbe;
         _isDeniedProcess = isDeniedProcess ?? (_ => false);
         _eventBuffer = eventBuffer;
@@ -439,6 +445,21 @@ public sealed class AppService : IAppService, IDisposable
                 spawnedPid = (Spawner ?? SpawnReal)(chosen, effectiveArgs.Count > 0 ? effectiveArgs : null);
             }
             timings.SpawnMs = spawnSw.ElapsedMilliseconds;
+            // Reaper bookkeeping: only a pid the spawn call itself returned is
+            // tracked — pids matched during readiness (e.g. a URI handler that
+            // was already running) are never attributed to us. Tracking even
+            // covers launches whose readiness wait later fails/times out.
+            if (spawnedPid is > 0)
+            {
+                try
+                {
+                    _processTracker?.Track(spawnedPid.Value,
+                        tool: PerfTrace.TryCurrent is { } tr
+                            ? $"{tr.Kind}:{tr.Id}"
+                            : "computer_launch");
+                }
+                catch { /* bookkeeping must never break a launch */ }
+            }
         }
         catch (OperationCanceledException) { throw; }
         catch (Exception e)
@@ -449,6 +470,7 @@ public sealed class AppService : IAppService, IDisposable
         }
 
         // ---- readiness ----
+        var launchStartUtc = DateTime.UtcNow;
         var waitSw = Stopwatch.StartNew();
         var ready = WaitReady(chosen, spawnedPid, readiness.Value,
             spec.TimeoutMs, ct, total, spec.App);
@@ -458,6 +480,25 @@ public sealed class AppService : IAppService, IDisposable
                 resolvedName: chosen.DisplayName,
                 identifier: chosen.Identifier, pid: ready.pid,
                 state: ready.state ?? "Started");
+        // Shell-launched targets (UseShellExecute + app-execution aliases like
+        // Win11 Store notepad.exe) return null/no pid from Process.Start, so
+        // `spawnedPid` is empty and the Track() above never ran. When readiness
+        // matched a real window, attribute its pid only if the process started
+        // after this launch began — same start-time identity check the reaper
+        // applies — so a pre-existing same-name window is never claimed.
+        if (!(spawnedPid is > 0) && ready.pid > 0)
+        {
+            try
+            {
+                using var proc = Process.GetProcessById(ready.pid.Value);
+                if (proc.StartTime.ToUniversalTime() >= launchStartUtc.AddSeconds(-2))
+                    _processTracker?.Track(ready.pid.Value,
+                        tool: PerfTrace.TryCurrent is { } tr2
+                            ? $"{tr2.Kind}:{tr2.Id}"
+                            : "computer_launch");
+            }
+            catch { /* bookkeeping must never break a launch */ }
+        }
         return Done(chosen.Method, chosen.DisplayName, ready.procName,
             ready.pid, ready.hwnd, ready.title, ready.state!, total,
             readyMs: total.ElapsedMilliseconds - spawnMs,
@@ -478,6 +519,16 @@ public sealed class AppService : IAppService, IDisposable
         err = null;
         if (spec.Path is { } p)
         {
+            // Script/UNC/shortcut gate BEFORE existence probing — a denied
+            // shape must never even answer "does this file exist".
+            var gate = LaunchPathGate.Evaluate(p);
+            if (gate.Verdict == LaunchPathGate.Verdict.Denied)
+            { err = $"PolicyDenied: {gate.Detail} (path '{p}')"; return null; }
+            if (gate.Verdict == LaunchPathGate.Verdict.ScriptRequiresConsent)
+            { err = $"ConfirmationRequired: {gate.Detail} (path '{p}') — " +
+                    $"set {LaunchPathGate.AllowEnvVar}=1 or " +
+                    "\"allowScriptLaunch\": true in settings.json to " +
+                    "permit script launches"; return null; }
             if (!File.Exists(p))
             { err = $"TargetNotFound: no file at '{p}'"; return null; }
             var stem = Path.GetFileNameWithoutExtension(p);
@@ -514,6 +565,18 @@ public sealed class AppService : IAppService, IDisposable
         }
         if (spec.Executable is { } exe)
         {
+            // Same gate as path: — ResolveExecutable's File.Exists fast-path
+            // ShellExecutes the file verbatim, so `executable:"foo.bat"`
+            // would otherwise launder a script through the name lane. Bare
+            // names (no extension) classify Allowed and resolve normally.
+            var gate = LaunchPathGate.Evaluate(exe);
+            if (gate.Verdict == LaunchPathGate.Verdict.Denied)
+            { err = $"PolicyDenied: {gate.Detail} (executable '{exe}')"; return null; }
+            if (gate.Verdict == LaunchPathGate.Verdict.ScriptRequiresConsent)
+            { err = $"ConfirmationRequired: {gate.Detail} (executable '{exe}') — " +
+                    $"set {LaunchPathGate.AllowEnvVar}=1 or " +
+                    "\"allowScriptLaunch\": true in settings.json to " +
+                    "permit script launches"; return null; }
             var hit = ResolveExecutable(exe);
             if (hit == null)
             { err = $"TargetNotFound: executable '{exe}' not found"; return null; }
