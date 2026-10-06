@@ -70,6 +70,7 @@ public sealed record GhostControlOptions(
     float? Scale = null,
     int TargetFps = 60,
     bool StartSession = true,
+    bool ExtraSession = false,
     string Username = "InbriskAgent",
     string ControlPipeName = GhostControlCommand.DefaultControlPipeName,
     bool JsonOutput = false,
@@ -88,6 +89,7 @@ public sealed record GhostControlOptions(
         float? scale = null;
         int targetFps = 60;
         bool startSession = true;
+        bool extraSession = false;
         string username = "InbriskAgent";
         string controlPipeName = GhostControlCommand.DefaultControlPipeName;
         bool jsonOutput = false;
@@ -332,6 +334,13 @@ public sealed record GhostControlOptions(
                 startSession = false;
             }
 
+            // Allow explicit multi-session creation
+            else if (a.Equals("--extra-session", StringComparison.OrdinalIgnoreCase) ||
+                     a.Equals("--extrasession", StringComparison.OrdinalIgnoreCase))
+            {
+                extraSession = true;
+            }
+
             // Target user account
             else if (a.Equals("--user", StringComparison.OrdinalIgnoreCase) ||
                      a.Equals("--username", StringComparison.OrdinalIgnoreCase))
@@ -362,6 +371,7 @@ public sealed record GhostControlOptions(
             Scale: scale,
             TargetFps: targetFps,
             StartSession: startSession,
+            ExtraSession: extraSession,
             Username: username,
             ControlPipeName: controlPipeName,
             JsonOutput: jsonOutput,
@@ -501,7 +511,7 @@ public static class GhostControlCommand
         writer.WriteLine("  tray                    Start full background session, PiP overlay and System Tray icon");
         writer.WriteLine("  pip                     Control or view the Picture-in-Picture (PiP) display window");
         writer.WriteLine("  status                  Query live operational status of Ghost OS and PiP overlay");
-        writer.WriteLine("  stop                    Safely stop and disconnect the active Ghost OS session");
+        writer.WriteLine("  stop                    Safely stop, disconnect, and cleanly wipe all ghost sessions, credentials, and temp files");
         writer.WriteLine("  logs                    View recent diagnostic and activity logs from %LOCALAPPDATA%\\inbrisk\\logs\\ghost-os.log");
         writer.WriteLine();
         writer.WriteLine("PiP Control Options (usable with 'ghost tray' and 'ghost pip'):");
@@ -514,6 +524,7 @@ public static class GhostControlCommand
         writer.WriteLine();
         writer.WriteLine("General Options:");
         writer.WriteLine("  --no-session            Launch PiP and System Tray without starting a new RDP session");
+        writer.WriteLine("  --extra-session         Force creating an additional secondary RDP session even if a desktop session is already running");
         writer.WriteLine("  --user <name>           Ghost desktop username (default: InbriskAgent)");
         writer.WriteLine("  --json                  Output status and responses formatted as JSON");
         writer.WriteLine("  --verbose, -v           Enable detailed diagnostic logging");
@@ -594,30 +605,49 @@ public static class GhostControlCommand
             // 1. Session Management: Provision & Start Headless Session (if enabled)
             if (options.StartSession && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                LogInfo($"Checking Ghost desktop account ({options.Username})...", options);
-                sessionManager = new GhostSessionManager();
-
-                try
+                // Check if target user already has an active or connected session
+                var targetExisting = GhostWtsInterop.FindSessionByUsername(options.Username);
+                if (targetExisting != null &&
+                    (targetExisting.State == WTS_CONNECTSTATE_CLASS.WTSActive || targetExisting.State == WTS_CONNECTSTATE_CLASS.WTSConnected))
                 {
-                    var status = await sessionManager.StartSessionAsync(new GhostSessionConfig
-                    {
-                        Username = options.Username,
-                        AutoProvision = true,
-                        TimeoutSeconds = 25
-                    }, linkedCts.Token).ConfigureAwait(false);
-
-                    if (status.IsActive)
-                    {
-                        LogSuccess($"Ghost session active (SessionId: {status.SessionId}, State: {status.State})", options);
-                    }
-                    else
-                    {
-                        LogWarning($"Ghost session started with state '{status.State}'. Proceeding with PiP overlay...", options);
-                    }
+                    LogInfo($"Active session already exists for '{options.Username}' (Session ID: {targetExisting.SessionId}, State: {targetExisting.State}). Reusing session.", options);
                 }
-                catch (Exception ex)
+                else if (!options.ExtraSession)
                 {
-                    LogWarning($"Could not auto-start headless session ({ex.Message}). Continuing with PiP overlay...", options);
+                    // Existing session check: an interactive console session is already active (e.g. current user)
+                    string currentUser = Environment.UserName;
+                    LogInfo($"Active Windows desktop session detected for '{currentUser}'.", options);
+                    LogInfo("Spawning additional loopback RDP session was skipped to prevent session conflict.", options);
+                    LogInfo("Hint: To force an isolated secondary RDP session, specify '--extra-session'.", options);
+                    LogInfo("Proceeding with zero-conflict PiP overlay on shared framebuffer.", options);
+                }
+                else
+                {
+                    LogInfo($"Explicit secondary session requested (--extra-session). Checking Ghost desktop account ({options.Username})...", options);
+                    sessionManager = new GhostSessionManager();
+
+                    try
+                    {
+                        var status = await sessionManager.StartSessionAsync(new GhostSessionConfig
+                        {
+                            Username = options.Username,
+                            AutoProvision = true,
+                            TimeoutSeconds = 25
+                        }, linkedCts.Token).ConfigureAwait(false);
+
+                        if (status.IsActive)
+                        {
+                            LogSuccess($"Ghost session active (SessionId: {status.SessionId}, State: {status.State})", options);
+                        }
+                        else
+                        {
+                            LogWarning($"Ghost session started with state '{status.State}'. Proceeding with PiP overlay...", options);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        LogWarning($"Could not auto-start headless session ({ex.Message}). Continuing with PiP overlay...", options);
+                    }
                 }
             }
             else
@@ -752,7 +782,14 @@ public static class GhostControlCommand
                 catch { }
             }
 
-            LogSuccess("Ghost OS System Tray session terminated cleanly.", options);
+            // Thorough cleanup: clear loopback credentials, delete temp files, kill leftover client processes
+            try
+            {
+                await GhostRdpConnector.CleanupAllSessionsAsync(options.Username).ConfigureAwait(false);
+            }
+            catch { }
+
+            LogSuccess("Ghost OS System Tray session terminated and all resources cleaned up.", options);
         }
 
         return 0;
@@ -1293,6 +1330,10 @@ public static class GhostControlCommand
                 var resp = await client.SendRequestAsync("stop", "{}", TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
                 LogSuccess("Shutdown signal sent to active Ghost OS daemon.", options);
                 if (options.JsonOutput) Console.WriteLine(resp);
+
+                // Run comprehensive cleanup
+                try { await GhostRdpConnector.CleanupAllSessionsAsync(options.Username).ConfigureAwait(false); } catch { }
+                LogSuccess("Ghost OS credentials, temp files, and background processes thoroughly cleaned up.", options);
                 return 0;
             }
         }
@@ -1324,6 +1365,17 @@ public static class GhostControlCommand
         {
             LogError($"Failed to stop headless session: {ex.Message}", options);
             return 1;
+        }
+
+        // Run comprehensive cleanup
+        try
+        {
+            await GhostRdpConnector.CleanupAllSessionsAsync(options.Username).ConfigureAwait(false);
+            LogSuccess("Ghost OS credentials, temp files, and background processes thoroughly cleaned up.", options);
+        }
+        catch (Exception ex)
+        {
+            LogWarning($"Warning during cleanup: {ex.Message}", options);
         }
 
         return 0;

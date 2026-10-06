@@ -43,7 +43,7 @@ public class GhostRdpConnector
     /// <param name="width">Screen width in pixels (default: 1920).</param>
     /// <param name="height">Screen height in pixels (default: 1080).</param>
     /// <returns>The target file path.</returns>
-    public static string GenerateRdpConfig(string targetPath, int width = 1920, int height = 1080)
+    public static string GenerateRdpConfig(string targetPath, int width = 1920, int height = 1080, string username = "InbriskAgent")
     {
         if (string.IsNullOrWhiteSpace(targetPath))
         {
@@ -64,6 +64,7 @@ public class GhostRdpConnector
         sb.AppendLine("session bpp:i:32");
         sb.AppendLine($"winposstr:s:0,1,0,0,{width},{height}");
         sb.AppendLine($"full address:s:{DefaultLoopbackAddress}:{DefaultRdpPort}");
+        sb.AppendLine($"username:s:{username}");
         sb.AppendLine("compression:i:1");
         sb.AppendLine("keyboardhook:i:2");
         sb.AppendLine("audiomode:i:2");
@@ -179,7 +180,7 @@ public class GhostRdpConnector
         string rdpDir = Path.Combine(Path.GetTempPath(), "Inbrisk_Ghost_RDP");
         Directory.CreateDirectory(rdpDir);
         string rdpPath = Path.Combine(rdpDir, $"ghost_{Guid.NewGuid():N}.rdp");
-        GenerateRdpConfig(rdpPath, width, height);
+        GenerateRdpConfig(rdpPath, width, height, username);
 
         // 5. Launch client (FreeRDP if present, otherwise mstsc.exe)
         Process? process = null;
@@ -341,6 +342,12 @@ public class GhostRdpConnector
                 }
                 catch { }
             }
+
+            // Clear loopback credentials from Credential Manager if no other tracked sessions remain
+            if (TrackedProcesses.IsEmpty)
+            {
+                try { ClearLoopbackCredentials(); } catch { }
+            }
         }
         catch
         {
@@ -348,6 +355,77 @@ public class GhostRdpConnector
         }
 
         return success;
+    }
+
+    /// <summary>
+    /// Performs complete, thorough teardown of all ghost sessions:
+    /// terminates tracked and lingering RDP client processes, logs off ghost sessions,
+    /// clears Windows Credential Manager entries, and cleans temporary RDP directories.
+    /// </summary>
+    public static async Task CleanupAllSessionsAsync(string? targetUsername = "InbriskAgent")
+    {
+        // 1. Terminate tracked client processes
+        foreach (var kvp in TrackedProcesses)
+        {
+            try
+            {
+                if (!kvp.Value.HasExited)
+                {
+                    kvp.Value.Kill(entireProcessTree: true);
+                }
+                kvp.Value.Dispose();
+            }
+            catch { }
+        }
+        TrackedProcesses.Clear();
+
+        // 2. Delete tracked temporary RDP files
+        foreach (var kvp in TrackedRdpFiles)
+        {
+            try
+            {
+                if (File.Exists(kvp.Value)) File.Delete(kvp.Value);
+            }
+            catch { }
+        }
+        TrackedRdpFiles.Clear();
+
+        // 3. Clear entire temporary RDP directory
+        try
+        {
+            string rdpDir = Path.Combine(Path.GetTempPath(), "Inbrisk_Ghost_RDP");
+            if (Directory.Exists(rdpDir))
+            {
+                Directory.Delete(rdpDir, recursive: true);
+            }
+        }
+        catch { }
+
+        // 4. Clear loopback credentials from Windows Credential Manager
+        try
+        {
+            ClearLoopbackCredentials();
+        }
+        catch { }
+
+        // 5. Logoff any active session belonging to targetUsername
+        if (!string.IsNullOrEmpty(targetUsername))
+        {
+            try
+            {
+                var sessions = GhostWtsInterop.GetAllSessions();
+                foreach (var s in sessions)
+                {
+                    if (string.Equals(s.UserName, targetUsername, StringComparison.OrdinalIgnoreCase))
+                    {
+                        GhostWtsInterop.LogoffSession(s.SessionId, wait: false);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        await Task.CompletedTask;
     }
 
     #region Helper Methods
