@@ -65,6 +65,7 @@ public sealed class InbriskRuntime : IDisposable
     private readonly ActivityHudService _hud;
     private readonly ITargetHighlightService _targetHighlight;
     private readonly IProcessProvenanceService _provenance;
+    private readonly SessionProcessTracker _processTracker;
     private readonly AppService _apps;
     private readonly UiaEventSubscriptionManager _subscriptionManager;
     private readonly List<ChangeMonitor> _monitors = new();
@@ -78,6 +79,9 @@ public sealed class InbriskRuntime : IDisposable
 
     public SafetyPolicy Policy => _policy;
     public IProcessProvenanceService Provenance => _provenance;
+    /// <summary>Processes this runtime spawned (computer_launch, run/batch
+    /// launch steps, adapter launches) — session teardown reaps them.</summary>
+    public SessionProcessTracker ProcessTracker => _processTracker;
     public UiaReadScheduler ReadScheduler => _uiaReadScheduler;
     public RecentEventBuffer EventBuffer => _eventBuffer;
 
@@ -120,7 +124,7 @@ public sealed class InbriskRuntime : IDisposable
         _input = new SendInputService();
         _capture = new CaptureService(_windows);
         _clipboard = new ClipboardService();
-        _ocr = new OcrService();
+        _ocr = new OcrService(_capture, _windows);
         _uiaBackend = new UiaBackend(_uiaDispatch, _windows, _uiaReadScheduler);
         _events = new CoalescingEventSource(new CompositeEventSource(
             new WinEventService(),
@@ -181,6 +185,27 @@ public sealed class InbriskRuntime : IDisposable
                 _uiaBackend.InvalidateWindow(bh);
         };
 
+        // Session process reaper: every pid AppService spawns is tracked so
+        // session teardown (or a cleanup tool call) can close what it started.
+        // The guards keep the tracker in Core platform-agnostic — the
+        // host-ancestry / protected-name / shared-host policy lives on
+        // WindowService statics and is injected here.
+        // NB: 'WindowService' unqualified binds to the WindowService property
+        // (IWindowService) — the statics live on the concrete platform type.
+        _processTracker = new SessionProcessTracker(_windows,
+            hostProcessGuard: pid =>
+                Platform.Windows.Topology.WindowService.IsAgentHostOrAncestorPid(
+                    pid, out var hostReason) ? hostReason : null,
+            killGuard: (pid, name) =>
+                Platform.Windows.Topology.WindowService.IsAgentHostOrAncestorPid(
+                    pid, out var ancReason) ? ancReason
+                : Platform.Windows.Topology.WindowService.IsProcessProtected(
+                    name, out var procReason) ? procReason
+                : Platform.Windows.Topology.WindowService.IsSharedMultiWindowProcess(
+                    name, out var sharedReason) ? sharedReason
+                : null);
+        SessionProcessTracker.Ambient = _processTracker;
+
         // Readiness probe: a window counts as usable only when its UIA
         // root is reachable — runs on the dedicated UIA dispatcher.
         _apps = new AppService(_windows,
@@ -198,11 +223,13 @@ public sealed class InbriskRuntime : IDisposable
             eventBuffer: _eventBuffer,
             telemetry: _subscriptionManager.Telemetry,
             catalogService: opt.CatalogService,
-            launchCache: opt.LaunchCache);
+            launchCache: opt.LaunchCache,
+            processTracker: _processTracker);
 
         _executor = new Executor(_windows, _integrity, _input, _capture,
             _agentBackends, _registry, _policy, _telemetry, _activity,
-            eventWaiter: _eventBuffer);
+            eventWaiter: _eventBuffer,
+            silent: new SilentInputService());
         _wait = new WaitService(s => Find(s), _capture, _events, _registry, _windows, _subscriptionManager);
 
         _events.Event += e =>
@@ -489,11 +516,15 @@ public sealed class InbriskRuntime : IDisposable
                 uia = Inspect(hwnd);
         }
 
+        OcrResult? ocrRes;
         IReadOnlyList<TextSpan> ocr;
         using (PerfTrace.Stage("observe.ocr"))
-            ocr = includeOcr && frame != null
-                ? _ocr.Recognize(frame)
-                : (IReadOnlyList<TextSpan>)Array.Empty<TextSpan>();
+        {
+            ocrRes = includeOcr && frame != null ? _ocr.Recognize(frame) : null;
+            ocr = ocrRes?.Words ?? (IReadOnlyList<TextSpan>)Array.Empty<TextSpan>();
+        }
+        if (ocrRes != null)
+            NoteOcrResult(hwnd, ocrRes);
 
         var vision = new List<UiElement>();
         if (_vision != null && frame != null)
@@ -538,11 +569,15 @@ public sealed class InbriskRuntime : IDisposable
                 uia = await InspectAsync(hwnd, ct: ct).ConfigureAwait(false);
         }
 
+        OcrResult? ocrRes;
         IReadOnlyList<TextSpan> ocr;
         using (PerfTrace.Stage("observe.ocr"))
-            ocr = includeOcr && frame != null
-                ? _ocr.Recognize(frame)
-                : (IReadOnlyList<TextSpan>)Array.Empty<TextSpan>();
+        {
+            ocrRes = includeOcr && frame != null ? _ocr.Recognize(frame) : null;
+            ocr = ocrRes?.Words ?? (IReadOnlyList<TextSpan>)Array.Empty<TextSpan>();
+        }
+        if (ocrRes != null)
+            NoteOcrResult(hwnd, ocrRes);
 
         var vision = new List<UiElement>();
         if (_vision != null && frame != null)
@@ -675,9 +710,139 @@ public sealed class InbriskRuntime : IDisposable
     // ---- vision / ocr ----
     public void SetVisionBackend(IVisionBackend? backend) => _vision = backend;
     public void SetGroundingBackend(IGroundingBackend? backend) => _grounding = backend;
-    public IReadOnlyList<TextSpan> Ocr(RawFrame frame) => _ocr.Recognize(frame);
+    public IReadOnlyList<TextSpan> Ocr(RawFrame frame) => _ocr.Recognize(frame).Words;
+    /// <summary>Rich OCR result: words (desktop space), engine/language used,
+    /// effective image size, wall ms, warning. This is the OCR entry point for
+    /// callers that need telemetry, not just the word list.</summary>
+    public OcrResult OcrDetailed(RawFrame frame, string? language = null,
+        TimeSpan? timeout = null) => _ocr.Recognize(frame, language, timeout);
+    /// <summary>Capture a window's visible bounds and OCR it (uncached —
+    /// OcrWindow(hwnd) is the cached word-list variant).</summary>
+    public OcrResult OcrWindowDetailed(long hwnd, string? language = null,
+        TimeSpan? timeout = null) => _ocr.RecognizeWindow(hwnd, language, timeout);
+    /// <summary>Capture a desktop-space rect and OCR it.</summary>
+    public OcrResult OcrRegionDetailed(RectPx region, string? language = null,
+        TimeSpan? timeout = null) => _ocr.RecognizeRegion(region, language, timeout);
+    /// <summary>The platform-neutral OCR contract — for DI into runtime
+    /// components (e.g. ActionResolver) that cannot reference this assembly.</summary>
+    public IOcrService OcrService => _ocr;
     public bool OcrAvailable => _ocr.Available;
     public string OcrLanguage => _ocr.Language;
+
+    /// <summary>
+    /// Short-lived per-window OCR result cache (~2s TTL, also invalidated by
+    /// MutationVersion — a click/typing changes the pixels). ObserveScene's
+    /// merged-scene pass already recognizes the window frame; it stashes the
+    /// pre-merge result here so same-call consumers (the ocr:true word
+    /// overlay, find's ocr: fallback via <see cref="CachedOcrService"/>) reuse
+    /// it instead of re-OCRing the same frame. Word order is OcrEngine
+    /// reading order — ocr:&lt;hwnd&gt;:&lt;idx&gt; ids are stable for every
+    /// consumer of one cache entry.
+    /// </summary>
+    private readonly Dictionary<long, (OcrResult Result,
+        DateTimeOffset At, long Ver)> _ocrCache = new();
+
+    private void NoteOcrResult(long hwnd, OcrResult result)
+    {
+        _ocrCache[hwnd] = (result, DateTimeOffset.UtcNow, MutationVersion);
+        if (_ocrCache.Count > 16) _ocrCache.Clear();
+    }
+
+    /// <summary>
+    /// OCR the current pixels of a window — the result behind
+    /// ocr:&lt;hwnd&gt;:&lt;idx&gt; ids. Cached per hwnd (~2s, or until a
+    /// mutation): repeat callers within one tool call chain share one
+    /// recognition. Never throws — capture/engine failures return an empty
+    /// result carrying the error in <see cref="OcrResult.Warning"/>.
+    /// </summary>
+    public OcrResult OcrWindowResult(long hwnd, bool forceRefresh = false)
+    {
+        using var _ = _activity.BeginActivity();
+        var ver = MutationVersion;
+        if (!forceRefresh &&
+            _ocrCache.TryGetValue(hwnd, out var hit) &&
+            hit.Ver == ver &&
+            (DateTimeOffset.UtcNow - hit.At).TotalSeconds < 2)
+        {
+            PerfLog.Write(new
+            {
+                kind = "ocr.observe",
+                at = DateTimeOffset.Now,
+                traceId = PerfTrace.CurrentId,
+                hwnd,
+                ms = 0,
+                words = hit.Result.Words.Count,
+                cached = true,
+            });
+            return hit.Result;
+        }
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        OcrResult result;
+        try
+        {
+            using (PerfTrace.Stage("ocr.observe"))
+                result = _ocr.RecognizeWindow(hwnd);
+        }
+        catch (Exception e)
+        {
+            _telemetry?.EmitPipeline(new PipelineTelemetry(DateTimeOffset.Now,
+                "ocr.observe", Target: $"ocr failed: {e.Message}"));
+            result = new OcrResult(Array.Empty<TextSpan>(),
+                sw.Elapsed.TotalMilliseconds, "windows.media.ocr",
+                _ocr.Language, 0, 0, null, $"ocr failed: {e.Message}");
+        }
+        NoteOcrResult(hwnd, result);
+        PerfLog.Write(new
+        {
+            kind = "ocr.observe",
+            at = DateTimeOffset.Now,
+            traceId = PerfTrace.CurrentId,
+            hwnd,
+            ms = sw.ElapsedMilliseconds,
+            words = result.Words.Count,
+            cached = false,
+        });
+        return result;
+    }
+
+    /// <summary>Word list of <see cref="OcrWindowResult"/> — the overlay
+    /// surface for computer_observe's ocr:true section.</summary>
+    public IReadOnlyList<TextSpan> OcrWindow(long hwnd, bool forceRefresh = false) =>
+        OcrWindowResult(hwnd, forceRefresh).Words;
+
+    /// <summary>IOcrService decorator that routes window-scoped recognition
+    /// through the runtime's per-hwnd result cache — observe/find/click OCR
+    /// consumers share one recognition (~2s or until a mutation) instead of
+    /// re-running the engine on the same pixels. Explicit language/timeout
+    /// requests and region captures bypass the cache.</summary>
+    private sealed class CachedOcrService(IOcrService inner,
+        Func<long, OcrResult> cachedWindow) : IOcrService
+    {
+        public bool Available => inner.Available;
+        public string Language => inner.Language;
+        public OcrResult Recognize(RawFrame frame, string? language = null,
+            TimeSpan? timeout = null)
+            => language == null && timeout == null &&
+               frame.Transform.SourceHwnd is > 0
+                ? cachedWindow(frame.Transform.SourceHwnd.Value)
+                : inner.Recognize(frame, language, timeout);
+        public OcrResult RecognizeWindow(long hwnd, string? language = null,
+            TimeSpan? timeout = null)
+            => language == null && timeout == null
+                ? cachedWindow(hwnd)
+                : inner.RecognizeWindow(hwnd, language, timeout);
+        public OcrResult RecognizeRegion(RectPx region, string? language = null,
+            TimeSpan? timeout = null)
+            => inner.RecognizeRegion(region, language, timeout);
+    }
+
+    private IOcrService? _cachedOcr;
+    /// <summary>OcrService wrapped in the per-hwnd result cache — what
+    /// RuntimeParts/CreateAgent hand to resolvers so OCR fallbacks reuse
+    /// the last recognition instead of capturing+OCRing again.</summary>
+    private IOcrService CachedOcr =>
+        _cachedOcr ??= new CachedOcrService(_ocr, h => OcrWindowResult(h));
 
     // ---- guards ----
     public bool SecureDesktopActive() => _integrity.IsSecureDesktopActive();
@@ -743,10 +908,12 @@ public sealed class InbriskRuntime : IDisposable
     public sealed record RuntimeParts(IWindowService Windows,
         ElementRegistry Registry, Executor Executor, WaitService Waits,
         RecentEventBuffer EventBuffer, IReadOnlyList<IElementBackend> Backends,
-        SafetyPolicy Policy, IInputService Input, IAppService Apps);
+        SafetyPolicy Policy, IInputService Input, IAppService Apps,
+        ICaptureService Capture, IOcrService Ocr);
 
     public RuntimeParts Parts => new(_windows, _registry, _executor, _wait,
-        _eventBuffer, _agentBackends, _policy, _input, _apps);
+        _eventBuffer, _agentBackends, _policy, _input, _apps,
+        _capture, CachedOcr);
 
     // ---- agent bridge (M3) -------------------------------------------------
 
@@ -770,7 +937,8 @@ public sealed class InbriskRuntime : IDisposable
         new(new ObservationBuilder(_windows, h => ObserveScene(h),
                 CaptureRaw, _eventBuffer, _telemetry),
             new ActionResolver(_registry, _executor, _wait, _windows,
-                new AutoVerifier(_registry, _agentBackends, _windows, _eventBuffer)),
+                new AutoVerifier(_registry, _agentBackends, _windows, _eventBuffer),
+                _capture, CachedOcr),
             h => Monitor(new CaptureTarget.Window(h)),
             _registry, _input, _policy, opts, _telemetry);
 

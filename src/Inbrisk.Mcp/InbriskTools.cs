@@ -122,6 +122,7 @@ public sealed class InbriskTools
         [Description("cap attached image width in px — wider frames are downscaled; frameId coordinate mapping stays correct")] int? maxWidth = null,
         [Description("draw numbered marks on attached frames at clickable element centers; mark i = the i-th element in the printed list")] bool? marks = null,
         [Description("collapse passive UIA nodes (unnamed, non-actionable panes/groups/images) — default on for slim, off for full")] bool? prune = null,
+        [Description("append an OCR word overlay for the observed window: ocr:<hwnd>:<idx> ids usable as elementIds in find/click — for UIA-less windows (games, canvas apps)")] bool? ocr = null,
         CancellationToken ct = default)
     {
         if (BadDetail(detail) is { } bd) return bd;
@@ -136,7 +137,7 @@ public sealed class InbriskTools
             PerfTrace.Count("launchFollowupDiscovery");
         }
 
-        var normArgs = $"{mode}|{hwnd}|{detail}|{maxElements}|{deltaOnly}|{baseSnapshotId}|{maxWidth}|{marks}|{prune}";
+        var normArgs = $"{mode}|{hwnd}|{detail}|{maxElements}|{deltaOnly}|{baseSnapshotId}|{maxWidth}|{marks}|{prune}|{ocr}";
         var scopeH = ParseHwnd(hwnd) ?? _s.ScopeHwnd ?? 0;
         if (RequestDeduplicator.IsSafeForReadDeduplication("computer_observe", mode, autoScreenshot: false, hasCropOrRegion: false))
         {
@@ -301,6 +302,35 @@ public sealed class InbriskTools
                 }
             }
         }
+        // OCR word overlay — the same word list find/click's ocr:<hwnd>:<idx>
+        // fallback resolves against (shared per-hwnd cache, ~2s). Screen-
+        // supplied text → same untrusted-provenance marking as the header.
+        if (ocr == true)
+        {
+            var ocrHwnd = hint ?? _s.ScopeHwnd ?? o.ActiveWindow?.Hwnd ?? 0;
+            sb.AppendLine(UntrustedHeader("ocr"));
+            if (ocrHwnd == 0)
+            {
+                sb.AppendLine("ocr words: (none — no window to OCR)");
+            }
+            else if (!_s.Rt.OcrAvailable)
+            {
+                sb.AppendLine("ocr words: (OCR engine unavailable)");
+            }
+            else
+            {
+                var words = _s.Rt.OcrWindow(ocrHwnd, forceRefresh: false);
+                var wordCap = slim ? 20 : 60;
+                sb.AppendLine($"ocr words ({Math.Min(words.Count, wordCap)} of {words.Count} shown; ocr:<hwnd>:<idx> ids are clickable targets):");
+                for (var wi = 0; wi < Math.Min(words.Count, wordCap); wi++)
+                {
+                    var wb = words[wi].Bounds;
+                    sb.AppendLine($"  ocr:0x{ocrHwnd:X}:{wi} \"{TruncEdges(words[wi].Text, 80)}\" ({wb.X},{wb.Y} {wb.Width}x{wb.Height})");
+                }
+                if (words.Count > wordCap)
+                    sb.AppendLine($"  …{words.Count - wordCap} more — ocr:<hwnd>:<idx> ids index the full list; narrow the window or use computer_find");
+            }
+        }
         if (o.PrevAction is { } p)
             sb.AppendLine($"previous action: {p.Kind} {(p.Success ? "ok" : "FAILED")} {p.Detail}");
         sb.AppendLine(o.Frames.Count == 0
@@ -403,11 +433,28 @@ public sealed class InbriskTools
         lock (_s.TrackedWindows)
         {
             var tracked = _s.TrackedWindows.FirstOrDefault(tw => tw.Hwnd == win.Hwnd && !tw.ClosedOrStale);
-            if (tracked != null) return tracked.AgentOwned;
+            if (tracked != null)
+            {
+                // PID-reuse guard: the recorded pid may now belong to a
+                // foreign process (ours exited, pid recycled). When a start
+                // time was recorded, a same-pid claim must re-prove the same
+                // process instance before inheriting agent-owned status; a
+                // null recorded start time is unverifiable and keeps the
+                // hwnd-based claim (the reaper's "close allowed" tier).
+                if (win.Pid == tracked.Pid && tracked.Pid > 0 &&
+                    tracked.ProcessStartTime != null &&
+                    !PidStillMatchesLaunch(tracked))
+                {
+                    tracked.ClosedOrStale = true;
+                    return false;
+                }
+                return tracked.AgentOwned;
+            }
 
             // Across HWND replacement: if window belongs to ApplicationFrameHost or matches launched identity/title
             var replacement = _s.TrackedWindows.FirstOrDefault(tw => tw.AgentOwned && !tw.ClosedOrStale &&
-                ((tw.Pid == win.Pid && tw.Pid > 0 && !string.Equals(win.ProcessName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase)) ||
+                ((tw.Pid == win.Pid && tw.Pid > 0 && PidStillMatchesLaunch(tw) &&
+                  !string.Equals(win.ProcessName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase)) ||
                  (string.Equals(win.ProcessName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) &&
                   (!string.IsNullOrEmpty(tw.AppIdentity) && win.Title.Contains(tw.AppIdentity, StringComparison.OrdinalIgnoreCase) ||
                    !string.IsNullOrEmpty(tw.Title) && win.Title.Contains(tw.Title, StringComparison.OrdinalIgnoreCase)))));
@@ -422,6 +469,23 @@ public sealed class InbriskTools
         if (_s.Rt.Provenance.CanAgentClose(win.Hwnd, out _))
             return true;
         return false;
+    }
+
+    /// <summary>PID-reuse guard for tracked-window adoption: the recorded
+    /// pid is still the process we launched only when its live start time
+    /// equals the one captured at launch. False when the pid is dead,
+    /// unreadable, or the start time differs — or none was recorded (a bare
+    /// pid match alone is not enough evidence to adopt a foreign window).</summary>
+    private static bool PidStillMatchesLaunch(SessionWindowProvenance tw)
+    {
+        if (tw.ProcessStartTime == null) return false;
+        try
+        {
+            using var p = Process.GetProcessById(tw.Pid);
+            return !p.HasExited &&
+                p.StartTime.ToUniversalTime() == tw.ProcessStartTime.Value.UtcDateTime;
+        }
+        catch { return false; }
     }
 
     private LifecycleIntent GetTrackedLifecycleIntent(long hwnd)
@@ -1408,9 +1472,11 @@ public sealed class InbriskTools
         [Description("optional remote debugging port for Chrome DevTools Protocol / CDP (e.g. 9222)")] int? debugPort = null,
         [Description("optional post-launch continuation steps executed via canonical plan executor")] RunStep[]? then = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        [Description("optional specialist adapter to wire at launch — \"blender\" force-enables the bpy socket bridge injection; \"none\" disables auto-injection")] string? adapter = null,
+        [Description("auto-inject the adapter bridge script when a supported app is detected (default true for Blender); false launches plain")] bool? bridge = null,
         CancellationToken ct = default)
     {
-        var normArgs = $"{app}|{search}|{executable}|{path}|{aumid}|{uri}|{string.Join(",", arguments ?? Array.Empty<string>())}|{newInstance}|{waitFor}|{timeoutMs}|{debugPort}|{then?.Length}";
+        var normArgs = $"{app}|{search}|{executable}|{path}|{aumid}|{uri}|{string.Join(",", arguments ?? Array.Empty<string>())}|{newInstance}|{waitFor}|{timeoutMs}|{debugPort}|{then?.Length}|{adapter}|{bridge}";
         if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_launch", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
             return deduped;
         if (conflictError != null)
@@ -1473,11 +1539,14 @@ public sealed class InbriskTools
         try
         {
             var preSnapshot = _s.CapturePreLaunchSnapshot();
+            var launchArguments = ApplyAdapterBridge(adapter, bridge,
+                app ?? search, executable, path, aumid, uri,
+                arguments, out var adapterBridge);
             LaunchResult r;
             try
             {
                 r = _s.Rt.Launch(new LaunchSpec(app ?? search, executable, path,
-                    aumid, uri, arguments, newInstance ?? false,
+                    aumid, uri, launchArguments, newInstance ?? false,
                     waitFor ?? "window", timeoutMs ?? 25000, debugPort), linked.Token);
             }
             catch (OperationCanceledException)
@@ -1738,6 +1807,11 @@ public sealed class InbriskTools
             ["continuation"] = continuationOutcome,
             ["launchState"] = r.LaunchState,
             ["alreadyRunning"] = r.LaunchState == "AlreadyRunning",
+            // injected --python only takes effect when a new process was
+            // actually spawned — a reused AlreadyRunning window never saw
+            // the args, so don't claim the bridge is live there
+            ["adapterBridge"] = r.LaunchState == "AlreadyRunning"
+                ? null : adapterBridge,
             ["note"] = r.LaunchState == "AlreadyRunning"
                 ? "already open — reused the running window" : null,
             ["durationMs"] = r.LaunchMs + r.ReadyMs,
@@ -1886,7 +1960,10 @@ public sealed class InbriskTools
         "name is a case-insensitive SUBSTRING — prefer exact names plus a " +
         "role to avoid label/control collisions. Prefer process over window " +
         "(titles are localized). Example: {process:\"notepad\", " +
-        "role:\"document\"} → the Notepad text area.")]
+        "role:\"document\"} → the Notepad text area. ocr:true scans the " +
+        "window's rendered text when UIA finds nothing (null = auto-fallback " +
+        "on zero matches); OCR hits print as id ocr:<hwnd>:<n> role text " +
+        "and are clickable via elementId.")]
     public async Task<CallToolResult> Find(
         [Description("role filter, e.g. button/edit/checkbox/listitem")] string? role = null,
         [Description("name contains (case-insensitive)")] string? name = null,
@@ -1905,6 +1982,7 @@ public sealed class InbriskTools
         [Description("object form — same filters nested ({process,name,role,hwnd,…}); merged with the flat args")] TargetSpec? target = null,
         [Description("batch list of search queries to execute in one turn (max 16)")] FindQuery[]? queries = null,
         [Description("collapse passive UIA nodes (unnamed, non-actionable containers) in the printed list — default on for slim, off for full; skipped when a role filter is given")] bool? prune = null,
+        [Description("OCR text scan of the target window: null = auto (runs only when the UIA search yields zero matches), true = always run and merge hits into the results, false = never")] bool? ocr = null,
         CancellationToken ct = default)
     {
         if (BadDetail(detail) is { } bd) return bd;
@@ -1923,8 +2001,8 @@ public sealed class InbriskTools
 
         if (queries != null)
         {
-            if (role != null || name != null || automationId != null || hwnd != null || process != null || enabled != null || nameNotContains != null || value != null || valueContains != null || className != null || within != null || query != null || target != null)
-                return Error(OutcomeKind.Malformed, "InvalidArgument: use either legacy single-query fields or queries[], not both");
+            if (role != null || name != null || automationId != null || hwnd != null || process != null || enabled != null || nameNotContains != null || value != null || valueContains != null || className != null || within != null || query != null || target != null || ocr != null)
+                return Error(OutcomeKind.Malformed, "InvalidArgument: use either legacy single-query fields or queries[], not both (ocr is single-query only)");
             if (queries.Length == 0)
                 return Error(OutcomeKind.Malformed, "queries array requires at least 1 query");
             if (queries.Length > 16)
@@ -2032,7 +2110,13 @@ public sealed class InbriskTools
             return bResult;
         }
 
-        var normArgs = $"{role}|{name}|{automationId}|{hwnd}|{process}|{enabled}|{nameNotContains}|{value}|{valueContains}|{className}|{within}|{limit}|{detail}|{query}|{prune}";
+        // OCR-CONTRACT: until TargetSpec.OcrText/Ocr/OcrLang land, those
+        // fields arrive via JsonExtensionData — include them in the dedup key.
+        var targetExtraKey = target?.Extra is { Count: > 0 } te
+            ? string.Join(",", te.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .Select(kv => $"{kv.Key}={kv.Value}"))
+            : "";
+        var normArgs = $"{role}|{name}|{automationId}|{hwnd}|{process}|{enabled}|{nameNotContains}|{value}|{valueContains}|{className}|{within}|{limit}|{detail}|{query}|{prune}|{ocr}|{targetExtraKey}";
         if (_s.Deduplicator.TryDeduplicateRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedFind)
             return cachedFind;
 
@@ -2079,10 +2163,146 @@ public sealed class InbriskTools
                 foreach (var kv in DialogTags(Snapshot(owner)))
                     tags[kv.Key] = kv.Value;
             }
-        var sb = new StringBuilder(UntrustedHeader("uia") + "\n");
+        // ---- OCR text fallback ------------------------------------------
+        // `ocr` semantics: null = auto (run only when the filtered UIA
+        // search above yielded zero matches), true = always scan and merge
+        // hits into the printed results, false = never.
+        // OCR-CONTRACT: the resolver-side OCR path
+        // (ActionResolver.ResolveOcr(TargetSpec, CancellationToken) ->
+        // OcrHit? — {point, confidence, matchedText}) and the
+        // TargetSpec.OcrText/Ocr/OcrLang fields are being added in parallel.
+        // Until they merge, those fields arrive via TargetSpec.Extra
+        // (JsonExtensionData) and this drives the runtime's OcrService
+        // directly (Rt.CaptureRaw + Rt.Ocr — the same engine ResolveOcr
+        // will wrap). Swap to _s.Resolver.ResolveOcr(spec, ct) once it lands.
+        string? ocrText = null; bool? ocrTarget = null; string? ocrLang = null;
+        if (target?.Extra is { Count: > 0 } ocrExtra)
+            foreach (var kv in ocrExtra)
+            {
+                if (kv.Key.Equals("ocrText", StringComparison.OrdinalIgnoreCase)
+                    && kv.Value.ValueKind == JsonValueKind.String)
+                    ocrText = kv.Value.GetString();
+                else if (kv.Key.Equals("ocr", StringComparison.OrdinalIgnoreCase)
+                    && kv.Value.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                    ocrTarget = kv.Value.GetBoolean();
+                else if (kv.Key.Equals("ocrLang", StringComparison.OrdinalIgnoreCase)
+                    && kv.Value.ValueKind == JsonValueKind.String)
+                    ocrLang = kv.Value.GetString();
+            }
+        var ocrMode = ocr ?? ocrTarget; // flat arg wins over target:{ocr:…}
+        var wantOcr = ocrMode == true || (ocrMode == null && els.Count == 0);
+        var ocrQuery = ocrText ?? name;
+        List<UiElement>? ocrEls = null;
+        string? ocrNote = null;
+        var ocrWords = 0;
+        if (wantOcr)
+        {
+            // scope: explicit hwnd/window title → within container → the
+            // process' best window → session scope → foreground window.
+            long? ocrHwnd = ParseHwnd(hwnd);
+            if (ocrHwnd == null && !string.IsNullOrWhiteSpace(hwnd))
+            {
+                try { ocrHwnd = _s.Rt.ResolveWindow(hwnd); }
+                catch { /* title ambiguous/not-found → fall through */ }
+            }
+            if (ocrHwnd == null && within is { } wref)
+            {
+                if (ParseHwnd(wref) is { } wh)
+                    ocrHwnd = wh;
+                else
+                    try
+                    {
+                        var c = _s.Rt.Parts.Registry.EnsureAlive(wref);
+                        ocrHwnd = c?.Handle.Recipe.Hwnd ?? c?.Hwnd;
+                    }
+                    catch { /* stale within → other scopes */ }
+            }
+            ocrHwnd ??= process != null
+                ? FindBestWindowForProcess(process)?.Hwnd : null;
+            ocrHwnd ??= _s.ScopeHwnd ?? _s.Rt.ForegroundWindow()?.Hwnd;
+
+            if (ocrHwnd is not { } oHw)
+                ocrNote = "skipped — no target window (pass hwnd/process or focus a window)";
+            else if (!_s.Rt.OcrAvailable)
+                ocrNote = $"skipped — OCR engine unavailable (lang={_s.Rt.OcrLanguage})";
+            else
+            {
+                var oSw = Stopwatch.StartNew();
+                IReadOnlyList<TextSpan> spans = [];
+                try
+                {
+                    var frame = await Task.Run(
+                        () => _s.Rt.CaptureRaw(new CaptureTarget.Window(oHw)),
+                        ct).ConfigureAwait(false);
+                    spans = await Task.Run(() => _s.Rt.Ocr(frame), ct)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception oex)
+                {
+                    ocrNote = $"capture/recognize failed: {oex.Message}";
+                }
+                ocrWords = spans.Count;
+                if (ocrNote == null)
+                {
+                    if (ocrLang != null && !string.Equals(ocrLang,
+                            _s.Rt.OcrLanguage, StringComparison.OrdinalIgnoreCase))
+                        ocrNote = $"ocrLang \"{ocrLang}\" requested; engine is " +
+                            $"fixed to {_s.Rt.OcrLanguage}";
+                    // OCR emits words — a multi-word query matches on any of
+                    // its tokens so "Render Pipeline" still finds "Render".
+                    var tokens = (ocrQuery ?? "").Split(' ',
+                        StringSplitOptions.RemoveEmptyEntries |
+                        StringSplitOptions.TrimEntries);
+                    var hits = spans.Where(sp => tokens.Length == 0 ||
+                        tokens.Any(t => sp.Text.Contains(t,
+                            StringComparison.OrdinalIgnoreCase))).ToList();
+                    // drop words that merely restate a UIA match (same
+                    // coverage + text) — OCR adds what UIA cannot see
+                    if (els.Count > 0)
+                        hits = hits.Where(sp => !els.Any(e =>
+                            SceneMerger.Covers(e.Bounds, sp.Bounds) &&
+                            (e.Name?.Contains(sp.Text,
+                                StringComparison.OrdinalIgnoreCase) == true ||
+                             (e.Name is { Length: > 0 } en && sp.Text.Contains(
+                                 en, StringComparison.OrdinalIgnoreCase)))))
+                            .ToList();
+                    var oPid = _s.Rt.Window(oHw)?.Pid;
+                    // synthetic elements: id ocr:<hwnd>:<idx>, role text,
+                    // [click] action, registered so elementId works in
+                    // computer_click (Ocr backend → coordinate click).
+                    ocrEls = hits.Select((sp, i) => new UiElement(
+                        $"ocr:{oHw:X}:{i}", BackendId.Ocr, Inbrisk.Core.Role.Text, sp.Text,
+                        sp.Bounds, ["click"],
+                        new Dictionary<string, object?>
+                        {
+                            ["source"] = "ocr",
+                            ["confidence"] = sp.Confidence,
+                        },
+                        new ElementHandle(BackendId.Ocr, sp.Text,
+                            new ReResolveRecipe(oPid, oHw, null, Inbrisk.Core.Role.Text,
+                                sp.Text, null, [], sp.Bounds)),
+                        oPid, oHw, sp.Confidence)).ToList();
+                    if (ocrEls.Count > 0)
+                        _s.Rt.Parts.Registry.Register(ocrEls);
+                }
+                UiaPerf.Write(new
+                {
+                    kind = "ocr.find", at = DateTimeOffset.Now,
+                    traceId = PerfTrace.CurrentId,
+                    ms = oSw.ElapsedMilliseconds,
+                    hwnd = $"0x{oHw:X}", query = ocrQuery,
+                    words = ocrWords, hits = ocrEls?.Count ?? 0,
+                });
+            }
+        }
+
+        var sb = new StringBuilder(UntrustedHeader(
+            ocrEls is { Count: > 0 } ? (els.Count > 0 ? "uia+ocr" : "ocr")
+            : "uia") + "\n");
         var slim = Slim(detail);
         var cap = limit ?? (slim ? 20 : 60);
-        if (els.Count == 0)
+        if (els.Count == 0 && ocrEls is not { Count: > 0 })
         {
             var targetSpec = new TargetSpec(
                 Role: role,
@@ -2102,6 +2322,9 @@ public sealed class InbriskTools
                 sb.AppendLine($"  actionableFix: {diag.SuggestedAction}");
             if (diag.CloseMatches is { Count: > 0 })
                 sb.AppendLine($"  closeMatches: [{string.Join(", ", diag.CloseMatches.Select(m => $"\"{m}\""))}]");
+            if (wantOcr)
+                sb.AppendLine($"  ocr: {ocrNote ?? $"{ocrWords} word(s) scanned, 0 matching hits" +
+                    (ocrQuery != null ? $" (query \"{ocrQuery}\")" : "")}");
             var missResult = Text(sb.ToString());
             _s.Deduplicator.RecordRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, missResult);
             return missResult;
@@ -2120,11 +2343,16 @@ public sealed class InbriskTools
                 matched = els.Count, shown = shown.Count,
                 dropped = els.Count - shown.Count, cap,
             });
-        sb.AppendLine($"found {els.Count} element(s)" +
+        // OCR hits are appended after UIA pruning — a word is never passive
+        // noise — and share the same printed shape + cap.
+        var printed = ocrEls is { Count: > 0 } oc
+            ? shown.Concat(oc).ToList() : shown;
+        sb.AppendLine($"found {els.Count + (ocrEls?.Count ?? 0)} element(s)" +
+            (ocrEls is { Count: > 0 } oc2 ? $" ({oc2.Count} via ocr)" : "") +
             (shown.Count < els.Count
                 ? $" ({els.Count - shown.Count} passive hidden — prune:false to show)" : "") +
-            (shown.Count > cap ? $" — showing {cap}:" : ":"));
-        foreach (var e in shown.Take(cap))
+            (printed.Count > cap ? $" — showing {cap}:" : ":"));
+        foreach (var e in printed.Take(cap))
             sb.AppendLine(slim
                 ? "  " + SlimEl(e, tags)
                 : $"  [{e.Id}] {e.Role} \"{e.Name}\" " +
@@ -2139,8 +2367,10 @@ public sealed class InbriskTools
                     $"actions=[{string.Join(",", e.Actions)}] " +
                     $"enabled={Prop(e, "enabled") ?? "?"}" +
                     (tags.TryGetValue(e.Id, out var tag) ? $" dialogRole={tag}" : ""));
-        if (shown.Count > cap)
-            sb.AppendLine($"  …{shown.Count - cap} more — refine target or pass limit");
+        if (printed.Count > cap)
+            sb.AppendLine($"  …{printed.Count - cap} more — refine target or pass limit");
+        if (wantOcr && ocrEls is not { Count: > 0 })
+            sb.AppendLine($"  ocr: {ocrNote ?? $"{ocrWords} word(s) scanned, 0 matching hits"}");
         var finalResult = Text(sb.ToString());
         _s.Deduplicator.RecordRead("computer_find", normArgs, scopeH, _s.Rt.MutationVersion, finalResult);
         return finalResult;
@@ -2763,6 +2993,7 @@ public sealed class InbriskTools
         [Description("window-relative x in px from the anchor window's top-left — for element-less windows; implies relativeTo:\"window\"")] int? rx = null,
         [Description("window-relative y (see rx)")] int? ry = null,
         [Description("coordinate space for x,y: \"screen\" (default, absolute desktop px) | \"window\" (x,y are offsets from the anchor window's top-left)")] string? relativeTo = null,
+        [Description("deliver via background window message instead of synthesized input — no focus theft, works on unfocused windows. Requires a control element target; coordinate/OCR-point and unsupported kinds fail NotSupported — never a SendInput fallback")] bool? silent = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.IncSequentialSingleAction();
@@ -2811,7 +3042,19 @@ public sealed class InbriskTools
         // would fail before the coordinate path runs. Element-identifying
         // fields still resolve normally (element wins over the point).
         UiElement? el;
-        if (windowRelative && elementId == null && target?.ElementId == null &&
+        OcrTargetHit? ocrHit = null;
+        // OCR targeting — elementId "ocr:<hwnd>:<idx>" (the synthetic ids
+        // computer_find registers and computer_observe ocr:true prints) or
+        // target:{ocrText:"X"} / {ocr:true, name:"X"}. Resolves to the
+        // word's registered element or its center point, then flows through
+        // the same guarded Act pipeline as any other target.
+        if (TryResolveOcrTarget(elementId, target, out el, out var ocrPoint,
+                out ocrHit, out var ocrErr))
+        {
+            if (ocrErr != null) return ocrErr;
+            point ??= ocrPoint; // explicit x/y or rx/ry coordinates still win
+        }
+        else if (windowRelative && elementId == null && target?.ElementId == null &&
             target?.Role == null && target?.Name == null &&
             target?.AutomationId == null)
         {
@@ -2828,10 +3071,11 @@ public sealed class InbriskTools
                 : button?.Equals("double", StringComparison.OrdinalIgnoreCase) == true
                     ? AgentActionKind.DoubleClick
                     : AgentActionKind.Click,
-            ElementId: el?.Id, Point: point), ct, observe, operationId);
+            ElementId: el?.Id, Point: point, Silent: silent == true),
+            ct, observe, operationId);
         return synthId != null
             ? AnnotateWindowRelativeResult(res, synthId, anchorHwnd, relX, relY, absX, absY)
-            : res;
+            : ocrHit != null ? AnnotateOcrResult(res, ocrHit) : res;
     }
 
     [McpServerTool(Name = "computer_invoke"), Description(
@@ -2839,21 +3083,41 @@ public sealed class InbriskTools
         "preferred way to press buttons and menu items: works without " +
         "foreground focus or pixel hit-testing. Accepts elementId or " +
         "semantic target. Example: {process:\"notepad\", role:\"menuitem\", " +
-        "name:\"Dosya\"} opens the File menu. When executing multiple actions in sequence, PREFER computer_batch.")]
-    public Task<CallToolResult> Invoke(
+        "name:\"Dosya\"} opens the File menu. Also accepts OCR ids " +
+        "(elementId \"ocr:<hwnd>:<idx>\") and target:{ocrText|ocr:true} — " +
+        "invoking a word hits its clickable center. When executing multiple actions in sequence, PREFER computer_batch.")]
+    public async Task<CallToolResult> Invoke(
         [Description("elementId")] string? elementId = null,
-        [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?}")] TargetSpec? target = null,
+        [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?, ocrText?, ocr?, ocrLang?}")] TargetSpec? target = null,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        [Description("deliver via background window message (BM_CLICK) — no focus theft; targets that cannot be messaged fail NotSupported — never a SendInput fallback")] bool? silent = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.IncSequentialSingleAction();
         Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
-        var el = ResolveTargetElement(elementId, target, out var err, out _, "invoke");
-        if (err != null) return Task.FromResult(err);
-        if (el == null) return Task.FromResult(
-            Error(OutcomeKind.Malformed, "elementId or target required"));
-        return Act(new AgentAction(AgentActionKind.Invoke, ElementId: el.Id), ct, observe, operationId);
+        UiElement? el;
+        OcrTargetHit? ocrHit = null;
+        ImagePoint? ocrPoint = null;
+        if (TryResolveOcrTarget(elementId, target, out el, out ocrPoint,
+                out ocrHit, out var ocrErr))
+        {
+            if (ocrErr != null) return ocrErr;
+        }
+        else
+        {
+            el = ResolveTargetElement(elementId, target, out var err, out _, "invoke");
+            if (err != null) return err;
+        }
+        if (el == null && ocrPoint == null) return
+            Error(OutcomeKind.Malformed, "elementId or target required");
+        // Invoking a bare OCR word = clicking its center — Invoke with a
+        // point target has no executor path, so dispatch Click.
+        var res = await Act(new AgentAction(
+            el == null ? AgentActionKind.Click : AgentActionKind.Invoke,
+            ElementId: el?.Id, Point: ocrPoint, Silent: silent == true),
+            ct, observe, operationId);
+        return ocrHit != null ? AnnotateOcrResult(res, ocrHit) : res;
     }
 
     [McpServerTool(Name = "computer_set_value"), Description(
@@ -2894,24 +3158,36 @@ public sealed class InbriskTools
     public async Task<CallToolResult> Type(
         [Description("text to type")] string text,
         [Description("elementId")] string? elementId = null,
-        [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?}")] TargetSpec? target = null,
+        [Description("semantic target: {elementId?, window? (title substring, localized — prefer process), process? (exe name), role?, name?, automationId?, ocrText?, ocr?, ocrLang?}")] TargetSpec? target = null,
         [Description("replace|append|insert")] string? mode = null,
         [Description("current|start|end")] string? position = null,
         [Description("press Enter after typing")] bool submit = false,
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        [Description("deliver the text via window message (WM_SETTEXT/EM_REPLACESEL) instead of keystrokes — no focus theft. Requires an element target and mode replace|append; caret-level insert and submit have no message-only equivalent and fail NotSupported")] bool? silent = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.IncSequentialSingleAction();
         Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
-        var normArgs = $"{text}|{elementId}|{target?.ToString()}|{mode}|{position}|{submit}|{observe}";
+        var normArgs = $"{text}|{elementId}|{target?.ToString()}|{mode}|{position}|{submit}|{observe}|{silent}";
         if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_type", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
             return deduped;
         if (conflictError != null)
             return conflictError;
 
-        var el = ResolveTargetElement(elementId, target, out var err, out _, "edit");
-        if (err != null) return err;
+        UiElement? el;
+        OcrTargetHit? ocrHit = null;
+        ImagePoint? ocrPoint = null;
+        if (TryResolveOcrTarget(elementId, target, out el, out ocrPoint,
+                out ocrHit, out var ocrErr))
+        {
+            if (ocrErr != null) return ocrErr;
+        }
+        else
+        {
+            el = ResolveTargetElement(elementId, target, out var err, out _, "edit");
+            if (err != null) return err;
+        }
         var modeN = (mode ?? "insert").ToLowerInvariant();
         var posN = (position ?? (modeN == "append" ? "end" : "current"))
             .ToLowerInvariant();
@@ -2920,10 +3196,52 @@ public sealed class InbriskTools
             return Error(OutcomeKind.Malformed,
                 "mode must be replace|append|insert; position current|start|end");
 
-        var steps = BuildTypeSteps(el, text, modeN, posN, submit);
+        List<AgentAction> steps;
+        if (silent == true)
+        {
+            // Message-based delivery can only set a control's whole text —
+            // caret positioning, keypresses and focused-window typing have
+            // no honest message equivalent. Refuse rather than degrade to
+            // SendInput.
+            if (submit)
+                return Error(OutcomeKind.NotSupported,
+                    "silent type cannot submit — Enter is a keypress with " +
+                    "no message-only equivalent; omit submit or retry with " +
+                    "silent:false");
+            if (el == null)
+                return Error(OutcomeKind.NotSupported,
+                    "silent type requires an element target — text delivered " +
+                    "by window message needs a control hwnd; OCR/coordinate/" +
+                    "focused typing is SendInput semantics — retry with " +
+                    "silent:false");
+            var cur = Prop(el, "value")?.ToString() ?? "";
+            var setText = modeN switch
+            {
+                "replace" => text,
+                "append" when posN == "end" => cur + text,
+                "append" when posN == "start" => text + cur,
+                _ => (string?)null,
+            };
+            if (setText == null)
+                return Error(OutcomeKind.NotSupported,
+                    "silent type supports mode replace and append " +
+                    "(whole-text WM_SETTEXT); insert and caret positioning " +
+                    "have no message-only equivalent — retry with silent:false");
+            steps = [new AgentAction(AgentActionKind.SetValue,
+                ElementId: el.Id, Text: setText, Silent: true)];
+        }
+        else
+        {
+            steps = BuildTypeSteps(el, text, modeN, posN, submit);
+            // OCR word target → click its center first so the field under
+            // it receives focus, then the usual navigation/type steps.
+            if (ocrPoint != null && el == null)
+                steps.Insert(0, new AgentAction(AgentActionKind.Click,
+                    Point: ocrPoint));
+        }
         var res = await ActChain(steps, el?.Id, ct, observe);
         _s.Deduplicator.RecordMutation(operationId, "computer_type", normArgs, res);
-        return res;
+        return ocrHit != null ? AnnotateOcrResult(res, ocrHit) : res;
     }
 
     /// <summary>Expand a high-level type request into primitive actions:
@@ -3001,25 +3319,33 @@ public sealed class InbriskTools
         "STRICT: unknown or wrong-action fields are Malformed, never ignored. " +
         "First failure pauses with step/error/observationDelta/availableElements — resume with the same runId. " +
         "checkpoint pauses deliberately for model reasoning. An unexpected dialog pauses with UnexpectedModalOpened. " +
-        "A proven run becomes a reusable parameterized recipe via computer_save_recipe{fromRunId} — replay later with computer_run_recipe.")]
+        "A proven run becomes a reusable parameterized recipe via computer_save_recipe{fromRunId} — replay later with computer_run_recipe. " +
+        "save_as_recipe:\"name\" auto-saves a successful run as a recipe in the same call.")]
     public async Task<CallToolResult> RunPlan(
         [Description("ordered plan steps")] RunStep[] steps,
         [Description("resume an existing run — keeps its element bindings")] string? runId = null,
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
+        [Description("on success, generalize the executed steps and persist as task-recipes/<name>.json — replay later via computer_run_recipe")] string? saveAsRecipe = null,
+        [Description("snake_case alias of saveAsRecipe")] string? save_as_recipe = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.ResetSequentialSingleAction();
         if (BadDetail(detail) is { } bd) return bd;
 
-        var normArgs = $"{runId}|{detail}|" + JsonSerializer.Serialize(steps, J);
+        var recipeName = saveAsRecipe ?? save_as_recipe;
+        var normArgs = $"{runId}|{detail}|{recipeName}|" + JsonSerializer.Serialize(steps, J);
 
         return await ExecuteWithIdempotencyAsync(operationId, "computer_run", normArgs, async () =>
         {
             var sw = Stopwatch.StartNew();
             try
             {
-                return await RunPlanCore(steps, runId, sw, ct, detail);
+                var res = await RunPlanCore(steps, runId, sw, ct, detail);
+                return AttachSavedRecipe(res, recipeName, steps,
+                    steps.FirstOrDefault(s => string.Equals(s.Action, "launch",
+                        StringComparison.OrdinalIgnoreCase))?.App,
+                    "computer_run");
             }
             catch (OperationCanceledException)
             {
@@ -3039,7 +3365,8 @@ public sealed class InbriskTools
         "Can launch/focus an app, click a target, type text, and/or send a hotkey. " +
         "Examples: computer_do(app: \"notepad\", type: \"hello world\", hotkey: \"ctrl+s\"), " +
         "computer_do(click: \"Save\", type: \"test.txt\", submit: true). " +
-        "For anything beyond launch+click+type+hotkey — conditions, loops over matched items, reads, reusable flows — use computer_run (or a saved computer_run_recipe).")]
+        "For anything beyond launch+click+type+hotkey — conditions, loops over matched items, reads, reusable flows — use computer_run (or a saved computer_run_recipe). " +
+        "save_as_recipe:\"name\" persists a successful flow as a replayable recipe.")]
     public async Task<CallToolResult> ComputerDo(
         [Description("Application to launch or focus (e.g. 'Notepad', 'Calculator')")] string? app = null,
         [Description("Target element name or text to click")] string? click = null,
@@ -3048,11 +3375,17 @@ public sealed class InbriskTools
         [Description("Whether to press Enter after typing (default false)")] bool submit = false,
         [Description("Semantic target or elementId to click")] TargetSpec? target = null,
         [Description("Wait in milliseconds between steps (default 100ms)")] int waitMs = 100,
+        [Description("after the action completes, reap session-spawned processes that are still running (same agent-owned-only safety policy as computer_cleanup; default false)")] bool cleanup = false,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        [Description("optional specialist adapter for the launch step — \"blender\" force-enables the bpy socket bridge injection; \"none\" disables auto-injection")] string? adapter = null,
+        [Description("auto-inject the adapter bridge script when a supported app is detected (default true for Blender); false launches plain")] bool? bridge = null,
+        [Description("on success, generalize the executed steps and persist as task-recipes/<name>.json — replay later via computer_run_recipe")] string? saveAsRecipe = null,
+        [Description("snake_case alias of saveAsRecipe")] string? save_as_recipe = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.ResetSequentialSingleAction();
-        var normArgs = $"{app}|{click}|{type}|{hotkey}|{submit}|{target?.Name}|{target?.Role}|{waitMs}";
+        var recipeName = saveAsRecipe ?? save_as_recipe;
+        var normArgs = $"{app}|{click}|{type}|{hotkey}|{submit}|{target?.Name}|{target?.Role}|{waitMs}|{cleanup}|{adapter}|{bridge}|{recipeName}";
 
         return await ExecuteWithIdempotencyAsync(operationId, "computer_do", normArgs, async () =>
         {
@@ -3060,7 +3393,8 @@ public sealed class InbriskTools
 
             if (!string.IsNullOrWhiteSpace(app))
             {
-                steps.Add(new RunStep { Action = "launch", App = app, WaitFor = "window" });
+                steps.Add(new RunStep { Action = "launch", App = app, WaitFor = "window",
+                    Adapter = bridge == false ? "none" : adapter });
                 if (waitMs > 0 && (!string.IsNullOrWhiteSpace(click) || target != null || !string.IsNullOrWhiteSpace(type) || !string.IsNullOrWhiteSpace(hotkey)))
                     steps.Add(new RunStep { Action = "wait", Ms = waitMs });
             }
@@ -3097,7 +3431,10 @@ public sealed class InbriskTools
             var sw = Stopwatch.StartNew();
             try
             {
-                return await RunPlanCore(steps.ToArray(), null, sw, ct, detail: "slim");
+                var planSteps = steps.ToArray();
+                var res = await RunPlanCore(planSteps, null, sw, ct, detail: "slim");
+                res = AttachSavedRecipe(res, recipeName, planSteps, app, "computer_do");
+                return cleanup ? WithCleanupReap(res) : res;
             }
             catch (OperationCanceledException)
             {
@@ -3127,7 +3464,8 @@ public sealed class InbriskTools
         "WinEvent/UIA events wake them early, a poll cadence remains as fallback; timeoutMs unchanged. " +
         "Result is compact: {success, stepsExecuted, totalSteps, totalDurationMs, results:[{step,do,t,ok,ms,error?}]}. " +
         "Do NOT batch across an unpredicted reasoning boundary. " +
-        "For conditions (ifExists/ifValue), iteration over matched items (scan/for_each), or reusable parameterized flows, prefer computer_run / computer_run_recipe.")]
+        "For conditions (ifExists/ifValue), iteration over matched items (scan/for_each), or reusable parameterized flows, prefer computer_run / computer_run_recipe. " +
+        "save_as_recipe:\"name\" auto-saves a fully successful batch as a replayable recipe.")]
     public async Task<CallToolResult> Batch(
         [Description("ordered list of simple action steps to execute sequentially (mutually exclusive with 'set')")] BatchStep[]? steps = null,
         [Description("compact list of form fields to set in one turn (target, value, role?); mutually exclusive with 'steps'")] FormFieldSpec[]? set = null,
@@ -3136,6 +3474,8 @@ public sealed class InbriskTools
         [Description("output verbosity: slim|full — default slim")] string? detail = null,
         [Description("stop the batch at the first failing step (default true); false records each failure in results[] and keeps executing")] bool? failFast = null,
         [Description("snake_case alias of failFast")] bool? fail_fast = null,
+        [Description("on success, generalize the executed steps and persist as task-recipes/<name>.json — replay later via computer_run_recipe")] string? saveAsRecipe = null,
+        [Description("snake_case alias of saveAsRecipe")] string? save_as_recipe = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
@@ -3412,7 +3752,8 @@ public sealed class InbriskTools
                 props = r.Props
             }),
             detail,
-            failFast = failFastE
+            failFast = failFastE,
+            saveAsRecipe = saveAsRecipe ?? save_as_recipe
         }, J);
         if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_batch", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
             return deduped;
@@ -3519,6 +3860,10 @@ public sealed class InbriskTools
             }
         }
 
+        res = AttachSavedRecipe(res, saveAsRecipe ?? save_as_recipe, runSteps,
+            runSteps.FirstOrDefault(s => string.Equals(s.Action, "launch",
+                StringComparison.OrdinalIgnoreCase))?.App,
+            "computer_batch");
         _s.Deduplicator.RecordMutation(operationId, "computer_batch", normArgs, res);
         return res;
     }
@@ -3837,6 +4182,190 @@ public sealed class InbriskTools
         };
     }
 
+    /// <summary>save_as_recipe post-success hook shared by computer_run,
+    /// computer_do and computer_batch: when the plan result reports success
+    /// (status Completed / success:true) the executed steps are generalized
+    /// through the same path computer_save_recipe uses and persisted under
+    /// task-recipes/&lt;name&gt;.json. A failed or partial run never saves —
+    /// the result passes through untouched. Name/save problems attach a
+    /// recipeWarning field instead of failing the action.</summary>
+    private CallToolResult AttachSavedRecipe(CallToolResult res,
+        string? saveAsRecipe, IReadOnlyList<RunStep> executedSteps,
+        string? app, string toolName)
+    {
+        if (string.IsNullOrWhiteSpace(saveAsRecipe) ||
+            res.Content is not [TextContentBlock { Text: { } rawText }])
+            return res;
+
+        Dictionary<string, object?>? doc;
+        try { doc = JsonSerializer.Deserialize<Dictionary<string, object?>>(rawText, J); }
+        catch { return res; }
+        if (doc == null) return res;
+
+        var completed =
+            (doc.TryGetValue("status", out var st) &&
+             st is JsonElement { ValueKind: JsonValueKind.String } se &&
+             string.Equals(se.GetString(), "Completed",
+                 StringComparison.OrdinalIgnoreCase)) ||
+            (doc.TryGetValue("success", out var sv) &&
+             sv is JsonElement { ValueKind: JsonValueKind.True });
+        if (!completed) return res;
+
+        var (recipe, warning) =
+            SaveStepsAsRecipe(saveAsRecipe.Trim(), executedSteps, app, toolName);
+        if (recipe == null && warning == null) return res;
+        if (recipe != null) doc["recipe"] = recipe;
+        if (warning != null) doc["recipeWarning"] = warning;
+
+        return new CallToolResult
+        {
+            IsError = res.IsError,
+            Content = [new TextContentBlock
+                { Text = JsonSerializer.Serialize(doc, J) }],
+        };
+    }
+
+    /// <summary>Persist executed steps as a reusable recipe — the same
+    /// generalize + store path as computer_save_recipe. When a
+    /// RecipeParameterizer component is present it first rewrites
+    /// dynamic-looking values (urls, file paths, typed free text) into
+    /// {{param}} placeholders; otherwise the recipe is saved verbatim with
+    /// parameterized:false. Returns the recipe block for the tool result,
+    /// or a warning — never throws.</summary>
+    private (Dictionary<string, object?>? Recipe, string? Warning)
+        SaveStepsAsRecipe(string rawName, IReadOnlyList<RunStep> steps,
+            string? app, string toolName)
+    {
+        if (TaskRecipeStore.SanitizeName(rawName) == null)
+            return (null, $"save_as_recipe '{rawName}' has no usable " +
+                "filename characters — recipe not saved");
+        if (steps.Count == 0)
+            return (null, "save_as_recipe skipped — no executed steps to save");
+
+        var parameterized = TryParameterizeSteps(steps,
+            out var parameterizedSteps, out var detectedParams);
+        var source = parameterized ? parameterizedSteps : steps;
+
+        var generalized = new RunStep[source.Count];
+        for (var i = 0; i < source.Count; i++)
+            generalized[i] = GeneralizeRecipeStep(source[i], app);
+
+        var stepsJson = JsonSerializer.Serialize(generalized,
+            new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                DefaultIgnoreCondition = System.Text.Json.Serialization
+                    .JsonIgnoreCondition.WhenWritingNull
+            });
+
+        var replaced = _s.RecipeStore.Get(rawName) != null;
+        var def = new TaskRecipeDefinition(
+            Name: rawName,
+            Description: $"auto-saved from a successful {toolName} call",
+            App: app,
+            Parameters: detectedParams ?? Array.Empty<RecipeParameter>(),
+            Preconditions: Array.Empty<string>(),
+            StepsJson: stepsJson,
+            Postconditions: Array.Empty<string>(),
+            CreatedAt: DateTimeOffset.UtcNow);
+        try { _s.RecipeStore.Save(def); }
+        catch (Exception ex)
+        {
+            return (null,
+                $"save_as_recipe '{rawName}' failed to persist: {ex.Message}");
+        }
+
+        var recipe = new Dictionary<string, object?>
+        {
+            ["name"] = rawName,
+            ["path"] = _s.RecipeStore.PathFor(rawName),
+            ["steps"] = generalized.Length,
+            ["parameterized"] = parameterized,
+        };
+        if (detectedParams is { Length: > 0 })
+            recipe["params"] = detectedParams.Select(p => p.Name).ToArray();
+        if (replaced) recipe["replaced"] = true;
+        return (recipe, null);
+    }
+
+    /// <summary>Optional RecipeParameterizer bridge — the parameterizer is
+    /// delivered as a separate component exposing Extract(steps) →
+    /// (steps', params). It is invoked via reflection so this compiles and
+    /// falls back cleanly whether or not it has merged: absent or
+    /// incompatible shape → false, and callers save verbatim with
+    /// parameterized:false.</summary>
+    private static bool TryParameterizeSteps(IReadOnlyList<RunStep> steps,
+        out RunStep[] parameterizedSteps, out RecipeParameter[]? parameters)
+    {
+        parameterizedSteps = [];
+        parameters = null;
+        try
+        {
+            var type = AppDomain.CurrentDomain.GetAssemblies()
+                .Select(a => a.GetType("Inbrisk.Mcp.RecipeParameterizer")
+                    ?? a.GetType("Inbrisk.Runtime.RecipeParameterizer")
+                    ?? a.GetType("Inbrisk.Core.RecipeParameterizer"))
+                .FirstOrDefault(t => t != null);
+            var extract = type?.GetMethods(
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.Static)
+                .FirstOrDefault(m => m.Name == "Extract" &&
+                    m.GetParameters().Length >= 1);
+            var argType = extract?.GetParameters()[0].ParameterType;
+            if (extract == null || argType == null) return false;
+
+            object? arg = steps.ToArray();
+            if (!argType.IsAssignableFrom(arg.GetType()))
+            {
+                if (argType.IsAssignableFrom(typeof(List<RunStep>)))
+                    arg = steps.ToList();
+                else
+                    return false;
+            }
+            var ret = extract.Invoke(null, [arg]);
+            if (ret == null) return false;
+
+            // (steps', params) value tuple, or an object with
+            // Steps/Parameters members
+            object? stepsObj = null, paramsObj = null;
+            var rt = ret.GetType();
+            if (rt.FullName?.StartsWith("System.ValueTuple",
+                    StringComparison.Ordinal) == true)
+            {
+                stepsObj = rt.GetField("Item1")?.GetValue(ret);
+                paramsObj = rt.GetField("Item2")?.GetValue(ret);
+            }
+            else
+            {
+                stepsObj = rt.GetProperty("Steps")?.GetValue(ret);
+                paramsObj = rt.GetProperty("Parameters")?.GetValue(ret)
+                    ?? rt.GetProperty("Params")?.GetValue(ret);
+            }
+            if (stepsObj is not System.Collections.IEnumerable stepsEnum)
+                return false;
+            var arr = stepsEnum.Cast<RunStep>().ToArray();
+            if (arr.Length == 0) return false;
+            parameterizedSteps = arr;
+
+            if (paramsObj is IEnumerable<RecipeParameter> rp)
+            {
+                parameters = rp.ToArray();
+            }
+            else if (paramsObj is System.Collections.IEnumerable pEnum)
+            {
+                // a foreign parameter type — keep whatever exposes a Name
+                parameters = pEnum.Cast<object?>()
+                    .Select(p => p?.GetType().GetProperty("Name")
+                        ?.GetValue(p) as string)
+                    .Where(n => !string.IsNullOrWhiteSpace(n))
+                    .Select(n => new RecipeParameter(n!))
+                    .ToArray();
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
     private static void SubstituteInJsonNode(System.Text.Json.Nodes.JsonNode node, Dictionary<string, string> parameters)
     {
         if (node is System.Text.Json.Nodes.JsonObject obj)
@@ -3974,19 +4503,128 @@ public sealed class InbriskTools
         return Task.FromResult(Text(sb.ToString().TrimEnd()));
     }
 
+    // ---------------- session process cleanup ----------------
+    // Reaps ONLY processes this session provably spawned. Backed by
+    // InbriskRuntime.ProcessTracker (Inbrisk.Core.SessionProcessTracker):
+    // every pid inbrisk launches is Track()ed with its start-time + baseline
+    // window count, and ReapAll does WM_CLOSE → ~2s grace → hard-kill only
+    // when the pid's identity is verified, no windows remain, and no
+    // protection veto applies. Untracked/user processes are never touched.
+
+    [McpServerTool(Name = "computer_cleanup"), Description(
+        "Reap leftover processes this session spawned that are still running: " +
+        "posts WM_CLOSE for a graceful exit, waits a short grace period, then " +
+        "kills only windowless processes whose spawn identity is verified. " +
+        "NEVER touches untracked or user processes — ineligible pids are " +
+        "reported in skipped[] with a reason. " +
+        "Returns {pending, reaped, skipped:[{pid,reason}]}.")]
+    public async Task<CallToolResult> Cleanup(
+        [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        CancellationToken ct = default)
+    {
+        // Same mutating-op gate as computer_app_shutdown: cleanup mutates the
+        // desktop, so it honours the latched emergency-stop epoch. The consent
+        // path also mirrors app_shutdown — only session-spawned, tracker-held
+        // pids are eligible; there is no force override for foreign processes.
+        if (_s.Control.ActionToken() == null)
+            return Error(OutcomeKind.EmergencyStopped, StoppedDetail);
+
+        return await ExecuteWithIdempotencyAsync(operationId, "computer_cleanup", "reap", async () =>
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var report = await Task.Run(
+                    () => _s.Rt.ProcessTracker.ReapAll(_s.SessionId), ct);
+                return Json(CleanupPayload(report));
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                return Error(OutcomeKind.Failed, $"cleanup reap failed: {ex.Message}");
+            }
+        });
+    }
+
+    /// <summary>Shared {pending, reaped, skipped:[{pid,reason}]} projection
+    /// of the tracker's ReapReport — "skipped" lists every tracked pid this
+    /// pass did not terminate (already-exited, vetoed, or save-prompted).</summary>
+    private static object CleanupPayload(ReapReport report) => new
+    {
+        pending = report.Attempted,
+        reaped = report.Reaped,
+        skipped = report.Outcomes
+            .Where(o => o.Action is not ("closed" or "killed"))
+            .Select(o => new { pid = o.Pid, process = o.ProcessName, reason = o.Reason ?? o.Action })
+            .ToList(),
+        pendingRemaining = report.PendingRemaining,
+        elapsedMs = report.ElapsedMs,
+    };
+
+    /// <summary>Post-wraps a computer_do result with a "cleanup" node when
+    /// cleanup:true was passed — reaps session-spawned leftovers and reports
+    /// {pending, reaped, skipped:[{pid,reason}]}. Never reaps while the
+    /// emergency stop is latched; leaves the original result untouched if its
+    /// payload is not a JSON object.</summary>
+    private CallToolResult WithCleanupReap(CallToolResult res)
+    {
+        try
+        {
+            object cleanup;
+            if (_s.Control.ActionToken() == null)
+            {
+                cleanup = new { error = OutcomeKind.EmergencyStopped.ToString(), detail = StoppedDetail };
+            }
+            else
+            {
+                cleanup = CleanupPayload(_s.Rt.ProcessTracker.ReapAll(_s.SessionId));
+            }
+
+            var text = res.Content?.OfType<TextContentBlock>().FirstOrDefault()?.Text;
+            if (string.IsNullOrEmpty(text)) return res;
+            if (System.Text.Json.Nodes.JsonNode.Parse(text) is not
+                System.Text.Json.Nodes.JsonObject node) return res;
+            node["cleanup"] = JsonSerializer.SerializeToNode(cleanup, J);
+            return new CallToolResult
+            {
+                IsError = res.IsError,
+                Content = [new TextContentBlock { Text = node.ToJsonString(J) }],
+            };
+        }
+        catch { return res; }
+    }
+
     [McpServerTool(Name = "computer_adapter"), Description(
         "Direct specialist application adapter execution (for browser work prefer the dedicated browser_* tools — " +
         "browser_browse, browser_click, browser_type, browser_evaluate, browser_content, browser_tabs — " +
         "the one-call self-healing path). Chrome DevTools Protocol / CDP for DOM, script, tabs; media controls for Spotify/VLC; " +
         "specialist app APIs, CLI tools). Bypasses coordinate clicking and executes semantic commands in <5ms.")]
     public async Task<CallToolResult> AdapterExecute(
-        [Description("action to execute, e.g. navigate, click, type, evaluate, get_content, list_tabs, new_tab, close_tab, play, pause, next, volume_up, read_state")] string action,
+        [Description("action to execute, e.g. navigate, click, type, evaluate, get_content, list_tabs, new_tab, close_tab, play, pause, next, volume_up, read_state — script-execution actions (evaluate/exec/eval/execute) require local consent, see browser_evaluate")] string action,
         [Description("optional preferred adapter ID: chrome_devtools | media | testapp | blender (bpy socket bridge — run action:bootstrap once to install the in-Blender bridge script)")] string? adapter = null,
         [Description("optional target application specification")] TargetSpec? target = null,
         [Description("optional arguments payload for the adapter")] Dictionary<string, object?>? args = null,
         CancellationToken ct = default)
     {
         var sw = Stopwatch.StartNew();
+
+        // Dangerous-action gate: adapter script-exec actions (CDP
+        // Runtime.evaluate, Blender bpy exec/eval) run caller-supplied
+        // code — the same class as browser_evaluate.
+        var act = action ?? "";
+        var adapterIsScriptExec = ScriptExecActions.Contains(act);
+        var adapterScriptCode = adapterIsScriptExec ? ExtractScriptArg(args) : null;
+        if (adapterIsScriptExec && !ScriptExecAllowed())
+        {
+            AuditScriptExec("computer_adapter", act, adapter,
+                ok: false, reason: "denied — allowScriptExecution off",
+                adapterScriptCode);
+            return Error(OutcomeKind.ConfirmationDenied,
+                ScriptExecDeniedDetail("computer_adapter"), sw);
+        }
+
+        CallToolResult result;
+        Inbrisk.Core.AdapterResult? res = null;
         var processName = target?.Process ?? _s?.Rt?.ForegroundWindow()?.ProcessName;
         var hwnd = target?.Hwnd != null ? ParseHwnd(target.Hwnd) : _s?.Rt?.ForegroundWindow()?.Hwnd;
 
@@ -3995,8 +4633,9 @@ public sealed class InbriskTools
         else if (!string.IsNullOrEmpty(target?.ElementId)) targetRef = TargetRef.Element(target.ElementId);
 
         var registry = _s?.Adapters ?? new Inbrisk.Runtime.Adapters.ApplicationAdapterRegistry();
-        (bool handled, Inbrisk.Core.AdapterResult? res) = await registry.TryExecuteAsync(
-            action: action,
+        bool handled;
+        (handled, res) = await registry.TryExecuteAsync(
+            action: act,
             target: targetRef,
             args: args,
             processName: processName,
@@ -4005,64 +4644,215 @@ public sealed class InbriskTools
             ct: ct);
 
         if (!handled || res == null)
-            return Error(OutcomeKind.Malformed, $"no adapter available to handle action '{action}' for process '{processName}'", sw);
+            result = Error(OutcomeKind.Malformed, $"no adapter available to handle action '{act}' for process '{processName}'", sw);
+        else if (!res.Success)
+            result = Error(res.Error == ErrorCode.NotFound ? OutcomeKind.TargetNotFound : OutcomeKind.Failed, res.Detail ?? "adapter execution failed", sw);
+        else
+            result = Json(new
+            {
+                success = true,
+                method = res.Method,
+                detail = res.Detail,
+                data = res.Data,
+                durationMs = sw.ElapsedMilliseconds,
+                provenance = Provenance("adapter")
+            });
 
-        if (!res.Success)
-            return Error(res.Error == ErrorCode.NotFound ? OutcomeKind.TargetNotFound : OutcomeKind.Failed, res.Detail ?? "adapter execution failed", sw);
-
-        return Json(new
-        {
-            success = true,
-            method = res.Method,
-            detail = res.Detail,
-            data = res.Data,
-            durationMs = sw.ElapsedMilliseconds,
-            provenance = Provenance("adapter")
-        });
+        if (adapterIsScriptExec)
+            AuditScriptExec("computer_adapter", act,
+                adapter ?? res?.Method,
+                ok: result.IsError != true,
+                reason: result.IsError == true
+                    ? "allowed — call did not succeed"
+                    : "allowed — executed",
+                adapterScriptCode);
+        return result;
     }
 
     // ---------------- browser_* — first-class Chrome/CDP tools ----------------
     // One-call, self-healing paths over the chrome_devtools adapter: no
     // computer_launch needed — a dead CDP port auto-spawns a debug browser.
 
+    // ---- script-execution gate (dangerous action, F04 class) ----
+    // browser_evaluate and adapter script-exec actions (CDP
+    // Runtime.evaluate, Blender bpy exec/eval) run caller-supplied code —
+    // the same dangerous class as shell-host typing: AutoConfirm and
+    // tool-call flags are self-approval, never consent. The only consent
+    // channels are local and unreachable from the MCP request path:
+    //   1. "AllowScriptExecution": true in settings.json
+    //      (%LOCALAPPDATA%\inbrisk\settings.json, or $INBRISK_DATA_DIR),
+    //      written by the setup app or edited by the user;
+    //   2. INBRISK_ALLOW_SCRIPT_EXECUTION on the host process — set, it
+    //      wins both ways (truthy allows; set-but-falsy force-denies even
+    //      when the setting is on).
+    // Every attempt — allowed or denied — is appended to the
+    // tamper-evident audit log (mcp-scriptexec.jsonl, hash-chained).
+
+    private static readonly string ScriptExecAuditPath =
+        AuditLog.Path("mcp-scriptexec.jsonl");
+    private static readonly string? ScriptExecAuditMirror =
+        AuditLog.MirrorPath("mcp-scriptexec.jsonl");
+    private static readonly object ScriptExecAuditGate = new();
+
+    /// <summary>Adapter action names that execute caller-supplied code:
+    /// chrome_devtools "evaluate" (JS) and the Blender bpy bridge
+    /// "execute"/"exec"/"eval"/"evaluate" (Python). Navigation, click,
+    /// type, and read actions evaluate fixed internal scripts — caller
+    /// data goes in serialized, never as code — and stay open.</summary>
+    private static readonly HashSet<string> ScriptExecActions =
+        new(StringComparer.OrdinalIgnoreCase)
+        { "evaluate", "eval", "exec", "execute" };
+
+    /// <summary>Local-consent check for script execution. The env var
+    /// wins both ways — set, its truthiness decides (deployments can
+    /// force-deny); unset falls through to the settings.json flag.</summary>
+    private static bool ScriptExecAllowed()
+    {
+        var env = Environment.GetEnvironmentVariable(
+            "INBRISK_ALLOW_SCRIPT_EXECUTION")?.Trim();
+        if (!string.IsNullOrEmpty(env))
+            return env.Equals("1", StringComparison.OrdinalIgnoreCase)
+                || env.Equals("true", StringComparison.OrdinalIgnoreCase)
+                || env.Equals("yes", StringComparison.OrdinalIgnoreCase)
+                || env.Equals("on", StringComparison.OrdinalIgnoreCase);
+        return Core.UserSettings.LoadCached().AllowScriptExecution;
+    }
+
+    private static string ScriptExecDeniedDetail(string surface) =>
+        $"{surface} denied — it executes caller-supplied code and is a " +
+        "dangerous action: consent must come from a LOCAL channel the " +
+        "model cannot forge. Set \"AllowScriptExecution\": true in " +
+        "settings.json (via the setup app or a manual edit) or launch the " +
+        "host with INBRISK_ALLOW_SCRIPT_EXECUTION=1. AutoConfirm and " +
+        "tool-call flags are ignored for dangerous classes.";
+
+    /// <summary>Extract the caller-supplied code payload from adapter
+    /// args for the audit hash — chrome uses "expression"/"script",
+    /// blender "code"/"script"/"expression".</summary>
+    private static string? ExtractScriptArg(
+        IReadOnlyDictionary<string, object?>? args)
+    {
+        if (args == null) return null;
+        foreach (var k in new[] { "expression", "code", "script" })
+            if (args.TryGetValue(k, out var v) && v != null)
+                return v.ToString();
+        return null;
+    }
+
+    /// <summary>Tamper-evident audit record for every script-exec attempt —
+    /// {at, tool, action, adapter, ok, reason, codeHash, codeLength}. The
+    /// code payload is hashed, never stored verbatim.</summary>
+    private static void AuditScriptExec(string tool, string action,
+        string? adapter, bool ok, string reason, string? code)
+    {
+        try
+        {
+            var record = JsonSerializer.SerializeToNode(new
+            {
+                at = DateTimeOffset.UtcNow,
+                category = "script_execution",
+                tool,
+                action,
+                adapter,
+                ok,
+                reason,
+                codeHash = code != null
+                    ? Convert.ToHexString(System.Security.Cryptography.SHA256
+                        .HashData(Encoding.UTF8.GetBytes(code))).ToLowerInvariant()
+                    : null,
+                codeLength = code?.Length,
+            })!.AsObject();
+            lock (ScriptExecAuditGate)
+            {
+                var line = AuditLog.ChainLine(record,
+                    AuditLog.LastChainHash(ScriptExecAuditPath));
+                Directory.CreateDirectory(
+                    Path.GetDirectoryName(ScriptExecAuditPath)!);
+                File.AppendAllText(ScriptExecAuditPath, line + "\n");
+                try
+                {
+                    if (ScriptExecAuditMirror != null)
+                        File.AppendAllText(ScriptExecAuditMirror, line + "\n");
+                }
+                catch { /* best-effort mirror */ }
+            }
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine(
+                $"Inbrisk script-exec audit failed: {e.Message}");
+        }
+    }
+
     /// <summary>Shared dispatch for the browser_* family — every call goes
-    /// through the emergency-stop token and the chrome_devtools adapter.</summary>
+    /// through the emergency-stop token, the script-execution gate (for
+    /// caller-supplied-code actions), and the chrome_devtools adapter.</summary>
     private async Task<CallToolResult> BrowserCall(
         string action, Dictionary<string, object?> args, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
+
+        // Dangerous-action gate: script-exec actions (CDP Runtime.evaluate)
+        // run caller-supplied code — deny unless locally consented.
+        var isScriptExec = ScriptExecActions.Contains(action);
+        var scriptCode = isScriptExec ? ExtractScriptArg(args) : null;
+        if (isScriptExec && !ScriptExecAllowed())
+        {
+            AuditScriptExec($"browser_{action}", action, "chrome_devtools",
+                ok: false, reason: "denied — allowScriptExecution off",
+                scriptCode);
+            return Error(OutcomeKind.ConfirmationDenied,
+                ScriptExecDeniedDetail($"browser_{action}"), sw);
+        }
+
+        CallToolResult result;
         var epoch = _s.Control.ActionToken();
         if (epoch == null)
-            return Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw);
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-            ct, _s.SessionCts.Token, epoch.Value);
-
-        var registry = _s?.Adapters ?? new Inbrisk.Runtime.Adapters.ApplicationAdapterRegistry();
-        (bool handled, Inbrisk.Core.AdapterResult? res) = await registry.TryExecuteAsync(
-            action: action,
-            target: null,
-            args: args,
-            processName: "chrome",
-            hwnd: null,
-            preferredAdapterId: "chrome_devtools",
-            ct: linked.Token);
-
-        if (!handled || res == null)
-            return Error(OutcomeKind.Failed, "chrome_devtools adapter unavailable", sw);
-        if (!res.Success)
-            return Error(res.Error == ErrorCode.NotFound
-                    ? OutcomeKind.TargetNotFound : OutcomeKind.Failed,
-                res.Detail ?? $"browser {action} failed", sw);
-
-        return Json(new
         {
-            success = true,
-            method = res.Method,
-            detail = res.Detail,
-            data = res.Data,
-            durationMs = sw.ElapsedMilliseconds,
-            provenance = Provenance("cdp")
-        });
+            result = Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw);
+        }
+        else
+        {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                ct, _s.SessionCts.Token, epoch.Value);
+
+            var registry = _s?.Adapters ?? new Inbrisk.Runtime.Adapters.ApplicationAdapterRegistry();
+            (bool handled, Inbrisk.Core.AdapterResult? res) = await registry.TryExecuteAsync(
+                action: action,
+                target: null,
+                args: args,
+                processName: "chrome",
+                hwnd: null,
+                preferredAdapterId: "chrome_devtools",
+                ct: linked.Token);
+
+            if (!handled || res == null)
+                result = Error(OutcomeKind.Failed,
+                    "chrome_devtools adapter unavailable", sw);
+            else if (!res.Success)
+                result = Error(res.Error == ErrorCode.NotFound
+                        ? OutcomeKind.TargetNotFound : OutcomeKind.Failed,
+                    res.Detail ?? $"browser {action} failed", sw);
+            else
+                result = Json(new
+                {
+                    success = true,
+                    method = res.Method,
+                    detail = res.Detail,
+                    data = res.Data,
+                    durationMs = sw.ElapsedMilliseconds,
+                    provenance = Provenance("cdp")
+                });
+        }
+
+        if (isScriptExec)
+            AuditScriptExec($"browser_{action}", action, "chrome_devtools",
+                ok: result.IsError != true,
+                reason: result.IsError == true
+                    ? "allowed — call did not succeed"
+                    : "allowed — executed",
+                scriptCode);
+        return result;
     }
 
     [McpServerTool(Name = "browser_browse"), Description(
@@ -4136,7 +4926,11 @@ public sealed class InbriskTools
     [McpServerTool(Name = "browser_evaluate"), Description(
         "Run JavaScript in the active page of the debug browser and return " +
         "the result (CDP Runtime.evaluate, awaitPromise + returnByValue). " +
-        "The escape hatch for anything the other browser_* tools don't cover.")]
+        "The escape hatch for anything the other browser_* tools don't cover. " +
+        "DANGEROUS ACTION — denied by default: requires LOCAL consent the " +
+        "model cannot supply (settings.json \"AllowScriptExecution\": true, " +
+        "or host env INBRISK_ALLOW_SCRIPT_EXECUTION=1). Every attempt is " +
+        "audit-logged.")]
     public Task<CallToolResult> BrowserEvaluate(
         [Description("JavaScript expression to evaluate")] string expression,
         [Description("pin a specific tab from browser_tabs/browser_browse")] string? tabId = null,
@@ -4861,14 +5655,45 @@ public sealed class InbriskTools
                 if (targetHwnd.HasValue) stepTargetRef = TargetRef.Window(targetHwnd.Value);
                 else if (!string.IsNullOrEmpty(s.Target?.ElementId)) stepTargetRef = TargetRef.Element(s.Target.ElementId);
 
-                (bool handled, Inbrisk.Core.AdapterResult? adapterRes) = await (_s?.Adapters ?? new Inbrisk.Runtime.Adapters.ApplicationAdapterRegistry()).TryExecuteAsync(
-                    action: adapterAction,
-                    target: stepTargetRef,
-                    args: effectiveArgs,
-                    processName: proc,
-                    hwnd: targetHwnd,
-                    preferredAdapterId: s.Adapter,
-                    ct: linked.Token);
+                // Dangerous-action gate: an "adapter" plan step with a
+                // script-exec action (evaluate/exec/eval/execute) runs
+                // caller-supplied code — same class as browser_evaluate.
+                // Denied steps flow into the normal adapter-failure path
+                // (report Failed, honour continueOnError) and every
+                // attempt is audit-logged.
+                var stepIsScriptExec = ScriptExecActions.Contains(adapterAction);
+                var stepScriptCode = stepIsScriptExec ? ExtractScriptArg(effectiveArgs) : null;
+                bool handled; Inbrisk.Core.AdapterResult? adapterRes;
+                if (stepIsScriptExec && !ScriptExecAllowed())
+                {
+                    AuditScriptExec("computer_run", adapterAction, s.Adapter,
+                        ok: false, reason: "denied — allowScriptExecution off",
+                        stepScriptCode);
+                    handled = true;
+                    adapterRes = new Inbrisk.Core.AdapterResult(false,
+                        "SafetyPolicy.ScriptExec",
+                        ScriptExecDeniedDetail($"run step '{adapterAction}'"),
+                        Error: ErrorCode.ConfirmationRequired);
+                }
+                else
+                {
+                    (handled, adapterRes) = await (_s?.Adapters ?? new Inbrisk.Runtime.Adapters.ApplicationAdapterRegistry()).TryExecuteAsync(
+                        action: adapterAction,
+                        target: stepTargetRef,
+                        args: effectiveArgs,
+                        processName: proc,
+                        hwnd: targetHwnd,
+                        preferredAdapterId: s.Adapter,
+                        ct: linked.Token);
+
+                    if (stepIsScriptExec)
+                        AuditScriptExec("computer_run", adapterAction, s.Adapter,
+                            ok: handled && adapterRes?.Success == true,
+                            reason: handled
+                                ? "allowed — executed per result"
+                                : "allowed — no adapter handled",
+                            stepScriptCode);
+                }
 
                 if (handled && adapterRes != null)
                 {
@@ -4960,6 +5785,11 @@ public sealed class InbriskTools
                 using (PerfTrace.Stage("step.resolve"))
                     built = BuildStepActions(s, state,
                         out errKind, out errDetail, out postId, out stepDiag);
+                // silent:true on the step opts every produced action into
+                // WM-message delivery — the executor's safety gates are
+                // identical; unsupported kinds fail NotSupported upstream.
+                if (built != null && s.Silent == true)
+                    built = built.Select(a => a with { Silent = true }).ToList();
                 if (built == null)
                 {
                     var (healed, healDetail) = await TrySelfHeal(s, state, errKind, errDetail, octx, linked.Token);
@@ -5356,7 +6186,7 @@ public sealed class InbriskTools
             "wait_for_change" or "wait_for_stable" => ["ms"],
             "launch" => ["target", "text", "value", "as", "ms", "app",
                 "search", "executable", "path", "aumid", "uri", "arguments",
-                "newInstance", "waitFor", "debugPort"],
+                "newInstance", "waitFor", "debugPort", "adapter"],
             _ => null,
         };
         if (allowed == null)
@@ -5692,7 +6522,7 @@ public sealed class InbriskTools
     private StepOutcome LaunchOutcome(RunStep s, RunState state,
         CancellationToken ct)
     {
-        var spec = StepLaunchSpec(s, out var err);
+        var spec = StepLaunchSpec(s, out var err, out var bridgeInfo);
         if (err != null)
             return new StepOutcome(OutcomeKind.Malformed, false, "launch",
                 err, 0);
@@ -5736,7 +6566,10 @@ public sealed class InbriskTools
                 ? $" hwnd=0x{hh:X} \"{Trunc(r.WindowTitle, 40)}\""
                 : "") +
             (s.As != null && r.Hwnd != null
-                ? $" → ${s.As.TrimStart('$')}" : ""), 0);
+                ? $" → ${s.As.TrimStart('$')}" : "") +
+            (bridgeInfo != null && r.LaunchState != "AlreadyRunning"
+                ? $" adapterBridge={bridgeInfo["adapter"]}@127.0.0.1:{bridgeInfo["port"]}"
+                : ""), 0);
     }
 
     private sealed record ScanResult(
@@ -5889,6 +6722,8 @@ public sealed class InbriskTools
                         else
                         {
                             var built = BuildStepActions(effectiveSub, state, out var subErrKind, out var subErrDetail, out var subPost, out var subDiag);
+                            if (built != null && effectiveSub.Silent == true)
+                                built = built.Select(a => a with { Silent = true }).ToList();
                             if (built == null)
                             {
                                 subOutcome = new StepOutcome(
@@ -6065,9 +6900,11 @@ public sealed class InbriskTools
     /// executable/path/aumid/uri are the advanced overrides. `text` /
     /// `target.process` remain accepted as the app's name for backwards
     /// compatibility with earlier plans.</summary>
-    private static LaunchSpec? StepLaunchSpec(RunStep s, out string? err)
+    private static LaunchSpec? StepLaunchSpec(RunStep s, out string? err,
+        out Dictionary<string, object?>? bridgeInfo)
     {
         err = null;
+        bridgeInfo = null;
         var app = s.App ?? s.Search ?? s.Target?.Process ?? s.Text ?? s.Value;
         var ids = new[]
         {
@@ -6092,9 +6929,85 @@ public sealed class InbriskTools
             err = "launch arguments only apply to executable targets";
             return null;
         }
+        // adapter:"none" on a launch step opts out of bridge injection;
+        // adapter:"blender" force-enables it even when the name doesn't
+        // mention Blender.
+        var mergedArgs = ApplyAdapterBridge(s.Adapter, bridge: null,
+            app, s.Executable, s.Path, s.Aumid, s.Uri,
+            s.Arguments, out bridgeInfo);
         return new LaunchSpec(app, s.Executable, s.Path, s.Aumid, s.Uri,
-            s.Arguments, s.NewInstance ?? false, s.WaitFor ?? "window",
+            mergedArgs, s.NewInstance ?? false, s.WaitFor ?? "window",
             s.Timeout ?? s.Ms ?? 25000, s.DebugPort);
+    }
+
+    /// <summary>Adapter bridge injection for launches: when the target is
+    /// Blender (app/executable/path mentions "blender", or
+    /// adapter:"blender" was requested explicitly) materialize the embedded
+    /// bpy socket-bridge script via BlenderAdapter's bootstrap path and
+    /// append <c>--python &lt;bridge-path&gt;</c> to the launch arguments so
+    /// semantic control is live as soon as the window appears. Skipped when
+    /// bridge:false, adapter:"none", an explicit non-blender adapter, the
+    /// caller already supplied a --python arg, or the launch is aumid/uri
+    /// (arguments don't apply there). A failed materialization never blocks
+    /// the launch — the app simply starts without the bridge.</summary>
+    private static IReadOnlyList<string>? ApplyAdapterBridge(
+        string? adapter, bool? bridge,
+        string? app, string? executable, string? path,
+        string? aumid, string? uri,
+        IReadOnlyList<string>? arguments,
+        out Dictionary<string, object?>? bridgeInfo)
+    {
+        bridgeInfo = null;
+        var adapterId = adapter?.Trim();
+        if (bridge == false ||
+            string.Equals(adapterId, "none", StringComparison.OrdinalIgnoreCase))
+            return arguments;
+        if (!string.IsNullOrEmpty(adapterId) &&
+            !string.Equals(adapterId, "blender", StringComparison.OrdinalIgnoreCase))
+            return arguments; // explicit non-blender adapter → nothing to inject
+        if (aumid != null || uri != null)
+            return arguments; // arguments never apply to aumid/uri launches
+        if (arguments != null && arguments.Any(a =>
+                a.Equals("--python", StringComparison.OrdinalIgnoreCase) ||
+                a.StartsWith("--python=", StringComparison.OrdinalIgnoreCase)))
+            return arguments; // caller already wired its own script
+
+        var isBlender =
+            string.Equals(adapterId, "blender", StringComparison.OrdinalIgnoreCase) ||
+            MentionsBlender(app) || MentionsBlender(executable) ||
+            MentionsBlender(path);
+        if (!isBlender)
+            return arguments;
+
+        try
+        {
+            var res = new Inbrisk.Runtime.Adapters.BlenderAdapter()
+                .ExecuteAsync("bootstrap").GetAwaiter().GetResult();
+            var scriptPath = res.Data?["path"]?.ToString();
+            if (!res.Success || string.IsNullOrEmpty(scriptPath))
+                return arguments;
+            var port = res.Data != null &&
+                       res.Data.TryGetValue("port", out var p) && p is int pi
+                ? pi : Inbrisk.Runtime.Adapters.BlenderAdapter.DefaultPort;
+            var merged = arguments?.ToList() ?? new List<string>();
+            merged.Add("--python");
+            merged.Add(scriptPath);
+            bridgeInfo = new Dictionary<string, object?>
+            {
+                ["adapter"] = "blender",
+                ["script"] = scriptPath,
+                ["port"] = port,
+            };
+            return merged;
+        }
+        catch
+        {
+            return arguments; // materialization failure must never block launch
+        }
+
+        static bool MentionsBlender(string? s) =>
+            !string.IsNullOrEmpty(s) &&
+            s.Contains("blender", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>wait_for scope: derive the window/process subtree to watch
@@ -6160,7 +7073,8 @@ public sealed class InbriskTools
             var (scopeHwnd, scopePid, scopeEl, scopeErr) = WaitScope(s.Target, state);
             if (scopeErr != null)
             { errKind = "TargetNotFound"; errDetail = scopeErr; return null; }
-            var targetQuery = s.Query ?? s.Target?.Name ?? s.Target?.NameContains;
+            var targetQuery = s.Query ?? s.Target?.Name ?? s.Target?.NameContains
+                ?? MapQuery(s.Target?.Map);
             var targetEl = BoundId(s.ElementId, state) ?? scopeEl;
             return [new AgentAction(AgentActionKind.WaitFor, Query: targetQuery,
                 ElementId: targetEl,
@@ -6848,11 +7762,13 @@ public sealed class InbriskTools
         [Description("key name")] string key,
         [Description("press count")] int count = 1,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        [Description("deliver via background window message — no focus theft. Key presses have no message-only equivalent: this fails NotSupported instead of falling back to SendInput")] bool? silent = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.IncSequentialSingleAction();
         Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
-        return Act(new AgentAction(AgentActionKind.Key, Key: key, Count: count), ct, operationId: operationId);
+        return Act(new AgentAction(AgentActionKind.Key, Key: key, Count: count,
+            Silent: silent == true), ct, operationId: operationId);
     }
 
     [McpServerTool(Name = "computer_hotkey"), Description(
@@ -6865,6 +7781,7 @@ public sealed class InbriskTools
         [Description("modifier names: ctrl,shift,alt,win")] string[]? modifiers = null,
         [Description("combo shorthand like \"ctrl+s\" — alternative to key+modifiers")] string? keys = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        [Description("deliver via background window message — no focus theft. Hotkeys have no message-only equivalent: this fails NotSupported instead of falling back to SendInput")] bool? silent = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.IncSequentialSingleAction();
@@ -6880,7 +7797,8 @@ public sealed class InbriskTools
             return Task.FromResult(Error(OutcomeKind.Malformed,
                 "hotkey requires key+modifiers, or keys shorthand like \"ctrl+s\""));
         return Act(new AgentAction(AgentActionKind.Hotkey, Key: key,
-            Modifiers: modifiers), ct, operationId: operationId);
+            Modifiers: modifiers, Silent: silent == true),
+            ct, operationId: operationId);
     }
 
     [McpServerTool(Name = "computer_scroll"), Description(
@@ -7031,7 +7949,7 @@ public sealed class InbriskTools
     [McpServerTool(Name = "computer_wait_for"), Description(
         "Wait until an element matching query/target appears in the active or target window, or until a condition (gone, state, value) is met.")]
     public Task<CallToolResult> WaitFor(
-        [Description("element name or query to wait for")] string? query = null,
+        [Description("element name or query to wait for — accepts \"map:app.element\" (e.g. \"map:notepad.document\", \"map:calculator.equals\")")] string? query = null,
         [Description("element name alias for query")] string? name = null,
         [Description("element text alias for query")] string? text = null,
         [Description("structured target specification")] TargetSpec? target = null,
@@ -7047,7 +7965,8 @@ public sealed class InbriskTools
         [Description("alias of ms — models often write timeoutMs")] int? timeoutMs = null,
         CancellationToken ct = default)
     {
-        var targetQuery = query ?? name ?? text ?? target?.Name ?? target?.NameContains;
+        var targetQuery = query ?? name ?? text ?? target?.Name ?? target?.NameContains
+            ?? MapQuery(target?.Map);
         var targetVal = expectedValue ?? value;
         long? explicitHwnd = ParseHwnd(hwnd ?? target?.Hwnd);
         int? explicitPid = explicitHwnd.HasValue && explicitHwnd.Value > 0 ? _s.Rt.Window(explicitHwnd.Value)?.Pid : null;
@@ -7597,7 +8516,11 @@ public sealed class InbriskTools
         [Description("elementId or hwnd — target bounds must be inside this element/window")] string? Within = null,
         [Description("role name or text an ancestor in the UIA path must match")] string? Ancestor = null,
         [Description("coordinate x (when targeting an image or screen point)")] int? X = null,
-        [Description("coordinate y (when targeting an image or screen point)")] int? Y = null)
+        [Description("coordinate y (when targeting an image or screen point)")] int? Y = null,
+        // -------- OCR fallback (pixel-space targeting when UIA can't see it) --------
+        [Description("text to locate via OCR inside the target window — exact → case-insensitive contains → fuzzy; resolves to the word's clickable center. Fallback for canvas/image/custom-drawn UI the UIA tree misses")] string? OcrText = null,
+        [Description("opt this target into OCR resolution — name/nameContains is matched against the window's OCR'd text instead of the UIA tree")] bool Ocr = false,
+        [Description("BCP-47 OCR recognizer language (e.g. \"en-US\", \"de-DE\"); default = system OCR language")] string? OcrLang = null)
     {
         public string Summary()
         {
@@ -7610,6 +8533,8 @@ public sealed class InbriskTools
             if (Within != null) parts.Add($"within: ${Within}");
             if (Value != null) parts.Add($"value: \"{Value}\"");
             if (ValueContains != null) parts.Add($"valueContains: \"{ValueContains}\"");
+            if (OcrText != null) parts.Add($"ocrText: \"{OcrText}\"");
+            if (Ocr) parts.Add("ocr: true");
             return parts.Count > 0 ? $"{{{string.Join(", ", parts)}}}" : "{empty target}";
         }
 
@@ -7641,7 +8566,7 @@ public sealed class InbriskTools
         [Description("key press count")] int? Count = null,
         [Description("scroll wheel delta")] int? Delta = null,
         [Description("wait ms / wait_for* timeout")] int? Ms = null,
-        [Description("wait_for element-name query")] string? Query = null,
+        [Description("wait_for element-name query — accepts \"map:app.element\" (e.g. \"map:calculator.equals\")")] string? Query = null,
         [Description("focus_window hwnd (hex/decimal)")] string? Hwnd = null,
         [Description("image point (needs frameId+observationId)")] int? X = null, int? Y = null,
         long? FrameId = null, long? ObservationId = null,
@@ -7689,7 +8614,8 @@ public sealed class InbriskTools
         [Description("piggyback scoped observation after this step executes (zero-turn feedback)")] bool? Observe = null,
         [Description("specialist application adapter (e.g. \"media\", \"testapp\")")] string? Adapter = null,
         [Description("adapter command or arguments dictionary")] Dictionary<string, object?>? Args = null,
-        [Description("record this step's failure and keep executing the rest of the plan instead of pausing (batch continueOnError / failFast:false); EmergencyStopped/Cancelled still stop the run")] bool? ContinueOnError = null)
+        [Description("record this step's failure and keep executing the rest of the plan instead of pausing (batch continueOnError / failFast:false); EmergencyStopped/Cancelled still stop the run")] bool? ContinueOnError = null,
+        [Description("deliver input via background window messages instead of foreground SendInput — no focus theft, works on unfocused/occluded windows; applies to click/invoke/toggle/type/set_value/close steps — unsupported kinds return NotSupported, never a silent SendInput fallback")] bool? Silent = null)
     {
         /// <summary>Unknown JSON fields land here instead of being dropped —
         /// ValidateStep rejects them so a misspelled field can't fake success.</summary>
@@ -7991,6 +8917,18 @@ public sealed class InbriskTools
             ClassName: sel.ClassName);
     }
 
+    /// <summary>Normalize a target.map field to the "map:app.element" query
+    /// form the wait_for Query channel expands (UiMap.TryParseKey accepts the
+    /// bare dotted form; the runtime expands on the "map:" prefix only, so a
+    /// plain-string query stays a literal name).</summary>
+    private static string? MapQuery(string? mapRef)
+    {
+        var m = mapRef?.Trim();
+        if (string.IsNullOrEmpty(m)) return null;
+        return m.StartsWith(UiMap.Prefix, StringComparison.OrdinalIgnoreCase)
+            ? m : UiMap.Prefix + m;
+    }
+
     /// <summary>Expand target.map / a "map:app.element" name prefix into the
     /// map's selector fields; explicit fields always win. Strict on an explicit
     /// map field (typo → Malformed/TargetNotFound), lenient on the name-prefix
@@ -8069,7 +9007,7 @@ public sealed class InbriskTools
                 $"unknown target field(s): {string.Join(", ", extra.Keys)} — " +
                 "valid: elementId,window,hwnd,process,role,name,automationId," +
                 "map,nameContains,nameNotContains,value,valueContains,valueNotContains," +
-                "className,labelledBy,nearText,within,ancestor");
+                "className,labelledBy,nearText,within,ancestor,x,y,ocrText,ocr,ocrLang");
             return null;
         }
 
@@ -8646,7 +9584,7 @@ public sealed class InbriskTools
     private async Task<CallToolResult> Act(AgentAction a, CancellationToken ct, bool observe = false, string? operationId = null)
     {
         var toolName = $"computer_{a.Kind.ToString().ToLowerInvariant()}";
-        var normArgs = $"{a.Kind}|{a.ElementId}|{a.Text}|{a.Key}|{string.Join(",", a.Modifiers ?? Array.Empty<string>())}|{a.Point?.X},{a.Point?.Y}|{a.Delta}|{observe}";
+        var normArgs = $"{a.Kind}|{a.ElementId}|{a.Text}|{a.Key}|{string.Join(",", a.Modifiers ?? Array.Empty<string>())}|{a.Point?.X},{a.Point?.Y}|{a.Delta}|{observe}|{a.Silent}";
         if (_s.Deduplicator.TryDeduplicateMutation(operationId, toolName, normArgs, _s.Telemetry, out var conflictError) is { } deduped)
             return deduped;
         if (conflictError != null)
@@ -8735,12 +9673,14 @@ public sealed class InbriskTools
             var eventGenBefore = _s?.Rt?.EventBuffer?.CurrentGeneration;
 
             IInputLease? physicalLease = null;
-            var requiresPhysical = steps.Any(a =>
-                a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.FocusWindow or AgentActionKind.FocusElement
+            // Silent (message-based) steps never touch the physical input
+            // channel — they skip the PhysicalInput lease entirely.
+            var requiresPhysical = steps.Any(a => !a.Silent &&
+                (a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.FocusWindow or AgentActionKind.FocusElement
                 || (a.Kind is AgentActionKind.Invoke && (
                     a.ElementId == null ||
                     _s?.Rt?.Parts.Registry.Get(a.ElementId) is not { } el ||
-                    !el.IsActionSupported("invoke"))));
+                    !el.IsActionSupported("invoke")))));
             if (requiresPhysical)
             {
                 try
@@ -9083,6 +10023,15 @@ public sealed class InbriskTools
             // screen-supplied strings — data, never instructions
             ["provenance"] = Provenance("uia"),
         };
+        if (steps.Any(s => s.Silent))
+        {
+            // message-based delivery reports its transport honestly:
+            // method "wm_message" regardless of which specific message
+            // (wm_settext / bm_click / em_replacesel / wm_close) carried
+            // the action — the mechanism stays in evidence/detail/perf.
+            payload["silent"] = true;
+            payload["method"] = "wm_message";
+        }
         if (verificationHint != null)
             payload["verificationHint"] = verificationHint;
         if (!isSlim)
@@ -9326,6 +10275,10 @@ public sealed class InbriskTools
         {
             var el = _s.Rt.Parts.Registry.Get(elRef);
             h = el?.Hwnd ?? el?.Handle.Recipe.Hwnd;
+            // unregistered ocr:<hwnd>:<idx> id — the anchor hwnd is in the
+            // id itself
+            if (h == null && TryParseOcrId(elRef, out var ocrHwnd, out _))
+                h = ocrHwnd;
         }
         if (h == null && !string.IsNullOrWhiteSpace(target?.Window))
             h = _s.Rt.Windows().FirstOrDefault(w =>
@@ -9369,6 +10322,176 @@ public sealed class InbriskTools
                 ["rx"] = rx,
                 ["ry"] = ry,
                 ["screen"] = $"({absX},{absY})",
+            };
+            return new CallToolResult
+            {
+                IsError = res.IsError,
+                Content = [new TextContentBlock { Text = node.ToJsonString(J) }],
+            };
+        }
+        catch { return res; }
+    }
+
+    /// <summary>What an OCR target resolved to — enough to annotate the
+    /// action result so callers can correlate it back to the synthetic
+    /// ocr:&lt;hwnd&gt;:&lt;idx&gt; id they passed.</summary>
+    private sealed record OcrTargetHit(
+        string SyntheticId, string MatchedText, RectPx Bounds, long Hwnd,
+        double? Confidence);
+
+    /// <summary>Parse "ocr:&lt;hwnd&gt;:&lt;idx&gt;" — the synthetic ids
+    /// computer_find registers (ocr:HEXHWND:n) and computer_observe ocr:true
+    /// prints (ocr:0xHEXHWND:n). A pure-digit hwnd component is ambiguous:
+    /// ids are hex by convention, but if the hex reading names no live
+    /// window and the decimal reading does, decimal wins.</summary>
+    private bool TryParseOcrId(string id, out long hwnd, out int idx)
+    {
+        hwnd = 0; idx = -1;
+        if (!id.StartsWith("ocr:", StringComparison.OrdinalIgnoreCase))
+            return false;
+        var parts = id[4..].Split(':');
+        if (parts.Length != 2 || !int.TryParse(parts[1], out idx))
+            return false;
+        var h = parts[0].Trim();
+        var explicitHex = h.StartsWith("0x", StringComparison.OrdinalIgnoreCase);
+        if (explicitHex) h = h[2..];
+        if (!long.TryParse(h, System.Globalization.NumberStyles.HexNumber,
+                null, out var hex))
+            return false;
+        hwnd = hex;
+        if (!explicitHex && long.TryParse(h, out var dec) && dec != hex &&
+            _s.Rt.WindowService.GetWindow(hex) == null &&
+            _s.Rt.WindowService.GetWindow(dec) != null)
+            hwnd = dec;
+        return true;
+    }
+
+    /// <summary>OCR targeting shared by computer_click/invoke/type.
+    /// Returns false when the request is not OCR-shaped (plain elementId /
+    /// semantic target) so the caller falls back to normal UIA resolution.
+    /// Two shapes:
+    ///   1. elementId "ocr:&lt;hwnd&gt;:&lt;idx&gt;" — registered ids
+    ///      (computer_find) resolve as elements; unregistered word ids
+    ///      (computer_observe ocr:true overlay) index the per-hwnd OCR word
+    ///      cache — the same list the overlay printed; the cache re-runs
+    ///      the recognizer itself when stale (~2s / after any mutation).
+    ///   2. target:{ocrText:"X"} or target:{ocr:true, name:"X"} — resolved
+    ///      via ActionResolver.ResolveOcrTarget (exact → contains → fuzzy)
+    ///      to the matched text's clickable center.
+    /// A word hit yields a desktop-space point with FrameId 0 — a direct
+    /// coordinate, no frame binding — dispatched through Act like any
+    /// point target, so foreground/occlusion/safety guards still apply.</summary>
+    private bool TryResolveOcrTarget(string? elementId, TargetSpec? target,
+        out UiElement? el, out ImagePoint? point, out OcrTargetHit? hit,
+        out CallToolResult? error)
+    {
+        el = null; point = null; hit = null; error = null;
+        var id = elementId ?? target?.ElementId;
+        if (id != null && id.StartsWith("ocr:", StringComparison.OrdinalIgnoreCase))
+        {
+            // Registered element (computer_find's ocr:<hex>:<i> ids) — the
+            // normal element path keeps liveness/staleness checks; the Ocr
+            // backend executes it as a bounds-center coordinate click.
+            // NB: a find-issued idx counts the *matching hits* list, not
+            // the window's word list — so an id that no longer resolves
+            // must NOT fall back to word indexing (different numbering);
+            // it fails stale. Only 0x-prefixed ids (the computer_observe
+            // overlay, never registered) index the word list.
+            if (_s.Rt.Parts.Registry.EnsureAlive(id) is { } reg)
+            {
+                el = reg;
+                hit = new OcrTargetHit(id, reg.Name ?? "", reg.Bounds,
+                    reg.Hwnd ?? reg.Handle.Recipe.Hwnd ?? 0, null);
+                return true;
+            }
+            if (!TryParseOcrId(id, out var ocrHwnd, out var idx))
+            {
+                error = Error(OutcomeKind.Malformed,
+                    $"invalid OCR id '{id}' — expected ocr:<hwnd>:<idx> " +
+                    "(as printed by computer_find or computer_observe ocr:true)");
+                return true;
+            }
+            if (!id[4..].StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                error = Error(OutcomeKind.Stale,
+                    $"OCR element '{id}' is no longer live — re-run " +
+                    "computer_find (or computer_observe ocr:true) for a " +
+                    "fresh id");
+                return true;
+            }
+            if (!_s.Rt.OcrAvailable)
+            {
+                error = Error(OutcomeKind.NotSupported,
+                    "OCR engine unavailable on this system");
+                return true;
+            }
+            var words = _s.Rt.OcrWindow(ocrHwnd, forceRefresh: false);
+            if (idx < 0 || idx >= words.Count)
+            {
+                error = Error(OutcomeKind.TargetNotFound,
+                    $"OCR id '{id}' out of range — {words.Count} word(s) " +
+                    $"OCR'd in window 0x{ocrHwnd:X}; re-run computer_observe " +
+                    "ocr:true or computer_find for fresh ids");
+                return true;
+            }
+            var w = words[idx];
+            var c = w.Bounds.Center;
+            point = new ImagePoint(c.X, c.Y, FrameId: 0);
+            hit = new OcrTargetHit(id, w.Text, w.Bounds, ocrHwnd,
+                w.Confidence);
+            return true;
+        }
+
+        var ocrQuery = target?.OcrText;
+        if (ocrQuery == null && target?.Ocr == true)
+            ocrQuery = target.Name ?? target.NameContains;
+        if (ocrQuery == null) return false;
+
+        if (!TryResolveWindowAnchor(elementId, target, out var ahwnd,
+                out var anchorErr))
+        { error = anchorErr; return true; }
+        var res = _s.Resolver.ResolveOcrTarget(
+            new OcrResolveRequest(ocrQuery, Hwnd: ahwnd,
+                Language: target?.OcrLang),
+            out var rerr, out var rkind, out var cands);
+        if (res == null)
+        {
+            var candText = cands is { Count: > 0 }
+                ? $" — candidates: {string.Join(", ", cands.Select(cc => $"\"{cc.Text}\""))}"
+                : "";
+            error = Error(rkind,
+                $"ocr target \"{ocrQuery}\" unresolved: {rerr}{candText}");
+            return true;
+        }
+        point = res.ToImagePoint();
+        hit = new OcrTargetHit($"ocr:0x{res.Hwnd:X}:{res.MatchedText}",
+            res.MatchedText, res.Bounds, res.Hwnd, res.Confidence);
+        return true;
+    }
+
+    /// <summary>Post-wraps an OCR-targeted action result with a target node
+    /// in the same shape AnnotateWindowRelativeResult uses, so the caller
+    /// can correlate the outcome back to the synthetic ocr: id or matched
+    /// text. The shared ActionResult builder stays untouched.</summary>
+    private static CallToolResult AnnotateOcrResult(CallToolResult res,
+        OcrTargetHit hit)
+    {
+        try
+        {
+            var text = res.Content?.OfType<TextContentBlock>().FirstOrDefault()?.Text;
+            if (string.IsNullOrEmpty(text)) return res;
+            if (System.Text.Json.Nodes.JsonNode.Parse(text) is not
+                System.Text.Json.Nodes.JsonObject node) return res;
+            node["target"] = new System.Text.Json.Nodes.JsonObject
+            {
+                ["elementId"] = hit.SyntheticId,
+                ["role"] = "text",
+                ["source"] = "ocr",
+                ["matchedText"] = hit.MatchedText,
+                ["confidence"] = hit.Confidence,
+                ["hwnd"] = $"0x{hit.Hwnd:X}",
+                ["bounds"] = $"({hit.Bounds.X},{hit.Bounds.Y} " +
+                    $"{hit.Bounds.Width}x{hit.Bounds.Height})",
             };
             return new CallToolResult
             {
