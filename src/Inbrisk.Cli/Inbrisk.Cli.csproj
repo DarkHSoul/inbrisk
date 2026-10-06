@@ -1,10 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <!-- WinExe + AttachConsole: double-click opens the setup app window
-         (no console flash); CLI commands attach to the parent console so
-         terminal usage and MCP stdio keep working unchanged. -->
-    <OutputType>WinExe</OutputType>
+    <!-- Exe: Native console application. PowerShell and CMD wait for the
+         command to exit, foreground input buffer is preserved, and Ctrl+C
+         interrupts cleanly terminate the process without prompt corruption. -->
+    <OutputType>Exe</OutputType>
     <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
     <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
