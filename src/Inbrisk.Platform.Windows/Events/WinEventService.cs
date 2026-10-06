@@ -43,23 +43,38 @@ public sealed class WinEventService : IEventSource
 
     private void PumpLoop()
     {
-        _threadId = NativeMethods.GetCurrentThreadId();
-        _callback = OnWinEvent; // must stay rooted for the hook's lifetime
-        foreach (var ev in HookedEvents)
+        // Boundary: the hook thread must survive any pump fault — an
+        // exception escaping a message-pump thread kills the process.
+        var hooks = _hooks; // avoid touching the list on the exit path
+        try
         {
-            var h = NativeMethods.SetWinEventHook(ev, ev, IntPtr.Zero, _callback, 0, 0,
-                NativeMethods.WINEVENT_OUTOFCONTEXT | NativeMethods.WINEVENT_SKIPOWNPROCESS);
-            if (h != IntPtr.Zero) _hooks.Add(h);
-        }
+            _threadId = NativeMethods.GetCurrentThreadId();
+            _callback = OnWinEvent; // must stay rooted for the hook's lifetime
+            foreach (var ev in HookedEvents)
+            {
+                var h = NativeMethods.SetWinEventHook(ev, ev, IntPtr.Zero, _callback, 0, 0,
+                    NativeMethods.WINEVENT_OUTOFCONTEXT | NativeMethods.WINEVENT_SKIPOWNPROCESS);
+                if (h != IntPtr.Zero) hooks.Add(h);
+            }
 
-        while (!_stop && NativeMethods.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
+            while (!_stop && NativeMethods.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
+            {
+                NativeMethods.TranslateMessage(ref msg);
+                NativeMethods.DispatchMessageW(ref msg);
+            }
+        }
+        catch (Exception e)
         {
-            NativeMethods.TranslateMessage(ref msg);
-            NativeMethods.DispatchMessageW(ref msg);
+            System.Diagnostics.Debug.WriteLine($"inbrisk-winevent pump exited: {e}");
         }
-
-        foreach (var h in _hooks) NativeMethods.UnhookWinEvent(h);
-        _hooks.Clear();
+        finally
+        {
+            foreach (var h in hooks)
+            {
+                try { NativeMethods.UnhookWinEvent(h); } catch { }
+            }
+            hooks.Clear();
+        }
     }
 
     private void OnWinEvent(IntPtr hook, uint eventType, IntPtr hwnd,
@@ -85,9 +100,26 @@ public sealed class WinEventService : IEventSource
         if (kind == null) return;
 
         NativeMethods.GetWindowThreadProcessId(hwnd, out var pid);
-        Event?.Invoke(new ObservedEvent(kind.Value, DateTimeOffset.Now,
+        Raise(new ObservedEvent(kind.Value, DateTimeOffset.Now,
             hwnd.ToInt64(), pid == 0 ? null : pid,
             Detail: $"obj={idObject} child={idChild}"));
+    }
+
+    // Per-subscriber delivery on the pump thread: one bad subscriber must
+    // neither abort the remaining subscribers nor escape this callback —
+    // an unhandled fault on a WinEvent callback kills the process.
+    private void Raise(ObservedEvent e)
+    {
+        var subs = Event;
+        if (subs == null) return;
+        foreach (Action<ObservedEvent> sub in subs.GetInvocationList())
+        {
+            try { sub(e); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"inbrisk-winevent subscriber fault: {ex}");
+            }
+        }
     }
 
     public void Dispose()

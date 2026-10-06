@@ -54,14 +54,16 @@ public sealed class StabilityTracker : IDisposable
             {
                 _current = new StabilityInfo(StabilityState.Changing,
                     _lastChange, TimeSpan.Zero, fraction);
-                StateChanged?.Invoke(_current);
+                RaiseState(_current);
             }
-            ChangeDetected?.Invoke();
+            RaiseChange();
         }
     }
 
     private void Tick()
     {
+        // Boundary: runs on a thread-pool timer (and from capture/event
+        // threads via FeedDiff) — subscriber faults must never escape.
         lock (_gate)
         {
             if (_current.State == StabilityState.Changing &&
@@ -69,17 +71,47 @@ public sealed class StabilityTracker : IDisposable
             {
                 _current = new StabilityInfo(StabilityState.Stable, _lastChange,
                     DateTimeOffset.Now - _lastChange, _current.LastChangedFraction);
-                StateChanged?.Invoke(_current);
+                RaiseState(_current);
             }
             else if (_current.State == StabilityState.Unknown)
             {
                 _current = new StabilityInfo(StabilityState.Stable, null,
                     TimeSpan.Zero, 0);
-                StateChanged?.Invoke(_current);
+                RaiseState(_current);
             }
             else if (_current.State == StabilityState.Stable && _lastChange != DateTimeOffset.MinValue)
             {
                 _current = _current with { StableFor = DateTimeOffset.Now - _lastChange };
+            }
+        }
+    }
+
+    // Per-subscriber delivery: one bad subscriber must neither abort the
+    // remaining subscribers nor escape the raiser's thread/timer.
+    private void RaiseState(StabilityInfo s)
+    {
+        var subs = StateChanged;
+        if (subs == null) return;
+        foreach (Action<StabilityInfo> sub in subs.GetInvocationList())
+        {
+            try { sub(s); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"inbrisk stability subscriber fault: {ex}");
+            }
+        }
+    }
+
+    private void RaiseChange()
+    {
+        var subs = ChangeDetected;
+        if (subs == null) return;
+        foreach (Action sub in subs.GetInvocationList())
+        {
+            try { sub(); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"inbrisk stability subscriber fault: {ex}");
             }
         }
     }

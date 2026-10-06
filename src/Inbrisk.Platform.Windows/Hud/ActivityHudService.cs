@@ -310,6 +310,24 @@ public sealed class ActivityHudService : IDisposable
 
     private void Pump()
     {
+        // Boundary: bare message-pump thread — nothing may escape or the
+        // process dies; _ready must always be released so Start() never hangs.
+        try
+        {
+            PumpCore();
+        }
+        catch (Exception e)
+        {
+            System.Diagnostics.Debug.WriteLine($"inbrisk-hud pump exited: {e}");
+        }
+        finally
+        {
+            _ready.Set();
+        }
+    }
+
+    private void PumpCore()
+    {
         DesktopBridge.TrySwitchCurrentThread();
         _current = this;
         _threadId = NativeMethods.GetCurrentThreadId();
@@ -329,6 +347,12 @@ public sealed class ActivityHudService : IDisposable
 
             RecalculatePosition();
         }
+        catch (Exception e)
+        {
+            // Init fault: HUD degrades to no-window; the pump still services
+            // the queue so Dispose() can tear down cleanly.
+            System.Diagnostics.Debug.WriteLine($"inbrisk-hud init fault: {e}");
+        }
         finally
         {
             _ready.Set();
@@ -336,10 +360,19 @@ public sealed class ActivityHudService : IDisposable
 
         while (NativeMethods.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
         {
-            if (msg.Message == WmAppTick) OnTick();
-            else if (msg.Message == WmAppRebuild) RecalculatePosition();
-            NativeMethods.TranslateMessage(ref msg);
-            NativeMethods.DispatchMessageW(ref msg);
+            try
+            {
+                if (msg.Message == WmAppTick) OnTick();
+                else if (msg.Message == WmAppRebuild) RecalculatePosition();
+                NativeMethods.TranslateMessage(ref msg);
+                NativeMethods.DispatchMessageW(ref msg);
+            }
+            catch (Exception e)
+            {
+                // Per-iteration containment: a transient wndproc/render fault
+                // must not take the whole pump (or process) down.
+                System.Diagnostics.Debug.WriteLine($"inbrisk-hud pump fault: {e}");
+            }
         }
 
         Teardown();

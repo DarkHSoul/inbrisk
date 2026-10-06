@@ -114,6 +114,21 @@ public sealed class UiaDispatcher : IDisposable
 
     private void Loop()
     {
+        // Boundary: this is a bare worker thread — nothing may escape or the
+        // process dies. The COM-provisioning fallback and per-item dispatch
+        // already catch; this outer catch is the last resort.
+        try
+        {
+            LoopCore();
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"inbrisk-uia dispatcher loop exited: {e}");
+        }
+    }
+
+    private void LoopCore()
+    {
         Inbrisk.Platform.Windows.Native.DesktopBridge.TrySwitchCurrentThread();
         IUIAutomation uia;
         try
@@ -123,7 +138,8 @@ public sealed class UiaDispatcher : IDisposable
         }
         catch
         {
-            uia = (IUIAutomation)new CUIAutomationClass();
+            try { uia = (IUIAutomation)new CUIAutomationClass(); }
+            catch { return; } // no UIA at all — exit the lane quietly
         }
 
         var queue = _queue; // capture current queue; restarts swap the field

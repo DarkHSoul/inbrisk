@@ -139,22 +139,27 @@ public sealed class TargetHighlightService : ITargetHighlightService
 
     private void RunWatchdogScan()
     {
-        if (_disposed || _emergency) return;
-        var now = DateTimeOffset.UtcNow;
-        var cutoff = now.AddMilliseconds(-_watchdogTimeoutMs);
-
-        foreach (var kvp in _tokensByHwnd)
+        // Boundary: thread-pool timer — an unhandled fault kills the process.
+        try
         {
-            var stale = kvp.Value.Values.Where(t => t.LastActivityAt < cutoff).ToList();
-            foreach (var t in stale)
+            if (_disposed || _emergency) return;
+            var now = DateTimeOffset.UtcNow;
+            var cutoff = now.AddMilliseconds(-_watchdogTimeoutMs);
+
+            foreach (var kvp in _tokensByHwnd)
             {
-                kvp.Value.TryRemove(t.Id, out _);
-            }
-            if (kvp.Value.IsEmpty)
-            {
-                _tokensByHwnd.TryRemove(kvp.Key, out _);
+                var stale = kvp.Value.Values.Where(t => t.LastActivityAt < cutoff).ToList();
+                foreach (var t in stale)
+                {
+                    kvp.Value.TryRemove(t.Id, out _);
+                }
+                if (kvp.Value.IsEmpty)
+                {
+                    _tokensByHwnd.TryRemove(kvp.Key, out _);
+                }
             }
         }
+        catch { /* watchdog is best-effort — next tick retries */ }
     }
 
     public void Dispose()

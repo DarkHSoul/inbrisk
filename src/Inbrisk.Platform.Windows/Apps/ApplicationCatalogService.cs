@@ -103,28 +103,46 @@ public sealed class ApplicationCatalogService : IDisposable
 
     private void OnWatcherEvent()
     {
-        if (_isDisposed) return;
-        Telemetry.IncCatalogWatcherInvalidations();
-        Interlocked.Increment(ref _dirtyGeneration);
-        // Coalesce / debounce event storms (100ms)
-        _debounceTimer.Change(100, Timeout.Infinite);
+        // Boundary: FileSystemWatcher thread-pool callback — a fault kills the process.
+        try
+        {
+            if (_isDisposed) return;
+            Telemetry.IncCatalogWatcherInvalidations();
+            Interlocked.Increment(ref _dirtyGeneration);
+            // Coalesce / debounce event storms (100ms)
+            _debounceTimer.Change(100, Timeout.Infinite);
+        }
+        catch { /* watcher callback is best-effort */ }
     }
 
     private void OnWatcherError(ErrorEventArgs e)
     {
-        if (_isDisposed) return;
-        Telemetry.IncCatalogWatcherOverflowInvalidations();
-        Interlocked.Increment(ref _dirtyGeneration);
-        // Force full refresh immediately on overflow or watcher error
-        _debounceTimer.Change(0, Timeout.Infinite);
+        // Boundary: FileSystemWatcher thread-pool callback — a fault kills the process.
+        try
+        {
+            if (_isDisposed) return;
+            Telemetry.IncCatalogWatcherOverflowInvalidations();
+            Interlocked.Increment(ref _dirtyGeneration);
+            // Force full refresh immediately on overflow or watcher error
+            _debounceTimer.Change(0, Timeout.Infinite);
+        }
+        catch { /* watcher callback is best-effort */ }
     }
 
     private void OnDebounceTimerElapsed(object? state)
     {
+        // Boundary: thread-pool timer — a fault kills the process.
         if (_isDisposed) return;
         try
         {
-            _ = RefreshAsync();
+            var refresh = RefreshAsync();
+            // Observe faults on the fire-and-forget refresh task — an
+            // unobserved task exception must never escalate.
+            _ = refresh.ContinueWith(
+                t => { _ = t.Exception; },
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted,
+                TaskScheduler.Default);
         }
         catch { }
     }

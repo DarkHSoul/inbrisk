@@ -87,6 +87,22 @@ public sealed class GlobalHotkeyService : IDisposable
 
     private void Loop()
     {
+        // Boundary: this is a bare message-pump thread — an escaped fault
+        // kills the process, and a hanging _ready would deadlock Start().
+        try
+        {
+            LoopCore();
+        }
+        catch (Exception e)
+        {
+            try { _onFailure($"Emergency hotkey loop crashed: {e.Message}"); } catch { }
+            System.Diagnostics.Debug.WriteLine($"inbrisk hotkey loop exited: {e}");
+        }
+        finally { _ready.Set(); }
+    }
+
+    private void LoopCore()
+    {
         // Ctrl+Pause produces VK_CANCEL (Break), not VK_PAUSE — register both
         // so the physical chord fires regardless of which VK the OS reports.
         const uint vkPause = 0x13, vkCancel = 0x03;

@@ -253,6 +253,12 @@ public sealed class UiaReadPool : IDisposable, IAsyncDisposable
         {
             // Normal shutdown
         }
+        catch (Exception e)
+        {
+            // Boundary: a worker thread must never take the process down —
+            // the pool loses one lane but the server stays alive.
+            Debug.WriteLine($"inbrisk read-pool worker exited: {e}");
+        }
     }
 
     private void WaitForReadPermission(CancellationToken ct)

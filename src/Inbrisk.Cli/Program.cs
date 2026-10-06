@@ -10,6 +10,28 @@ using Inbrisk.Platform.Windows.Tray;
 using Inbrisk.Runtime;
 using Inbrisk.Sdk;
 
+// Exception resilience: a fault on any background thread, timer, async-void
+// or event callback must never take down the MCP server/daemon. Log and
+// keep the process alive — every worker boundary also has its own catch so
+// in practice UnhandledException stays a last-resort diagnostic (on .NET
+// Core a truly unhandled thread exception still terminates; the boundary
+// catches are what keep the process alive).
+AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+{
+    try
+    {
+        Console.Error.WriteLine(
+            $"inbrisk: unhandled exception (terminating={e.IsTerminating}): {e.ExceptionObject}");
+    }
+    catch { /* logging must never fault the handler */ }
+};
+TaskScheduler.UnobservedTaskException += (_, e) =>
+{
+    try { Console.Error.WriteLine($"inbrisk: unobserved task exception: {e.Exception}"); }
+    catch { }
+    e.SetObserved(); // observed → never escalates to process termination
+};
+
 // This is a WinExe — no console is attached unless we ask for one. CLI/MCP
 // modes attach to the parent console so terminal output keeps working;
 // double-click (no console) goes to the setup app window instead.
@@ -76,9 +98,10 @@ if (Inbrisk.Setup.SetupCommands.IsSetupCommand(args[0]))
 
 using var inbrisk = new InbriskRuntime(new InbriskOptions(
     AutoConfirm: Has(args, "--yes") || Has(args, "-y"),
-    TelemetryPath: Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "inbrisk", "telemetry.jsonl")));
+    // F32: primary audit log under %ProgramData%\Inbrisk\audit (ACL'd,
+    // hash-chained); data-dir copy is an agent-readable mirror.
+    TelemetryPath: AuditLog.Path("telemetry.jsonl"),
+    TelemetryMirrorPath: AuditLog.MirrorPath("telemetry.jsonl")));
 
 var cmd = args[0].ToLowerInvariant();
 try
@@ -810,10 +833,14 @@ static int RunDesktopShell()
     {
         Task.Run(async () =>
         {
-            hud.SetEnabled(true);
-            hud.SetActivity("Spotify açılıyor…", "Spotify");
-            await Task.Delay(2200);
-            hud.SetSuccess("Spotify açıldı");
+            try
+            {
+                hud.SetEnabled(true);
+                hud.SetActivity("Spotify açılıyor…", "Spotify");
+                await Task.Delay(2200);
+                hud.SetSuccess("Spotify açıldı");
+            }
+            catch { /* preview is best-effort — never fault an unobserved task */ }
         });
     };
 

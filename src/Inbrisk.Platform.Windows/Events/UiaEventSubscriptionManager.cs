@@ -350,6 +350,27 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
         UiaNotificationData? notificationData = null,
         int? propertyId = null)
     {
+        // Boundary: this runs on a UIA COM callback thread — a routing fault
+        // escaping the callback kills the process.
+        try
+        {
+            RouteCallbackGuarded(record, epoch, kind, sender, detail, notificationData, propertyId);
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"inbrisk UIA route-callback fault: {e}");
+        }
+    }
+
+    private void RouteCallbackGuarded(
+        NativeSubscriptionRecord record,
+        long epoch,
+        EventKind kind,
+        IUIAutomationElement sender,
+        string? detail = null,
+        UiaNotificationData? notificationData = null,
+        int? propertyId = null)
+    {
         // Late callback safety: early check before reading properties
         if (!record.IsActive || record.Epoch != epoch)
         {
@@ -474,7 +495,7 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
                 PropertyId: propertyId);
 
             Telemetry.IncUiaEventRelevant();
-            Event?.Invoke(notifEv);
+            Raise(notifEv);
             return;
         }
 
@@ -528,7 +549,23 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
         _recentCallbacks[coalescingKey] = (ev, nowTicks);
 
         Telemetry.IncUiaEventRelevant();
-        Event?.Invoke(ev);
+        Raise(ev);
+    }
+
+    // Per-subscriber delivery on UIA callback threads: one bad subscriber must
+    // neither abort the remaining subscribers nor escape the COM callback.
+    private void Raise(ObservedEvent e)
+    {
+        var subs = Event;
+        if (subs == null) return;
+        foreach (Action<ObservedEvent> sub in subs.GetInvocationList())
+        {
+            try { sub(e); }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"inbrisk UIA subscriber fault: {ex}");
+            }
+        }
     }
 
     internal void TestRouteCallback(

@@ -133,6 +133,24 @@ public sealed class TrayIconService : IDisposable
 
     private void Pump()
     {
+        // Boundary: bare message-pump thread — nothing may escape or the
+        // process dies; _ready must always be released so Start() never hangs.
+        try
+        {
+            PumpCore();
+        }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"inbrisk-tray pump exited: {e}");
+        }
+        finally
+        {
+            _ready.Set();
+        }
+    }
+
+    private void PumpCore()
+    {
         _threadId = NativeMethods.GetCurrentThreadId();
 
         // Mutex for single tray icon deduplication across processes
@@ -182,6 +200,12 @@ public sealed class TrayIconService : IDisposable
 
             CreateTrayIcon();
         }
+        catch (Exception e)
+        {
+            // Init fault: tray degrades to no-window; the pump still services
+            // the queue so Dispose() can tear down cleanly.
+            Debug.WriteLine($"inbrisk-tray init fault: {e}");
+        }
         finally
         {
             _ready.Set();
@@ -189,8 +213,17 @@ public sealed class TrayIconService : IDisposable
 
         while (NativeMethods.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
         {
-            NativeMethods.TranslateMessage(ref msg);
-            NativeMethods.DispatchMessageW(ref msg);
+            try
+            {
+                NativeMethods.TranslateMessage(ref msg);
+                NativeMethods.DispatchMessageW(ref msg);
+            }
+            catch (Exception e)
+            {
+                // Per-iteration containment: a menu-callback/wndproc fault
+                // must not take the whole pump (or process) down.
+                Debug.WriteLine($"inbrisk-tray pump fault: {e}");
+            }
         }
 
         RemoveTrayIcon();

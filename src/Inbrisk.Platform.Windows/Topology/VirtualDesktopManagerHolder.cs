@@ -48,6 +48,20 @@ public sealed class VirtualDesktopManagerHolder : IDisposable
 
     private void ProcessQueue()
     {
+        // Boundary: bare MTA worker thread — nothing may escape or the
+        // process dies; per-item faults are already routed to each Tcs.
+        try
+        {
+            ProcessQueueCore();
+        }
+        catch (Exception e)
+        {
+            System.Diagnostics.Debug.WriteLine($"inbrisk VDM MTA lane exited: {e}");
+        }
+    }
+
+    private void ProcessQueueCore()
+    {
         foreach (var item in _queue.GetConsumingEnumerable())
         {
             try

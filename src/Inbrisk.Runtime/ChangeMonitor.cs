@@ -33,7 +33,7 @@ public sealed class ChangeMonitor : IDisposable
         _session = session;
         _telemetry = telemetry;
         _stability = new StabilityTracker(quietMs);
-        _stability.StateChanged += s => StabilityChanged?.Invoke(s);
+        _stability.StateChanged += s => RaiseStabilityChanged(s);
         _stability.StateChanged += OnStabilityTransition;
         _session.FrameReceived += OnFrame;
     }
@@ -49,20 +49,59 @@ public sealed class ChangeMonitor : IDisposable
 
     private void OnFrame(RawFrame frame)
     {
-        if (_disposed) return;
-        var prev = _prev;
-        Interlocked.Increment(ref _received);
-        FrameDiff? diff = null;
-        lock (_gate)
+        // Boundary: invoked on the capture session's delivery thread — a
+        // fault propagates back into the capture loop.
+        try
         {
-            diff = _differ.Compare(prev, frame);
-            _prev = frame;
-            Interlocked.Increment(ref _sampled);
+            if (_disposed) return;
+            var prev = _prev;
+            Interlocked.Increment(ref _received);
+            FrameDiff? diff = null;
+            lock (_gate)
+            {
+                diff = _differ.Compare(prev, frame);
+                _prev = frame;
+                Interlocked.Increment(ref _sampled);
+            }
+            _stability.FeedDiff(diff);
+            LastChangedDesktopRegions = diff.DesktopRegions().ToList();
+            RaiseDiff(diff);
+            MaybeEmitMetrics(diff);
         }
-        _stability.FeedDiff(diff);
-        LastChangedDesktopRegions = diff.DesktopRegions().ToList();
-        Diff?.Invoke(diff);
-        MaybeEmitMetrics(diff);
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"inbrisk changemonitor frame fault: {ex}");
+        }
+    }
+
+    // Per-subscriber delivery: one bad subscriber must neither abort the
+    // remaining subscribers nor escape the capture thread.
+    private void RaiseDiff(FrameDiff d)
+    {
+        var subs = Diff;
+        if (subs == null) return;
+        foreach (Action<FrameDiff> sub in subs.GetInvocationList())
+        {
+            try { sub(d); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"inbrisk changemonitor subscriber fault: {ex}");
+            }
+        }
+    }
+
+    private void RaiseStabilityChanged(StabilityInfo s)
+    {
+        var subs = StabilityChanged;
+        if (subs == null) return;
+        foreach (Action<StabilityInfo> sub in subs.GetInvocationList())
+        {
+            try { sub(s); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"inbrisk changemonitor subscriber fault: {ex}");
+            }
+        }
     }
 
     private void OnStabilityTransition(StabilityInfo s)

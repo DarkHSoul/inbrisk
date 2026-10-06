@@ -74,7 +74,12 @@ internal sealed class WgcSession : ICaptureSession
         if (target is CaptureTarget.Window wt)
             _watchdog = new Timer(_ =>
             {
-                if (_running && !NativeMethods.IsWindow(new IntPtr(wt.Hwnd))) Stop();
+                // Boundary: thread-pool timer — an unhandled fault kills the process.
+                try
+                {
+                    if (_running && !NativeMethods.IsWindow(new IntPtr(wt.Hwnd))) Stop();
+                }
+                catch { }
             }, null, 1000, 1000);
         LastInitError = null;
     }

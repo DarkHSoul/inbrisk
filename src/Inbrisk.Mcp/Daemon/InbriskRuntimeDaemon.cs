@@ -229,12 +229,51 @@ public sealed class InbriskRuntimeDaemon : IAsyncDisposable, IDisposable
         }
 
         IsRunning = true;
+        // Pay one-time process-wide activation costs (WinRT projections for
+        // OCR/WGC, GDI+ init) off the critical path — otherwise the first
+        // session's handshake serializes them.
+        _ = Task.Run(WarmProcessWideServices);
         _listenerTask = Task.Run(() => ListenLoopAsync(_cts.Token), _cts.Token);
         using var reg = ct.Register(() => _startedTcs.TrySetCanceled(ct));
         await _startedTcs.Task.ConfigureAwait(false);
     }
 
+    /// <summary>Background first-touch of the process-wide platform services a
+    /// session will need (OCR engine activation, WGC capability probe, GDI+
+    /// init). Read-only — captures no pixels, injects no input; every failure
+    /// is swallowed since warm-up is best-effort.</summary>
+    private static void WarmProcessWideServices()
+    {
+        try { _ = new Inbrisk.Platform.Windows.Ocr.OcrService().Available; }
+        catch { }
+        try { _ = Windows.Graphics.Capture.GraphicsCaptureSession.IsSupported(); }
+        catch { }
+        try
+        {
+            using var bmp = new System.Drawing.Bitmap(2, 2);
+            using var g = System.Drawing.Graphics.FromImage(bmp);
+            g.Clear(System.Drawing.Color.Transparent);
+        }
+        catch { }
+    }
+
     private async Task ListenLoopAsync(CancellationToken ct)
+    {
+        // Boundary: the listener is a fire-and-forget task — a fault escaping
+        // the per-iteration catches (e.g. a stream Dispose throwing inside a
+        // catch block) must surface as a logged exit, not a faulted task.
+        try
+        {
+            await ListenLoopCoreAsync(ct).ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            _startedTcs.TrySetException(e);
+            System.Diagnostics.Debug.WriteLine($"inbrisk-daemon listen loop exited: {e}");
+        }
+    }
+
+    private async Task ListenLoopCoreAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested && !IsDisposed)
         {
@@ -268,13 +307,13 @@ public sealed class InbriskRuntimeDaemon : IAsyncDisposable, IDisposable
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
                 _startedTcs.TrySetCanceled();
-                serverStream?.Dispose();
+                try { serverStream?.Dispose(); } catch { }
                 break;
             }
             catch (Exception ex)
             {
                 _startedTcs.TrySetException(ex);
-                serverStream?.Dispose();
+                try { serverStream?.Dispose(); } catch { }
                 if (ct.IsCancellationRequested || IsDisposed) break;
                 try { await Task.Delay(50, ct).ConfigureAwait(false); } catch { }
             }

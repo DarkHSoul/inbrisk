@@ -481,7 +481,8 @@ public sealed class CdpTargetSession : IAsyncDisposable
                 if (!string.IsNullOrEmpty(method))
                 {
                     Telemetry.IncEventsReceived();
-                    DispatchEvent(method, node["params"]);
+                    try { DispatchEvent(method, node["params"]); }
+                    catch { /* a bad event/subscriber must not kill the receive loop */ }
                 }
             }
 
@@ -490,6 +491,12 @@ public sealed class CdpTargetSession : IAsyncDisposable
             {
                 FailPendingCommands(new IOException("CDP transport disconnected."));
             }
+        }
+        catch (Exception e)
+        {
+            // Boundary: the receive loop is a fire-and-forget task — a fault
+            // here would otherwise surface only as an unobserved task exception.
+            Debug.WriteLine($"inbrisk CDP receive loop exited: {e}");
         }
         finally
         {

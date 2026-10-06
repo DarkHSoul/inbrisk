@@ -47,31 +47,66 @@ public sealed class CoalescingEventSource : IEventSource
 
     public void OnRaw(ObservedEvent e)
     {
-        Interlocked.Increment(ref RawCount);
-        if (Immediate.Contains(e.Kind))
+        // Boundary: invoked from the inner source's event thread — a fault
+        // here propagates back into the raiser's thread.
+        try
         {
-            Interlocked.Increment(ref EmittedCount);
-            Event?.Invoke(e);
-            return;
+            Interlocked.Increment(ref RawCount);
+            if (Immediate.Contains(e.Kind))
+            {
+                Interlocked.Increment(ref EmittedCount);
+                Raise(e);
+                return;
+            }
+            var key = EventCoalescingKey.FromEvent(e);
+            lock (_gate)
+                _pending[key] = e;
         }
-        var key = EventCoalescingKey.FromEvent(e);
-        lock (_gate)
-            _pending[key] = e;
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"inbrisk coalescer OnRaw fault: {ex}");
+        }
     }
 
     public void Flush()
     {
+        // Boundary: runs on a thread-pool timer — an unhandled timer-callback
+        // exception kills the process.
         List<ObservedEvent> batch;
-        lock (_gate)
+        try
         {
-            if (_pending.Count == 0) return;
-            batch = [.. _pending.Values];
-            _pending.Clear();
+            lock (_gate)
+            {
+                if (_pending.Count == 0) return;
+                batch = [.. _pending.Values];
+                _pending.Clear();
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"inbrisk coalescer flush fault: {ex}");
+            return;
         }
         foreach (var e in batch)
         {
             Interlocked.Increment(ref EmittedCount);
-            Event?.Invoke(e);
+            Raise(e);
+        }
+    }
+
+    // Per-subscriber delivery: one bad subscriber must neither abort the
+    // remaining subscribers nor escape this raiser's thread.
+    private void Raise(ObservedEvent e)
+    {
+        var subs = Event;
+        if (subs == null) return;
+        foreach (Action<ObservedEvent> sub in subs.GetInvocationList())
+        {
+            try { sub(e); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"inbrisk coalescer subscriber fault: {ex}");
+            }
         }
     }
 

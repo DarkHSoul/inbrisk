@@ -364,7 +364,9 @@ public sealed class ThinStdioProxy : IAsyncDisposable, IDisposable
         }
         finally
         {
-            FailInFlightRequestsTruthfully();
+            // Boundary: the reader is a fire-and-forget task — even the
+            // disconnect-failover path must never fault the task.
+            try { FailInFlightRequestsTruthfully(); } catch { }
         }
     }
 

@@ -157,25 +157,35 @@ public sealed class ComputerControlActivityService : IDisposable
 
     private void CheckWatchdog()
     {
-        var now = Environment.TickCount64;
-        foreach (var kvp in _activeTokens)
+        // Boundary: thread-pool timer — an unhandled fault kills the process.
+        try
         {
-            var token = kvp.Value;
-            if (now - token.LastActivityTick > WatchdogTimeoutMs)
+            var now = Environment.TickCount64;
+            foreach (var kvp in _activeTokens)
             {
-                token.Dispose();
+                var token = kvp.Value;
+                if (now - token.LastActivityTick > WatchdogTimeoutMs)
+                {
+                    token.Dispose();
+                }
             }
         }
+        catch { /* watchdog is best-effort — next tick retries */ }
     }
 
     private void OnIdleTimer()
     {
-        lock (_gate)
+        // Boundary: thread-pool timer — an unhandled fault kills the process.
+        try
         {
-            _idlePending = false;
-            if (_leases != 0) return; // new activity arrived during grace
+            lock (_gate)
+            {
+                _idlePending = false;
+                if (_leases != 0) return; // new activity arrived during grace
+            }
+            Evaluate();
         }
-        Evaluate();
+        catch { /* idle transition is best-effort — Evaluate already guards */ }
     }
 
     private IndicatorState Resolve()

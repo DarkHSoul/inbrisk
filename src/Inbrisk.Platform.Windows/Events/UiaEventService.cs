@@ -34,35 +34,52 @@ public sealed class UiaEventService : IEventSource
         {
             var root = uia.GetRootElement();
 
-            try { uia.AddFocusChangedEventHandler(null, new FocusHandler(e => Event?.Invoke(e))); } catch { }
+            try { uia.AddFocusChangedEventHandler(null, new FocusHandler(Raise)); } catch { }
             try
             {
                 uia.AddStructureChangedEventHandler(root, TreeScope.TreeScope_Subtree,
-                    null, new StructureHandler(e => Event?.Invoke(e)));
+                    null, new StructureHandler(Raise));
             }
             catch { }
             try
             {
                 uia.AddAutomationEventHandler(UiaIds.WindowOpenedEvent, root,
                     TreeScope.TreeScope_Children, null,
-                    new AutomationHandler(UiaIds.WindowOpenedEvent, e => Event?.Invoke(e)));
+                    new AutomationHandler(UiaIds.WindowOpenedEvent, Raise));
             }
             catch { }
             try
             {
                 uia.AddAutomationEventHandler(UiaIds.WindowClosedEvent, root,
                     TreeScope.TreeScope_Subtree, null,
-                    new AutomationHandler(UiaIds.WindowClosedEvent, e => Event?.Invoke(e)));
+                    new AutomationHandler(UiaIds.WindowClosedEvent, Raise));
             }
             catch { }
             try
             {
                 uia.AddPropertyChangedEventHandler(root, TreeScope.TreeScope_Subtree,
-                    null, new PropHandler(e => Event?.Invoke(e)), WatchedProperties);
+                    null, new PropHandler(Raise), WatchedProperties);
             }
             catch { }
             return true;
         });
+    }
+
+    // Per-subscriber delivery on UIA callback threads: one bad subscriber must
+    // neither abort the remaining subscribers nor escape the COM callback —
+    // an unhandled fault on a UIA event thread kills the process.
+    private void Raise(ObservedEvent e)
+    {
+        var subs = Event;
+        if (subs == null) return;
+        foreach (Action<ObservedEvent> sub in subs.GetInvocationList())
+        {
+            try { sub(e); }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"inbrisk-uiaevent subscriber fault: {ex}");
+            }
+        }
     }
 
     private static ObservedEvent Ev(EventKind kind, IUIAutomationElement el, string? detail = null)
