@@ -8,6 +8,10 @@ public interface IWindowService
 {
     IReadOnlyList<WindowInfo> ListWindows();
     WindowInfo? GetWindow(long hwnd);
+    /// <summary>GetWindow normalized to the top-level (GA_ROOT) ancestor — element
+    /// NativeWindowHandles can be child controls (e.g. Notepad's RichEdit), which are
+    /// never foreground-able.</summary>
+    WindowInfo? GetTopLevelWindow(long hwnd) => GetWindow(hwnd);
     WindowInfo? GetForegroundWindow();
     IReadOnlyList<MonitorInfo> GetMonitors();
     RectPx GetVirtualDesktopBounds();

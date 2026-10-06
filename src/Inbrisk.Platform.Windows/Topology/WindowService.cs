@@ -167,6 +167,12 @@ public sealed class WindowService : IWindowService
             IsEnabled: isEnabled);
     });
 
+    public WindowInfo? GetTopLevelWindow(long hwnd)
+    {
+        var root = NativeMethods.GetAncestor(new IntPtr(hwnd), NativeMethods.GA_ROOT);
+        return GetWindow(root != IntPtr.Zero ? root.ToInt64() : hwnd);
+    }
+
     public Dictionary<long, WindowInfo> SyntheticModalPopups { get; } = new();
 
     public WindowInfo? GetModalPopup(long hwnd)

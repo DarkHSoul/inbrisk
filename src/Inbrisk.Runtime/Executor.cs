@@ -125,7 +125,7 @@ public sealed class Executor
                             $"element {id} is stale and could not be re-resolved");
                 }
                 point = element.Center;
-                if (element.Hwnd is { } h) window = _windows.GetWindow(h);
+                if (element.Hwnd is { } h) window = _windows.GetTopLevelWindow(h);
                 targetDesc = $"{id} ({element.Role} '{element.Name}')";
             }
             else if (intent.Target.Selector is { } spec)
@@ -138,7 +138,7 @@ public sealed class Executor
                 _registry.Register(found);
                 elementId = element.Id;
                 point = element.Center;
-                if (element.Hwnd is { } h) window = _windows.GetWindow(h);
+                if (element.Hwnd is { } h) window = _windows.GetTopLevelWindow(h);
                 targetDesc = $"{element.Id} ({element.Role} '{element.Name}')";
             }
             else if (intent.Target.Point is { } pt)

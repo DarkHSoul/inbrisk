@@ -276,7 +276,7 @@ public sealed class AutoVerifier
             }
 
             // 3. Check semantic event even while element still exists
-            var ev2 = AnySemanticEvent(pre, window ?? (el.Hwnd is { } h ? _windows.GetWindow(h) : null));
+            var ev2 = AnySemanticEvent(pre, window ?? (el.Hwnd is { } h ? _windows.GetTopLevelWindow(h) : null));
             if (ev2 != null)
             {
                 return ObservedChange("SemanticEvent", actual: ev2.Kind.ToString(),

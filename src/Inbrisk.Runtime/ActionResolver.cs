@@ -150,7 +150,7 @@ public sealed class ActionResolver
         UiElement? element;
         using (PerfTrace.Stage("resolve.element"))
             element = a.ElementId != null ? _registry.EnsureAlive(a.ElementId) : null;
-        var window = element?.Hwnd is { } h ? _windows.GetWindow(h) : null;
+        var window = element?.Hwnd is { } h ? _windows.GetTopLevelWindow(h) : null;
         AutoVerifier.PreState pre;
         using (PerfTrace.Stage("verify.pre"))
             pre = _verifier.Snapshot(element);
