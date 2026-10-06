@@ -1,9 +1,11 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Inbrisk.Core;
+using Microsoft.Win32;
 
 namespace Inbrisk.Runtime.Adapters;
 
@@ -16,9 +18,11 @@ namespace Inbrisk.Runtime.Adapters;
 /// line per request and reads one JSON line back — the same request/response
 /// shape used by the 3dsmax-mcp bridge.
 ///
-/// Setup is manual and one-time: run <c>computer_adapter{adapter:"blender",
-/// action:"bootstrap"}</c> to materialize the bridge script, then run it once
-/// inside Blender (Scripting workspace → Run Script, or
+/// Setup is one-time: run <c>computer_adapter{adapter:"blender",
+/// action:"auto_install"}</c> to drop the bridge into Blender's
+/// <c>scripts\startup</c> folder so it loads automatically on every launch.
+/// Alternatively <c>action:"bootstrap"</c> materializes the script to
+/// %LOCALAPPDATA% for a manual run (Scripting workspace → Run Script, or
 /// <c>blender --python blender_bridge.py</c>). When the bridge is not
 /// reachable every action fails gracefully with install guidance instead of
 /// throwing.
@@ -30,7 +34,7 @@ public sealed class BlenderAdapter : IApplicationAdapter
 
     public IReadOnlyList<string> SupportedActions { get; } = new[]
     {
-        "execute", "eval", "status", "get_scene", "bootstrap"
+        "execute", "eval", "status", "get_scene", "bootstrap", "auto_install"
     };
 
     /// <summary>Default localhost port the embedded bridge listens on.
@@ -61,7 +65,8 @@ public sealed class BlenderAdapter : IApplicationAdapter
     {
         var act = (action ?? "").ToLowerInvariant();
         return act is "execute" or "exec" or "eval" or "evaluate"
-            or "status" or "ping" or "get_scene" or "scene" or "bootstrap";
+            or "status" or "ping" or "get_scene" or "scene" or "bootstrap"
+            or "auto_install" or "install";
     }
 
     public async Task<AdapterResult> ExecuteAsync(
@@ -81,6 +86,10 @@ public sealed class BlenderAdapter : IApplicationAdapter
             {
                 case "bootstrap":
                     return await Task.Run(() => Bootstrap(), ct).ConfigureAwait(false);
+
+                case "auto_install":
+                case "install":
+                    return await Task.Run(() => AutoInstall(), ct).ConfigureAwait(false);
 
                 case "status":
                 case "ping":
@@ -199,6 +208,186 @@ public sealed class BlenderAdapter : IApplicationAdapter
             });
     }
 
+    /// <summary>File name written into Blender's <c>scripts\startup</c>
+    /// folder. Blender executes every *.py there at launch, so the bridge
+    /// starts with Blender — no manual Scripting-workspace step.</summary>
+    private const string StartupFileName = "inbrisk_bridge.py";
+
+    /// <summary>
+    /// Installs the bridge into Blender's startup-scripts folder so it is
+    /// auto-loaded on every Blender launch. Search order:
+    /// <list type="number">
+    /// <item><c>%APPDATA%\Blender Foundation\Blender\&lt;ver&gt;\scripts\startup</c>
+    /// — highest versioned subdir wins (this is Blender's canonical per-user
+    /// startup location; dirs are created if missing).</item>
+    /// <item><c>C:\Program Files\Blender Foundation\Blender *&lt;ver&gt;\&lt;ver&gt;\scripts\startup</c>
+    /// — versioned subdirs of each system-wide install dir.</item>
+    /// <item><c>scripts\startup</c> beside a blender.exe located through the
+    /// registry App Paths key (HKLM/HKCU).</item>
+    /// </list>
+    /// Idempotent: identical content on disk is reported as
+    /// "already-installed" and left untouched.
+    /// </summary>
+    private static AdapterResult AutoInstall()
+    {
+        var candidates = FindStartupDirs();
+        if (candidates.Count == 0)
+        {
+            return new AdapterResult(false, "Blender.AutoInstall",
+                "No Blender installation found. Searched " +
+                $"'{RoamingBlenderRoot}\\<version>', " +
+                $"'{ProgramFilesBlenderRoot}\\Blender *\\<version>', and " +
+                "the scripts\\startup dir next to blender.exe from the " +
+                "HKLM/HKCU App Paths registry keys. Install Blender first, or " +
+                "use action \"bootstrap\" and run the script manually inside Blender.",
+                Error: ErrorCode.NotFound);
+        }
+
+        var chosen = candidates[0];
+        Directory.CreateDirectory(chosen.StartupDir);
+        var target = Path.Combine(chosen.StartupDir, StartupFileName);
+
+        var status = "installed";
+        if (File.Exists(target) &&
+            string.Equals(File.ReadAllText(target), BootstrapScript, StringComparison.Ordinal))
+        {
+            status = "already-installed";
+        }
+        else
+        {
+            File.WriteAllText(target, BootstrapScript);
+        }
+
+        var versionLabel = chosen.VersionText ?? "unknown";
+        return new AdapterResult(true, "Blender.AutoInstall",
+            status == "already-installed"
+                ? $"Bridge already installed at {target} (identical content). " +
+                  "Restart Blender if it is running to (re)load the bridge; " +
+                  $"it listens on 127.0.0.1:{DefaultPort}."
+                : $"Bridge installed to {target} (Blender {versionLabel}, via " +
+                  $"{chosen.Source}). Restart Blender — startup scripts run at " +
+                  $"launch, then the bridge listens on 127.0.0.1:{DefaultPort}.",
+            Data: new Dictionary<string, object?>
+            {
+                ["installedTo"] = target,
+                ["blenderVersion"] = versionLabel,
+                ["status"] = status,
+                ["howToActivate"] = "restart Blender",
+                ["port"] = DefaultPort,
+                ["source"] = chosen.Source,
+            });
+    }
+
+    /// <summary>One candidate startup folder: the parsed Blender version
+    /// (null when the dir layout gave no version), its display string, the
+    /// scripts\startup path, and which search tier found it.</summary>
+    private sealed record StartupCandidate(
+        Version? Version, string? VersionText, string StartupDir, string Source);
+
+    private static string RoamingBlenderRoot => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+        "Blender Foundation", "Blender");
+
+    private static string ProgramFilesBlenderRoot => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+        "Blender Foundation");
+
+    /// <summary>Ordered candidate startup dirs, highest Blender version
+    /// first. Tier 1 (roaming config) is authoritative — Blender always
+    /// reads it — so tiers 2–3 are only consulted when no versioned
+    /// roaming dir exists yet (e.g. Blender installed but never run).</summary>
+    private static List<StartupCandidate> FindStartupDirs()
+    {
+        var found = VersionedStartupDirs(RoamingBlenderRoot, "roaming-config").ToList();
+        if (found.Count == 0)
+        {
+            if (Directory.Exists(ProgramFilesBlenderRoot))
+            {
+                foreach (var installDir in SafeEnumerateDirs(ProgramFilesBlenderRoot, "Blender*"))
+                    found.AddRange(VersionedStartupDirs(installDir, "program-files"));
+            }
+
+            var exe = FindBlenderExe();
+            if (exe != null)
+            {
+                var exeDir = Path.GetDirectoryName(exe)!;
+                found.AddRange(VersionedStartupDirs(exeDir, "exe-adjacent"));
+                var direct = Path.Combine(exeDir, "scripts", "startup");
+                if (Directory.Exists(direct))
+                    found.Add(new StartupCandidate(null, null, direct, "exe-adjacent"));
+            }
+
+            found = found
+                .GroupBy(c => c.StartupDir, StringComparer.OrdinalIgnoreCase)
+                .Select(g => g.First())
+                .ToList();
+        }
+
+        return found
+            .OrderByDescending(c => c.Version ?? new Version(0, 0))
+            .ToList();
+    }
+
+    /// <summary>Versioned subdirs of <paramref name="root"/> ("3.6", "4.2",
+    /// …) each mapped to its <c>scripts\startup</c> child. The child need
+    /// not exist — it is created on install.</summary>
+    private static IEnumerable<StartupCandidate> VersionedStartupDirs(string root, string source)
+    {
+        foreach (var sub in SafeEnumerateDirs(root))
+        {
+            var name = Path.GetFileName(sub);
+            if (Version.TryParse(name, out var v))
+                yield return new StartupCandidate(v, name,
+                    Path.Combine(sub, "scripts", "startup"), source);
+        }
+    }
+
+    private static IEnumerable<string> SafeEnumerateDirs(string root, string pattern = "*")
+    {
+        try
+        {
+            return Directory.Exists(root)
+                ? Directory.EnumerateDirectories(root, pattern).ToList()
+                : new List<string>();
+        }
+        catch (Exception)
+        {
+            return new List<string>();
+        }
+    }
+
+    /// <summary>Locates blender.exe through the App Paths registry key
+    /// (what the Blender installer registers) in both HKLM and HKCU and
+    /// both 64/32-bit views. Null when no registration exists; registry
+    /// access is best-effort (non-Windows simply returns null).</summary>
+    private static string? FindBlenderExe()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        const string appPathsKey =
+            @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\blender.exe";
+        foreach (var (hive, view) in new[]
+        {
+            (RegistryHive.LocalMachine, RegistryView.Registry64),
+            (RegistryHive.LocalMachine, RegistryView.Registry32),
+            (RegistryHive.CurrentUser, RegistryView.Registry64),
+        })
+        {
+            try
+            {
+                using var baseKey = RegistryKey.OpenBaseKey(hive, view);
+                using var key = baseKey.OpenSubKey(appPathsKey);
+                var val = key?.GetValue(null) as string; // (Default) value
+                if (!string.IsNullOrWhiteSpace(val) && File.Exists(val))
+                    return val;
+            }
+            catch (Exception)
+            {
+                // registry unavailable / access denied — keep searching
+            }
+        }
+        return null;
+    }
+
     /// <summary>Wraps a raw bridge response in an AdapterResult; the bridge's
     /// ok:false carries the Python traceback through as the detail.</summary>
     private static AdapterResult BridgeResult(string method, JsonNode? res,
@@ -222,16 +411,40 @@ public sealed class BlenderAdapter : IApplicationAdapter
             });
     }
 
-    private AdapterResult Unreachable(int port, string why) => new(
-        Success: false,
-        Method: "Blender.Connect",
-        Detail: $"Blender bpy bridge is not reachable on 127.0.0.1:{port} ({why}). " +
-                "Load the bridge inside Blender first: run " +
-                "computer_adapter{adapter:\"blender\", action:\"bootstrap\"} to write the " +
-                "script, then run it in Blender's Scripting workspace (or via " +
-                "`blender --python blender_bridge.py`). The bridge must be re-started " +
-                "after every Blender launch.",
-        Error: ErrorCode.NotFound);
+    private AdapterResult Unreachable(int port, string why)
+    {
+        const string hint =
+            "Run computer_adapter{adapter:\"blender\", action:\"auto_install\"} to install " +
+            "the bridge into Blender's scripts\\startup folder, then restart Blender " +
+            "(alternative: action:\"bootstrap\" writes the script for a manual run in " +
+            "the Scripting workspace).";
+        return new AdapterResult(
+            Success: false,
+            Method: "Blender.Connect",
+            Detail: IsBlenderProcessRunning()
+                ? $"Blender bpy bridge is not reachable on 127.0.0.1:{port} ({why}), but a " +
+                  "Blender process IS running — the bridge was never loaded in it or " +
+                  $"Blender was started before install. {hint}"
+                : $"Blender bpy bridge is not reachable on 127.0.0.1:{port} ({why}). {hint}",
+            Error: ErrorCode.NotFound);
+    }
+
+    /// <summary>True when a blender.exe process exists — used to sharpen the
+    /// "bridge unreachable" guidance (running-but-no-bridge is almost always
+    /// "bridge never installed into startup scripts").</summary>
+    private static bool IsBlenderProcessRunning()
+    {
+        try
+        {
+            var procs = Process.GetProcessesByName("blender");
+            try { return procs.Length > 0; }
+            finally { foreach (var p in procs) p.Dispose(); }
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
 
     /// <summary>One request = one short-lived connection: write a single JSON
     /// line, read a single JSON line back. The bridge serializes execution
@@ -301,7 +514,9 @@ public sealed class BlenderAdapter : IApplicationAdapter
     /// previous instance.
     /// </summary>
     internal const string BootstrapScript = """
-        # Inbrisk Blender bridge — run ONCE inside Blender:
+        # Inbrisk Blender bridge — auto-loaded when placed in Blender's
+        # scripts/startup folder (see adapter action "auto_install"), or run
+        # manually once inside Blender:
         #   Scripting workspace -> open this file -> "Run Script", or
         #   start Blender with:  blender --python blender_bridge.py
         # Listens on 127.0.0.1 (INBRISK_BLENDER_PORT env overrides, default 9877).
@@ -403,10 +618,41 @@ public sealed class BlenderAdapter : IApplicationAdapter
             allow_reuse_address = True
             daemon_threads = True
 
+        # Port-in-use retry: when scripts/startup auto-runs this file while a
+        # previous Blender (or a stale socket) still owns the port, the bind
+        # raises OSError. Instead of dying, a persistent timer retries the
+        # bind so the bridge comes up as soon as the port frees.
+        _RETRY = {"attempts": 0}
+        _MAX_RETRY_ATTEMPTS = 240  # ~2 minutes at 0.5 s intervals
+
+        def _bind(port):
+            return _Server(("127.0.0.1", port), _Handler)
+
+        def _serve(srv):
+            global _server
+            _server = srv
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            if not bpy.app.timers.is_registered(_pump):
+                bpy.app.timers.register(_pump, persistent=True)
+            print("inbrisk bridge listening on 127.0.0.1:%d" % srv.server_address[1])
+
+        def _retry_start():
+            _RETRY["attempts"] += 1
+            if _RETRY["attempts"] > _MAX_RETRY_ATTEMPTS:
+                print("inbrisk bridge: giving up, port %d still busy" % _PORT)
+                return None  # returning None unregisters this timer
+            try:
+                srv = _bind(_PORT)
+            except OSError:
+                return 0.5  # retry in 0.5 s
+            _serve(srv)
+            return None
+
         def stop():
             global _server
-            if bpy.app.timers.is_registered(_pump):
-                bpy.app.timers.unregister(_pump)
+            for fn in (_pump, _retry_start):
+                if bpy.app.timers.is_registered(fn):
+                    bpy.app.timers.unregister(fn)
             if _server:
                 _server.shutdown()
                 _server.server_close()
@@ -415,11 +661,15 @@ public sealed class BlenderAdapter : IApplicationAdapter
         def start(port=None):
             global _server
             stop()  # re-running this script replaces a previous instance
-            _server = _Server(("127.0.0.1", port or _PORT), _Handler)
-            threading.Thread(target=_server.serve_forever, daemon=True).start()
-            if not bpy.app.timers.is_registered(_pump):
-                bpy.app.timers.register(_pump, persistent=True)
-            print("inbrisk bridge listening on 127.0.0.1:%d" % _server.server_address[1])
+            _RETRY["attempts"] = 0
+            try:
+                _serve(_bind(port or _PORT))
+            except OSError as e:
+                print("inbrisk bridge: 127.0.0.1:%d busy (%s); retrying via timers"
+                      % (port or _PORT, e))
+                if not bpy.app.timers.is_registered(_retry_start):
+                    bpy.app.timers.register(_retry_start, persistent=True)
+                return "retrying"
             return "listening"
 
         start()
