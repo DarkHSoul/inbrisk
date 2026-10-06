@@ -709,7 +709,7 @@ public static class GhostControlCommand
             expander = new GhostPipExpander(pipManager.Renderer);
 
             // 4. Initialize Windows System Tray Icon Application
-            trayApp = new GhostTrayApp(initialStatus: "🟢 Ghost OS: RUNNING", visible: true);
+            trayApp = new GhostTrayApp(initialStatus: "🟢 Inbrisk: Hazır", visible: true);
             trayApp.SetInteractive(initialInteractive);
             trayApp.SetOpacity(initialOpacity);
             trayApp.Start();
@@ -815,7 +815,12 @@ public static class GhostControlCommand
 
             if (localDesktop != null)
             {
-                try { localDesktop.Dispose(); } catch { }
+                try
+                {
+                    localDesktop.TerminateAllProcesses(1500);
+                    localDesktop.Dispose();
+                }
+                catch { }
             }
 
             if (localWorker != null)
@@ -908,6 +913,12 @@ public static class GhostControlCommand
         {
             LogInfo("[Tray] Exit requested from System Tray menu.", options);
             try { linkedCts.Cancel(); } catch { }
+        };
+
+        // F2. Tray: Open Settings Requested
+        trayApp.OnOpenSettings += () =>
+        {
+            LogInfo("[Tray] Opening Inbrisk Settings...", options);
         };
 
         // G. Keyboard Forwarder events

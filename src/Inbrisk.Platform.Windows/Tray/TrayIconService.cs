@@ -115,7 +115,7 @@ public sealed class TrayIconService : IDisposable
             else if (_isMcpConnected)
                 tip = $"Inbrisk — Ready ({_mcpClientName})";
             else
-                tip = "Inbrisk — Standby";
+                tip = "Inbrisk — Hazır";
         }
 
         var nid = new NativeMethods.NOTIFYICONDATAW
@@ -259,7 +259,7 @@ public sealed class TrayIconService : IDisposable
 
         try
         {
-            using var bmp = AppIconExtractor.GetInbriskLogo(32);
+            var bmp = AppIconExtractor.GetInbriskLogo(32);
             _hIcon = bmp.GetHicon();
         }
         catch
@@ -275,7 +275,7 @@ public sealed class TrayIconService : IDisposable
             UFlags = NativeMethods.NIF_MESSAGE | NativeMethods.NIF_ICON | NativeMethods.NIF_TIP,
             UCallbackMessage = WmTrayCallback,
             HIcon = _hIcon,
-            SzTip = "Inbrisk — Ready"
+            SzTip = "Inbrisk — Hazır"
         };
 
         _iconAdded = NativeMethods.Shell_NotifyIconW(NativeMethods.NIM_ADD, ref nid);
@@ -394,7 +394,7 @@ public sealed class TrayIconService : IDisposable
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | NativeMethods.MF_DISABLED, (UIntPtr)0, "INBRISK — STOPPED");
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdResume, "Resume Control");
-            NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdOpenSettings, "Settings...");
+            NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdOpenSettings, "⚙️ Ayarlar (Settings)...");
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdQuit, "Quit Inbrisk");
         }
@@ -413,7 +413,7 @@ public sealed class TrayIconService : IDisposable
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | (hudOn ? NativeMethods.MF_CHECKED : NativeMethods.MF_UNCHECKED), (UIntPtr)CmdShowHud, "Show Activity HUD");
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | (perimOn ? NativeMethods.MF_CHECKED : NativeMethods.MF_UNCHECKED), (UIntPtr)CmdShowPerimeter, "Show Perimeter Smoke");
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdPreviewHud, "HUD Önizleme (Test Et)");
-            NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdOpenSettings, "Settings...");
+            NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdOpenSettings, "⚙️ Ayarlar (Settings)...");
 
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdEmergencyStop, "Emergency Stop");

@@ -33,6 +33,7 @@ public sealed class GhostTrayApp : IDisposable
     private const uint CmdOpacity100 = 2106;
     private const uint CmdStop = 2107;
     private const uint CmdExit = 2108;
+    private const uint CmdSettings = 2109;
 
     private readonly object _gate = new();
     private readonly ManualResetEventSlim _ready = new();
@@ -52,8 +53,8 @@ public sealed class GhostTrayApp : IDisposable
     private volatile bool _disposed;
 
     // Runtime state bindings
-    private string _statusText = "🟢 Ghost OS: RUNNING";
-    private string _tooltipText = "Inbrisk Ghost OS — RUNNING";
+    private string _statusText = "🟢 Inbrisk: Hazır";
+    private string _tooltipText = "Inbrisk — Hazır";
     private bool _isInteractive;
     private bool _isFullScreen;
     private bool _isVisible = true;
@@ -95,6 +96,11 @@ public sealed class GhostTrayApp : IDisposable
     /// Raised when the tray icon is clicked with the primary mouse button.
     /// </summary>
     public event Action? OnTrayIconClicked;
+
+    /// <summary>
+    /// Raised when the user requests opening the settings / control panel window.
+    /// </summary>
+    public event Action? OnOpenSettings;
 
     #endregion
 
@@ -175,7 +181,7 @@ public sealed class GhostTrayApp : IDisposable
         if (!string.IsNullOrEmpty(initialStatus))
         {
             _statusText = initialStatus;
-            _tooltipText = $"Inbrisk Ghost OS — {initialStatus}";
+            _tooltipText = initialStatus.Contains("Hazır") ? "Inbrisk — Hazır" : $"Inbrisk — {initialStatus}";
         }
         _isVisible = visible;
     }
@@ -387,7 +393,7 @@ public sealed class GhostTrayApp : IDisposable
                 }
                 else if (lparamMsg is NativeMethods.WM_LBUTTONDBLCLK)
                 {
-                    owner.ToggleFullScreen();
+                    owner.OpenSettings();
                 }
                 return IntPtr.Zero;
             }
@@ -425,7 +431,7 @@ public sealed class GhostTrayApp : IDisposable
         {
             try
             {
-                using var bmp = AppIconExtractor.GetInbriskLogo(32);
+                var bmp = AppIconExtractor.GetInbriskLogo(32);
                 _hIcon = bmp.GetHicon();
             }
             catch
@@ -445,7 +451,7 @@ public sealed class GhostTrayApp : IDisposable
             UFlags = NativeMethods.NIF_MESSAGE | NativeMethods.NIF_ICON | NativeMethods.NIF_TIP,
             UCallbackMessage = WmTrayCallback,
             HIcon = _hIcon,
-            SzTip = string.IsNullOrEmpty(tip) ? "Inbrisk Ghost OS" : tip
+            SzTip = string.IsNullOrEmpty(tip) ? "Inbrisk — Hazır" : tip
         };
 
         _iconAdded = NativeMethods.Shell_NotifyIconW(NativeMethods.NIM_ADD, ref nid);
@@ -467,7 +473,7 @@ public sealed class GhostTrayApp : IDisposable
             HWnd = _hwnd,
             UId = GhostTrayIconId,
             UFlags = NativeMethods.NIF_TIP,
-            SzTip = string.IsNullOrEmpty(tip) ? "Inbrisk Ghost OS" : tip
+            SzTip = string.IsNullOrEmpty(tip) ? "Inbrisk — Hazır" : tip
         };
 
         NativeMethods.Shell_NotifyIconW(NativeMethods.NIM_MODIFY, ref nid);
@@ -571,7 +577,11 @@ public sealed class GhostTrayApp : IDisposable
         NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | NativeMethods.MF_DISABLED, (UIntPtr)0, status);
         NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
 
-        // 2. Interactive Mode (Checkable)
+        // 2. Settings (Ayarlar)
+        NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdSettings, "⚙️ Ayarlar (Settings)...");
+        NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
+
+        // 3. Interactive Mode (Checkable)
         var interactiveLabel = (interactive ? "[✓] " : "[ ] ") + "PiP: İnteraktif Mod (Tıklanabilir)";
         NativeMethods.AppendMenuW(
             hMenu,
@@ -579,7 +589,7 @@ public sealed class GhostTrayApp : IDisposable
             (UIntPtr)CmdInteractive,
             interactiveLabel);
 
-        // 3. Full-Screen Toggle
+        // 4. Full-Screen Toggle
         var fullScreenLabel = "↗️ Tam Ekrana Genişlet / Küçült";
         NativeMethods.AppendMenuW(
             hMenu,
@@ -587,7 +597,7 @@ public sealed class GhostTrayApp : IDisposable
             (UIntPtr)CmdFullScreen,
             fullScreenLabel);
 
-        // 4. Live Preview Visibility (Checkable)
+        // 5. Live Preview Visibility (Checkable)
         var visibilityLabel = (visible ? "[✓] " : "[ ] ") + "PiP Canlı Önizlemeyi Göster";
         NativeMethods.AppendMenuW(
             hMenu,
@@ -595,7 +605,7 @@ public sealed class GhostTrayApp : IDisposable
             (UIntPtr)CmdVisibility,
             visibilityLabel);
 
-        // 5. Opacity Submenu
+        // 6. Opacity Submenu
         bool is50 = opacity <= 165 && opacity >= 100;
         bool is80 = opacity > 165 && opacity < 230;
         bool is100 = opacity >= 230;
@@ -606,13 +616,13 @@ public sealed class GhostTrayApp : IDisposable
 
         NativeMethods.AppendMenuW(hMenu, MF_POPUP, (UIntPtr)(ulong)hOpacitySubMenu.ToInt64(), "⚙️ Opaklık: %50 / %80 / %100");
 
-        // 6. Separator
+        // 7. Separator
         NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
 
-        // 7. Stop Session
+        // 8. Stop Session
         NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdStop, "⏹️ Oturumu Durdur");
 
-        // 8. Exit
+        // 9. Exit
         NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING, (UIntPtr)CmdExit, "❌ Çıkış");
 
         NativeMethods.SetForegroundWindow(_hwnd);
@@ -628,6 +638,9 @@ public sealed class GhostTrayApp : IDisposable
 
         switch (cmd)
         {
+            case CmdSettings:
+                OpenSettings();
+                break;
             case CmdInteractive:
                 ToggleInteractive();
                 break;
@@ -656,6 +669,35 @@ public sealed class GhostTrayApp : IDisposable
                 OnExitRequested?.Invoke();
                 Dispose();
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Opens the Inbrisk settings / control dashboard window.
+    /// </summary>
+    public void OpenSettings()
+    {
+        if (OnOpenSettings != null)
+        {
+            try
+            {
+                OnOpenSettings.Invoke();
+                return;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[GhostTrayApp] OnOpenSettings error: {ex.Message}");
+            }
+        }
+
+        try
+        {
+            var exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
+            Process.Start(new ProcessStartInfo(exe, "settings") { UseShellExecute = true });
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[GhostTrayApp] Failed to open settings: {ex.Message}");
         }
     }
 

@@ -42,6 +42,8 @@ public static class GhostDesktopNative
     public const short SW_SHOWNORMAL = 1;
     public const short SW_HIDE = 0;
 
+    public const uint CREATE_NEW_CONSOLE = 0x00000010;
+
     public const int ERROR_ALREADY_EXISTS = 183;
 
     #endregion
@@ -201,7 +203,8 @@ public static class GhostDesktopNative
         string fileName,
         string? arguments,
         string? workingDir,
-        out PROCESS_INFORMATION processInformation)
+        out PROCESS_INFORMATION processInformation,
+        uint dwCreationFlags = CREATE_NEW_CONSOLE)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(desktopName);
         ArgumentException.ThrowIfNullOrWhiteSpace(fileName);
@@ -224,7 +227,7 @@ public static class GhostDesktopNative
             lpProcessAttributes: IntPtr.Zero,
             lpThreadAttributes: IntPtr.Zero,
             bInheritHandles: false,
-            dwCreationFlags: 0,
+            dwCreationFlags: dwCreationFlags,
             lpEnvironment: IntPtr.Zero,
             lpCurrentDirectory: string.IsNullOrWhiteSpace(workingDir) ? null : workingDir,
             lpStartupInfo: ref si,
@@ -238,9 +241,10 @@ public static class GhostDesktopNative
         string desktopName,
         string fileName,
         string? arguments = null,
-        string? workingDir = null)
+        string? workingDir = null,
+        uint dwCreationFlags = CREATE_NEW_CONSOLE)
     {
-        if (!CreateProcessWithDesktop(desktopName, fileName, arguments, workingDir, out var pi))
+        if (!CreateProcessWithDesktop(desktopName, fileName, arguments, workingDir, out var pi, dwCreationFlags))
         {
             int err = Marshal.GetLastWin32Error();
             GhostLogger.Error($"[GhostDesktopNative] CreateProcessWithDesktop failed for '{fileName}' on desktop '{desktopName}'. Win32 Error: {err}");
@@ -443,12 +447,16 @@ public sealed class GhostLocalDesktop : IDisposable
     /// <param name="arguments">Optional command-line arguments.</param>
     /// <param name="workingDir">Optional working directory.</param>
     /// <returns>The started <see cref="Process"/> instance.</returns>
-    public Process StartProcess(string fileName, string? arguments = null, string? workingDir = null)
+    public Process StartProcess(
+        string fileName,
+        string? arguments = null,
+        string? workingDir = null,
+        uint dwCreationFlags = GhostDesktopNative.CREATE_NEW_CONSOLE)
     {
         ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrWhiteSpace(fileName);
 
-        if (!GhostDesktopNative.CreateProcessWithDesktop(_desktopName, fileName, arguments, workingDir, out var pi))
+        if (!GhostDesktopNative.CreateProcessWithDesktop(_desktopName, fileName, arguments, workingDir, out var pi, dwCreationFlags))
         {
             int err = Marshal.GetLastWin32Error();
             GhostLogger.Error($"[GhostLocalDesktop] Failed to spawn process '{fileName}' on desktop '{_desktopName}'. Win32 Error: {err}");
@@ -699,6 +707,15 @@ public sealed class GhostLocalDesktop : IDisposable
 
             if (disposing)
             {
+                try
+                {
+                    TerminateAllProcesses(1500);
+                }
+                catch (Exception ex)
+                {
+                    GhostLogger.Warn($"[GhostLocalDesktop] Exception during TerminateAllProcesses in Dispose: {ex.Message}");
+                }
+
                 foreach (var proc in _startedProcesses)
                 {
                     try { proc.Dispose(); } catch { }
