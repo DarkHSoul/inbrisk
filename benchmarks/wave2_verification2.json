@@ -1,0 +1,52 @@
+[
+  {
+    "name": "launch mspaint",
+    "ok": true,
+    "detail": "{\"status\":\"Verified\",\"next\":\"inspect\",\"nextObservationRequired\":true,\"app\":\"mspaint\",\"method\":\"AppPath\",\"process\":{\"pid\":24888},\"window\":{\"hwnd\":\"0x35090C\",\"title\":\"Paint\"},\"initialMap\":{\"hwnd\":\"0x350"
+  },
+  {
+    "name": "launch mspaint #2",
+    "ok": true,
+    "detail": "{\"status\":\"Verified\",\"next\":\"inspect\",\"nextObservationRequired\":true,\"app\":\"mspaint\",\"method\":\"ExistingInstance\",\"process\":{\"pid\":24888},\"window\":{\"hw"
+  },
+  {
+    "name": "cleanup reaped>=1",
+    "ok": true,
+    "detail": "{\"pending\":1,\"reaped\":1,\"skipped\":[],\"pendingRemaining\":0,\"elapsedMs\":209}"
+  },
+  {
+    "name": "cleanup shape",
+    "ok": true,
+    "detail": "{\"pending\":1,\"reaped\":1,\"skipped\":[],\"pendingRemaining\":0,\"elapsedMs\":209}"
+  },
+  {
+    "name": "mspaint pid gone",
+    "ok": true,
+    "detail": "False"
+  },
+  {
+    "name": "run + save_as_recipe",
+    "ok": true,
+    "detail": "{\"runId\":\"r_aba1bad1\",\"status\":\"Completed\",\"screen\":\"Main\",\"executed\":1,\"steps\":[{\"step\":0,\"action\":\"launch\",\"status\":\"Verified\",\"ms\":828,\"method\":\"launch.AppPath\",\"detail\":\"mspaint Ready pid=7024 hwnd=0x2D040A \\u0022Paint\\u0022\"}],\"durationMs\":1332,\"provenance\":{\"untrusted\":true,\"source\":\"uia\",\"han"
+  },
+  {
+    "name": "recipe file written",
+    "ok": true,
+    "detail": "C:\\Users\\Ahmet\\AppData\\Local\\Temp\\inbrisk-wave2b-zvvjki08\\task-recipes\\w2-mspaint.json"
+  },
+  {
+    "name": "recipe parameterized flag",
+    "ok": true,
+    "detail": "\"recipe\":{\"name\":\"w2-mspaint\",\"path\":\"C:\\\\Users\\\\Ahmet\\\\AppData\\\\Local\\\\Temp\\\\inbrisk-wave2b-zvvjki08\\\\task-recipes\\\\w2-mspaint.json\",\"steps\":1,\"parameterized\":true}}"
+  },
+  {
+    "name": "launch mspaint for session-reap",
+    "ok": 7024,
+    "detail": "{\"status\":\"Verified\",\"next\":\"inspect\",\"nextObservationRequired\":true,\"app\":\"mspaint\",\"method\":\"ExistingInstance\",\"process\":{\"pid\":7024},\"window\":{\"hwn"
+  },
+  {
+    "name": "session-end reaped own mspaint",
+    "ok": true,
+    "detail": "False"
+  }
+]
