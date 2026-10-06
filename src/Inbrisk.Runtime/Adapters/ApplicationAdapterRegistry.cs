@@ -18,6 +18,7 @@ public sealed class ApplicationAdapterRegistry
         {
             Register(new WindowsMediaAdapter());
             Register(new TestAppAdapter());
+            Register(new BlenderAdapter());
             var chrome = new ChromeDevToolsAdapter();
             Register(chrome);
             _adapters["cdp"] = chrome;
