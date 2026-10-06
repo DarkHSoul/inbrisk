@@ -62,6 +62,15 @@ public static class McpHost
         "computer_screenshot",
         "computer_reset_input",
         "computer_capabilities",
+        // escape hatch + run lifecycle — without these, a "core" session can
+        // never reach the wider toolset or reuse recorded plans
+        "computer_toolset",
+        "computer_save_recipe",
+        "computer_run_recipe",
+        "computer_list_recipes",
+        "computer_pause_run",
+        "computer_resume_run",
+        "computer_wait_for",
     };
 
     public static IReadOnlySet<string> CoreTools => CoreToolNames;

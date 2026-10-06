@@ -136,7 +136,29 @@ public static class InbriskResources
                     "{window} → title match. Works on hwnd-less UIA trees " +
                     "(Spotify/Electron); no target → observed window, then desktop" },
                 ["wait_for_change|wait_for_stable"] = new { fields = "ms" },
+                ["wait_for_gone"] = new { fields = "query|target|elementId, ms, stopOnDialog" },
+                ["scroll_into_view"] = new { fields = "elementId|target" },
+                ["scan|for_each"] = new { fields = "target|elementId " +
+                    "(container), as, where{startsWith,contains,notContains," +
+                    "exact,role,state}, steps[], collect[], maxItems, " +
+                    "maxPages, stopOn[]", note =
+                    "iterates matched items SERVER-SIDE — no LLM roundtrip " +
+                    "per item; binds $as (default $item) plus .id/.name/" +
+                    ".role/.value for sub-steps; collect projects props into " +
+                    "the run's collected[]; maxPages paginates virtualized lists" },
+                ["human|human_takeover|pause_for_human"] = new
+                    { fields = "note|reason", note =
+                    "pauses the run and hands control to the local user — " +
+                    "resume via computer_resume_run" },
+                ["media|play|pause|next|previous|volume_up|volume_down|mute"] =
+                    new { fields = "target(process)|adapter|args", note =
+                    "routed through specialist adapters like action:\"adapter\"" },
             },
+            recipes = "proven runs → reusable parameterized macros: " +
+                "computer_save_recipe{name, fromRunId|steps with " +
+                "{{param}} placeholders, parameters[]} then " +
+                "computer_run_recipe{name, parameters:{…}}; " +
+                "computer_list_recipes reports success rates",
             bindings = "find{as:\"doc\"} → later steps use elementId:\"$doc\", " +
                 "target:{elementId:\"$doc\"} or target:{within:\"$doc\"}; " +
                 "launch{as:\"app\"} binds a window hwnd the same way",
@@ -282,7 +304,8 @@ public static class InbriskResources
         runStepActions =
             "launch|find|assert|checkpoint|focus|focus_window|click|rightclick|" +
             "doubleclick|invoke|toggle|select|hover|set_value|type|key|hotkey|" +
-            "scroll|drag|wait|wait_for|wait_for_change|wait_for_stable|adapter",
+            "scroll|drag|wait|wait_for|wait_for_gone|wait_for_change|" +
+            "wait_for_stable|scan|for_each|adapter|media|human|pause_for_human",
         specialistAdapters = "chrome_devtools (CDP DOM/JS/tabs) | media (Spotify/VLC) | testapp",
         runBindings =
             "find{as:\"x\"}/launch{as:\"x\"} → later steps use " +

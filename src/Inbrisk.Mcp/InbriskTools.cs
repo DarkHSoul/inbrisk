@@ -2901,19 +2901,21 @@ public sealed class InbriskTools
         "set_value{elementId|target,text|value}, type{elementId|target,text,mode,position,submit}, " +
         "key{key,count}, hotkey{key,modifiers OR keys:\"ctrl+s\"}, scroll{delta,target}, " +
         "scroll_into_view{elementId|target}, drag{target,toX,toY}, wait{ms}, " +
-        "wait_for{query,ms,target-scope:{within|process|window}}, wait_for_change/wait_for_stable{ms}, " +
-        "scan/for_each{target,asVar,steps,where,collect,limit,maxPages,stopOn}. " +
+        "wait_for{query,ms,target-scope:{within|process|window}}, wait_for_gone{query|target|elementId,ms}, wait_for_change/wait_for_stable{ms}, " +
+        "scan/for_each{target,as,steps,where,collect,maxItems,maxPages,stopOn}, " +
+        "adapter{adapter,args}/media actions (play,pause,next,previous,volume_up,volume_down,mute), human|pause_for_human{reason}. " +
         "Dynamic variables ($var, {{var}}, $item.name, $item.value, $item.role, $item.id) interpolate automatically " +
         "inside target names, text, values, and element IDs. " +
         "Targets resolve LAZILY at each step, so later steps can act on UI created by earlier ones. " +
         "find{as:\"x\"} binds an element for later steps via elementId:\"$x\" (also inside target.within). " +
-        "scan iterates server-side over matched items without LLM roundtrips, binding $asVar and properties. " +
+        "scan iterates server-side over matched items without LLM roundtrips, binding $as and $as.name/.value/.role/.id per item. " +
         "When several candidates match, selection stays server-side: select:\"first|last|nth\" + index + " +
         "orderBy:\"visual\" | \"tree\" | \"score\". " +
         "ifExists/ifNotExists/ifEnabled/ifValue skip steps; retry/timeout bound them. " +
         "STRICT: unknown or wrong-action fields are Malformed, never ignored. " +
         "First failure pauses with step/error/observationDelta/availableElements — resume with the same runId. " +
-        "checkpoint pauses deliberately for model reasoning. An unexpected dialog pauses with UnexpectedModalOpened.")]
+        "checkpoint pauses deliberately for model reasoning. An unexpected dialog pauses with UnexpectedModalOpened. " +
+        "A proven run becomes a reusable parameterized recipe via computer_save_recipe{fromRunId} — replay later with computer_run_recipe.")]
     public async Task<CallToolResult> RunPlan(
         [Description("ordered plan steps")] RunStep[] steps,
         [Description("resume an existing run — keeps its element bindings")] string? runId = null,
@@ -2950,7 +2952,8 @@ public sealed class InbriskTools
         "Execute a composite fast UI action in a single turn without LLM roundtrips. " +
         "Can launch/focus an app, click a target, type text, and/or send a hotkey. " +
         "Examples: computer_do(app: \"notepad\", type: \"hello world\", hotkey: \"ctrl+s\"), " +
-        "computer_do(click: \"Save\", type: \"test.txt\", submit: true)")]
+        "computer_do(click: \"Save\", type: \"test.txt\", submit: true). " +
+        "For anything beyond launch+click+type+hotkey — conditions, loops over matched items, reads, reusable flows — use computer_run (or a saved computer_run_recipe).")]
     public async Task<CallToolResult> ComputerDo(
         [Description("Application to launch or focus (e.g. 'Notepad', 'Calculator')")] string? app = null,
         [Description("Target element name or text to click")] string? click = null,
@@ -3030,7 +3033,8 @@ public sealed class InbriskTools
         "Supports sequential 'steps' (click, invoke, type, set_value, hotkey, wait, scroll, launch, etc.), " +
         "OR a compact 'set' list for multiple form fields (mutually exclusive with 'steps' to avoid ambiguous ordering). " +
         "Supports optional 'until' wait condition and optional 'read' list to extract element values/states. " +
-        "Do NOT batch across an unpredicted reasoning boundary.")]
+        "Do NOT batch across an unpredicted reasoning boundary. " +
+        "For conditions (ifExists/ifValue), iteration over matched items (scan/for_each), or reusable parameterized flows, prefer computer_run / computer_run_recipe.")]
     public async Task<CallToolResult> Batch(
         [Description("ordered list of simple action steps to execute sequentially (mutually exclusive with 'set')")] BatchStep[]? steps = null,
         [Description("compact list of form fields to set in one turn (target, value, role?); mutually exclusive with 'steps'")] FormFieldSpec[]? set = null,
@@ -6189,7 +6193,29 @@ public sealed class InbriskTools
         if (!state.Slim || skipped > 0) payload["skipped"] = skipped;
         if (!state.Slim || internalActions > 0) payload["internalActions"] = internalActions;
         if (!state.Slim && status is "Completed")
+        {
             payload["verificationHint"] = "plan execution completed successfully; follow-up computer_observe is NOT needed";
+            if (executed >= 2)
+                payload["recipeHint"] = "reusable flow? save it for replay: " +
+                    $"computer_save_recipe{{name:\"<name>\", fromRunId:\"{state.RunId}\"}}";
+        }
+        // P2.9: per-run plan stats → find-perf.jsonl. One event per
+        // computer_run/resume invocation; callsSaved estimates the
+        // separate MCP tool calls this batched plan replaced (each
+        // executed step + internal scan/adapter action ≈ one call).
+        UiaPerf.Write(new
+        {
+            kind = "run.summary",
+            runId = state.RunId,
+            status,
+            stepEntries = steps.Count,
+            executed,
+            skipped,
+            internalActions,
+            collectedRecords = state.Collected.Count,
+            callsSaved = executed + internalActions,
+            ms = sw.ElapsedMilliseconds,
+        });
         if (state.Bindings.Count > 0) payload["bindings"] = state.Bindings;
         if (state.Collected.Count > 0) payload["collected"] = state.Collected;
         if (state.HumanChanges != null) payload["humanChanges"] = state.HumanChanges;
