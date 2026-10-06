@@ -28,6 +28,7 @@ public sealed class GhostPipWindowHost : IDisposable
     private const uint WmAppSetPosSize = NativeMethods.WM_APP + 212;
     private const uint WmAppSetVisible = NativeMethods.WM_APP + 213;
     private const uint WmAppInvalidate = NativeMethods.WM_APP + 214;
+    private const uint WmAppToggleExpand = NativeMethods.WM_APP + 215;
 
     private static readonly IntPtr HwndTopmost = new(-1);
     private static readonly object ClassGate = new();
@@ -49,6 +50,12 @@ public sealed class GhostPipWindowHost : IDisposable
     private volatile int _height;
     private volatile bool _visible = true;
     private volatile bool _disposed;
+
+    private int _savedCompactWidth = 320;
+    private int _savedCompactHeight = 180;
+    private int _savedCompactX = -1;
+    private int _savedCompactY = -1;
+    private bool _isExpanded;
 
     /// <summary>
     /// Raised during WM_PAINT so custom renderers (GDI / DirectX / Capture streams) can paint directly.
@@ -73,6 +80,11 @@ public sealed class GhostPipWindowHost : IDisposable
     /// Raised when the user drags or resizes the PiP window.
     /// </summary>
     public event Action<int, int>? PositionChanged;
+
+    /// <summary>
+    /// Raised when the user drags or resizes the PiP window, providing full bounds (X, Y, Width, Height).
+    /// </summary>
+    public event Action<int, int, int, int>? BoundsChanged;
 
     /// <summary>
     /// Raised when an interactive mouse or input event occurs in the PiP client area below the header bar.
@@ -272,6 +284,26 @@ public sealed class GhostPipWindowHost : IDisposable
     }
 
     /// <summary>
+    /// Gets whether the PiP window is currently in expanded size mode.
+    /// </summary>
+    public bool IsExpanded => _isExpanded;
+
+    /// <summary>
+    /// Toggles the PiP window between compact size (~320x180) and 2x expanded size (~640x360).
+    /// </summary>
+    public void ToggleExpand()
+    {
+        if (_threadId != 0 && Thread.CurrentThread.ManagedThreadId != _thread?.ManagedThreadId)
+        {
+            NativeMethods.PostThreadMessageW(_threadId, WmAppToggleExpand, IntPtr.Zero, IntPtr.Zero);
+        }
+        else
+        {
+            ToggleExpandCore();
+        }
+    }
+
+    /// <summary>
     /// Configures screen capture exclusion (WDA_EXCLUDEFROMCAPTURE) so screen recorders
     /// or Inbrisk's own desktop vision can omit this PiP overlay.
     /// </summary>
@@ -350,6 +382,10 @@ public sealed class GhostPipWindowHost : IDisposable
                         NativeMethods.InvalidateRect(_hwnd, IntPtr.Zero, msg.WParam != IntPtr.Zero);
                     }
                 }
+                else if (msg.Message == WmAppToggleExpand)
+                {
+                    ToggleExpandCore();
+                }
 
                 NativeMethods.TranslateMessage(ref msg);
                 NativeMethods.DispatchMessageW(ref msg);
@@ -400,16 +436,16 @@ public sealed class GhostPipWindowHost : IDisposable
         _hwndHandle = GCHandle.Alloc(this);
 
         // Core requirement styles:
-        // WS_POPUP | WS_VISIBLE
+        // WS_POPUP | WS_VISIBLE | WS_MINIMIZEBOX | WS_SYSMENU
         // WS_EX_TOPMOST (0x08)
         // WS_EX_NOACTIVATE (0x08000000) -> Never steals focus from active game or app
         // WS_EX_TRANSPARENT (0x20) -> Click-through passed to window underneath
-        // WS_EX_TOOLWINDOW (0x80) -> Excluded from taskbar & Alt+Tab
+        // WS_EX_APPWINDOW (0x40000) -> Appears in taskbar like a standard application
         // WS_EX_LAYERED (0x80000) -> Supports opacity & alpha blending
-        uint dwStyle = NativeMethods.WS_POPUP | NativeMethods.WS_VISIBLE;
+        uint dwStyle = NativeMethods.WS_POPUP | NativeMethods.WS_VISIBLE | NativeMethods.WS_MINIMIZEBOX | NativeMethods.WS_SYSMENU;
         uint dwExStyle = (uint)(NativeMethods.WS_EX_TOPMOST |
                                 NativeMethods.WS_EX_NOACTIVATE |
-                                NativeMethods.WS_EX_TOOLWINDOW |
+                                NativeMethods.WS_EX_APPWINDOW |
                                 NativeMethods.WS_EX_LAYERED);
 
         if (_clickThrough)
@@ -447,8 +483,8 @@ public sealed class GhostPipWindowHost : IDisposable
 
             NativeMethods.SetWindowPos(_hwnd, HwndTopmost, _x, _y, _width, _height, swpFlags);
 
-            // Default: Exclude from vision captures to prevent AI feedback loops
-            NativeMethods.SetWindowDisplayAffinity(_hwnd, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
+            // Screen capture: WDA_NONE allows Windows Snipping Tool, Win+Shift+S, and PrtScn screenshots
+            NativeMethods.SetWindowDisplayAffinity(_hwnd, NativeMethods.WDA_NONE);
 
             WindowCreated?.Invoke(this);
         }
@@ -492,6 +528,84 @@ public sealed class GhostPipWindowHost : IDisposable
         if (_hwnd != IntPtr.Zero)
         {
             NativeMethods.SetLayeredWindowAttributes(_hwnd, 0, alpha, NativeMethods.LWA_ALPHA);
+        }
+    }
+
+    private void ToggleExpandCore()
+    {
+        if (_hwnd == IntPtr.Zero) return;
+
+        // If currently compact or medium (width <= 480), expand to large mode
+        if (_width <= 480)
+        {
+            _savedCompactWidth = _width;
+            _savedCompactHeight = _height;
+            _savedCompactX = _x;
+            _savedCompactY = _y;
+
+            int newWidth = Math.Max(640, _savedCompactWidth * 2);
+            int newHeight = Math.Max(360, (newWidth * 9) / 16);
+
+            int screenW = 1920;
+            int screenH = 1080;
+            try
+            {
+                var hMon = NativeMethods.MonitorFromWindow(_hwnd, NativeMethods.MONITOR_DEFAULTTONEAREST);
+                var mi = new MONITORINFOEXW { CbSize = Marshal.SizeOf<MONITORINFOEXW>() };
+                if (NativeMethods.GetMonitorInfoW(hMon, ref mi))
+                {
+                    screenW = mi.RcWork.Right - mi.RcWork.Left;
+                    screenH = mi.RcWork.Bottom - mi.RcWork.Top;
+                }
+            }
+            catch { }
+
+            int newX = _x;
+            int newY = _y;
+
+            // Expand towards the left if close to right edge
+            if (newX + newWidth > screenW)
+            {
+                newX = screenW - newWidth - 16;
+            }
+            if (newX < 10) newX = 10;
+
+            // Expand upwards if close to bottom edge
+            if (newY + newHeight > screenH)
+            {
+                newY = screenH - newHeight - 16;
+            }
+            if (newY < 10) newY = 10;
+
+            _x = newX;
+            _y = newY;
+            _width = newWidth;
+            _height = newHeight;
+            _isExpanded = true;
+
+            ApplyPositionAndSize(_x, _y, _width, _height);
+            PositionChanged?.Invoke(_x, _y);
+            BoundsChanged?.Invoke(_x, _y, _width, _height);
+            NativeMethods.InvalidateRect(_hwnd, IntPtr.Zero, false);
+        }
+        else
+        {
+            // Restore to compact size
+            int restoreWidth = _savedCompactWidth > 0 ? _savedCompactWidth : 320;
+            int restoreHeight = _savedCompactHeight > 0 ? _savedCompactHeight : 180;
+            int restoreX = _savedCompactX >= 0 ? _savedCompactX : _x;
+            int restoreY = _savedCompactY >= 0 ? _savedCompactY : _y;
+
+            _x = restoreX;
+            _y = restoreY;
+            _width = restoreWidth;
+            _height = restoreHeight;
+            _isExpanded = false;
+
+            ApplyPositionAndSize(_x, _y, _width, _height);
+            PositionChanged?.Invoke(_x, _y);
+            BoundsChanged?.Invoke(_x, _y, _width, _height);
+            NativeMethods.InvalidateRect(_hwnd, IntPtr.Zero, false);
         }
     }
 
@@ -555,19 +669,61 @@ public sealed class GhostPipWindowHost : IDisposable
                 var pt = new POINT { X = screenX, Y = screenY };
                 NativeMethods.ScreenToClient(hWnd, ref pt);
 
-                // Bottom-right resize handle (14x14 corner)
-                if (pt.X >= _width - 14 && pt.Y >= _height - 14)
-                {
+                const int border = 8;
+                const int corner = 14;
+
+                // 1. Resizing corners
+                if (pt.X <= corner && pt.Y <= corner)
+                    return new IntPtr(NativeMethods.HTTOPLEFT);
+                if (pt.X >= _width - corner && pt.Y <= corner)
+                    return new IntPtr(NativeMethods.HTTOPRIGHT);
+                if (pt.X <= corner && pt.Y >= _height - corner)
+                    return new IntPtr(NativeMethods.HTBOTTOMLEFT);
+                if (pt.X >= _width - corner && pt.Y >= _height - corner)
                     return new IntPtr(NativeMethods.HTBOTTOMRIGHT);
+
+                // 2. Resizing borders
+                if (pt.X <= border)
+                    return new IntPtr(NativeMethods.HTLEFT); // En soldan tutup drag ile boyut değiştirme!
+                if (pt.X >= _width - border)
+                    return new IntPtr(NativeMethods.HTRIGHT);
+                if (pt.Y >= _height - border)
+                    return new IntPtr(NativeMethods.HTBOTTOM);
+                if (pt.Y <= border)
+                    return new IntPtr(NativeMethods.HTTOP);
+
+                // 3. Header Action Buttons (Far right of header: Expand & Minimize buttons)
+                if (pt.Y < HeaderHeight && pt.X >= _width - 56)
+                {
+                    return new IntPtr(NativeMethods.HTCLIENT);
                 }
 
-                // Top header drag bar (0 <= Y < HeaderHeight) -> Native Windows smooth dragging!
-                if (pt.Y >= 0 && pt.Y < HeaderHeight)
+                // 4. Header Bar: Native smooth dragging of the whole window!
+                if (pt.Y < HeaderHeight)
                 {
                     return new IntPtr(NativeMethods.HTCAPTION);
                 }
 
                 return new IntPtr(NativeMethods.HTCLIENT);
+
+            case NativeMethods.WM_NCLBUTTONDBLCLK:
+                if (wParam.ToInt32() == NativeMethods.HTCAPTION)
+                {
+                    ToggleExpandCore();
+                    return IntPtr.Zero;
+                }
+                break;
+
+            case NativeMethods.WM_GETMINMAXINFO:
+                if (lParam != IntPtr.Zero)
+                {
+                    var mmi = Marshal.PtrToStructure<NativeMethods.MINMAXINFO>(lParam);
+                    mmi.ptMinTrackSize.X = 240;
+                    mmi.ptMinTrackSize.Y = 135;
+                    Marshal.StructureToPtr(mmi, lParam, true);
+                    return IntPtr.Zero;
+                }
+                break;
 
             case NativeMethods.WM_MOUSEMOVE:
             case NativeMethods.WM_LBUTTONDOWN:
@@ -584,9 +740,33 @@ public sealed class GhostPipWindowHost : IDisposable
                     int clientX = unchecked((short)(long)lParam);
                     int clientY = unchecked((short)((long)lParam >> 16));
 
-                    // Only handle mouse messages in the client area below the 26px header bar
-                    if (clientY >= HeaderHeight)
+                    // Header bar clicks (buttons or double clicks)
+                    if (clientY < HeaderHeight)
                     {
+                        if (msg == NativeMethods.WM_LBUTTONDOWN)
+                        {
+                            if (clientX >= _width - 28)
+                            {
+                                // Minimize button clicked
+                                NativeMethods.ShowWindow(hWnd, 6 /* SW_MINIMIZE */);
+                                return IntPtr.Zero;
+                            }
+                            if (clientX >= _width - 56)
+                            {
+                                // Expand toggle button clicked
+                                ToggleExpandCore();
+                                return IntPtr.Zero;
+                            }
+                        }
+                        else if (msg == NativeMethods.WM_LBUTTONDBLCLK)
+                        {
+                            // Double-click on header bar
+                            ToggleExpandCore();
+                            return IntPtr.Zero;
+                        }
+
+                        return IntPtr.Zero;
+                    }
                         if (msg == NativeMethods.WM_LBUTTONDOWN)
                         {
                             NativeMethods.SetFocus(hWnd);
@@ -621,9 +801,8 @@ public sealed class GhostPipWindowHost : IDisposable
                         OnInteractiveInput?.Invoke(new PipInputEventArgs(eventType, clientX, clientY, button));
                         return IntPtr.Zero;
                     }
+                    break;
                 }
-                break;
-            }
 
             case NativeMethods.WM_MOUSEWHEEL:
             {
@@ -650,11 +829,17 @@ public sealed class GhostPipWindowHost : IDisposable
             case 0x0005: // WM_SIZE
                 if (NativeMethods.GetWindowRect(hWnd, out var wr))
                 {
-                    _x = wr.Left;
-                    _y = wr.Top;
-                    _width = wr.Right - wr.Left;
-                    _height = wr.Bottom - wr.Top;
-                    PositionChanged?.Invoke(_x, _y);
+                    int nw = wr.Right - wr.Left;
+                    int nh = wr.Bottom - wr.Top;
+                    if (nw > 50 && nh > 50)
+                    {
+                        _x = wr.Left;
+                        _y = wr.Top;
+                        _width = nw;
+                        _height = nh;
+                        PositionChanged?.Invoke(_x, _y);
+                        BoundsChanged?.Invoke(_x, _y, _width, _height);
+                    }
                 }
                 break;
 

@@ -46,6 +46,7 @@ public class GhostPipInteractiveInputTests
         public int Height { get; private set; } = 270;
 
         public event Action<int, int>? PositionChanged;
+        public event Action<int, int, int, int>? BoundsChanged;
         public event Action<PipInputEventArgs>? OnInteractiveInput;
 
         public void SetClickThrough(bool enabled) => ClickThrough = enabled;
@@ -54,6 +55,19 @@ public class GhostPipInteractiveInputTests
         {
             X = x; Y = y; Width = width; Height = height;
             PositionChanged?.Invoke(x, y);
+            BoundsChanged?.Invoke(x, y, width, height);
+        }
+
+        public void ToggleExpand()
+        {
+            if (Width <= 480)
+            {
+                SetPositionAndSize(X, Y, 640, 360);
+            }
+            else
+            {
+                SetPositionAndSize(X, Y, 320, 180);
+            }
         }
 
         public void RaiseInteractiveInput(PipInputEventArgs e) => OnInteractiveInput?.Invoke(e);
@@ -180,5 +194,36 @@ public class GhostPipInteractiveInputTests
         pipManager.SetInteractive(false);
         mockHost.RaiseInteractiveInput(new PipInputEventArgs(PipInputEventType.MouseDown, 240, 148));
         Assert.Equal(2, dispatched.Count); // Count does not increase
+    }
+
+    [Fact]
+    public void MockGhostPipWindowHost_ToggleExpand_TogglesBetweenCompactAndExpanded()
+    {
+        var host = new MockGhostPipWindowHost();
+        Assert.Equal(480, host.Width);
+        Assert.Equal(270, host.Height);
+
+        // When <= 480, expands to 640x360
+        host.ToggleExpand();
+        Assert.Equal(640, host.Width);
+        Assert.Equal(360, host.Height);
+
+        // When > 480, restores to 320x180
+        host.ToggleExpand();
+        Assert.Equal(320, host.Width);
+        Assert.Equal(180, host.Height);
+    }
+
+    [Fact]
+    public void MockGhostPipWindowHost_BoundsChanged_FiresOnResize()
+    {
+        var host = new MockGhostPipWindowHost();
+        (int X, int Y, int W, int H)? lastBounds = null;
+        host.BoundsChanged += (x, y, w, h) => lastBounds = (x, y, w, h);
+
+        host.SetPositionAndSize(50, 60, 500, 300);
+
+        Assert.NotNull(lastBounds);
+        Assert.Equal((50, 60, 500, 300), lastBounds.Value);
     }
 }

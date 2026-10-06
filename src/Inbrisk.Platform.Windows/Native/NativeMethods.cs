@@ -171,8 +171,12 @@ internal static class NativeMethods
     public const int WS_EX_TOOLWINDOW = 0x00000080;
     public const int WS_EX_NOACTIVATE = 0x08000000;
     public const int WS_EX_LAYERED = 0x00080000;
+    public const int WS_EX_APPWINDOW = 0x00040000;
     public const uint WS_POPUP = 0x80000000;
     public const uint WS_VISIBLE = 0x10000000;
+    public const uint WS_MINIMIZEBOX = 0x00020000;
+    public const uint WS_MAXIMIZEBOX = 0x00010000;
+    public const uint WS_SYSMENU = 0x00080000;
     public const uint SWP_NOSIZE = 0x0001;
     public const uint SWP_NOMOVE = 0x0002;
     public const uint SWP_NOZORDER = 0x0004;
@@ -419,10 +423,29 @@ internal static class NativeMethods
     public const uint NIF_INFO = 0x00000010;
 
     public const uint WM_NCHITTEST = 0x0084;
+    public const uint WM_NCLBUTTONDBLCLK = 0x00A3;
+    public const uint WM_GETMINMAXINFO = 0x0024;
     public const int HTTRANSPARENT = -1;
     public const int HTCLIENT = 1;
     public const int HTCAPTION = 2;
+    public const int HTLEFT = 10;
+    public const int HTRIGHT = 11;
+    public const int HTTOP = 12;
+    public const int HTTOPLEFT = 13;
+    public const int HTTOPRIGHT = 14;
+    public const int HTBOTTOM = 15;
+    public const int HTBOTTOMLEFT = 16;
     public const int HTBOTTOMRIGHT = 17;
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct MINMAXINFO
+    {
+        public POINT ptReserved;
+        public POINT ptMaxSize;
+        public POINT ptMaxPosition;
+        public POINT ptMinTrackSize;
+        public POINT ptMaxTrackSize;
+    }
 
     [DllImport("user32.dll")] internal static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
     public const uint WM_MOUSEMOVE = 0x0200;

@@ -95,8 +95,14 @@ public interface IGhostPipWindowHost : IDisposable
     /// <summary>Raised when the window is dragged or moved.</summary>
     event Action<int, int>? PositionChanged;
 
+    /// <summary>Raised when the window is dragged or resized, providing full bounds (x, y, width, height).</summary>
+    event Action<int, int, int, int>? BoundsChanged;
+
     /// <summary>Raised when an interactive mouse or input event occurs in the PiP client area.</summary>
     event Action<PipInputEventArgs>? OnInteractiveInput;
+
+    /// <summary>Toggles window between compact and expanded scale.</summary>
+    void ToggleExpand();
 }
 
 #endregion
@@ -393,6 +399,20 @@ public class GhostPipManager : IDisposable
                     {
                         _currentX = newX;
                         _currentY = newY;
+                        _currentWidth = _windowHost.Width > 0 ? _windowHost.Width : _currentWidth;
+                        _currentHeight = _windowHost.Height > 0 ? _windowHost.Height : _currentHeight;
+                        _currentPosition = PipPresetPosition.Custom;
+                    }
+                };
+
+                _windowHost.BoundsChanged += (newX, newY, newW, newH) =>
+                {
+                    lock (_gate)
+                    {
+                        _currentX = newX;
+                        _currentY = newY;
+                        _currentWidth = newW;
+                        _currentHeight = newH;
                         _currentPosition = PipPresetPosition.Custom;
                     }
                 };
@@ -414,8 +434,8 @@ public class GhostPipManager : IDisposable
             return;
         }
 
-        int pipWidth = _currentWidth;
-        int pipHeight = _currentHeight;
+        int pipWidth = _windowHost.Width > 0 ? _windowHost.Width : _currentWidth;
+        int pipHeight = _windowHost.Height > 0 ? _windowHost.Height : _currentHeight;
         const int headerHeight = 26; // Height of the drag handle header bar
 
         // Map PiP client coordinates (excluding 26px header) proportionally to the ghost desktop resolution (e.g. 1920x1080)
@@ -703,6 +723,7 @@ public class GhostPipManager : IDisposable
             _setClickThroughMethod = t.GetMethod("SetClickThrough", new[] { typeof(bool) });
             _setOpacityMethod = t.GetMethod("SetOpacity", new[] { typeof(byte) });
             _setPosSizeMethod = t.GetMethod("SetPositionAndSize", new[] { typeof(int), typeof(int), typeof(int), typeof(int) });
+            _toggleExpandMethod = t.GetMethod("ToggleExpand");
 
             try
             {
@@ -711,6 +732,13 @@ public class GhostPipManager : IDisposable
                 {
                     Action<int, int> handler = (nx, ny) => PositionChanged?.Invoke(nx, ny);
                     ev.AddEventHandler(_instance, handler);
+                }
+
+                var boundsEv = t.GetEvent("BoundsChanged");
+                if (boundsEv != null)
+                {
+                    Action<int, int, int, int> handler = (nx, ny, nw, nh) => BoundsChanged?.Invoke(nx, ny, nw, nh);
+                    boundsEv.AddEventHandler(_instance, handler);
                 }
 
                 var inputEv = t.GetEvent("OnInteractiveInput");
@@ -723,7 +751,9 @@ public class GhostPipManager : IDisposable
             catch { }
         }
 
+        private readonly MethodInfo? _toggleExpandMethod;
         public event Action<int, int>? PositionChanged;
+        public event Action<int, int, int, int>? BoundsChanged;
         public event Action<PipInputEventArgs>? OnInteractiveInput;
 
         public IntPtr Hwnd => (IntPtr)(_hwndProp?.GetValue(_instance) ?? IntPtr.Zero);
@@ -739,6 +769,7 @@ public class GhostPipManager : IDisposable
         public void SetOpacity(byte alpha) => _setOpacityMethod?.Invoke(_instance, new object[] { alpha });
         public void SetPositionAndSize(int x, int y, int width, int height) =>
             _setPosSizeMethod?.Invoke(_instance, new object[] { x, y, width, height });
+        public void ToggleExpand() => _toggleExpandMethod?.Invoke(_instance, Array.Empty<object>());
 
         public void Dispose()
         {
@@ -935,7 +966,7 @@ public class GhostPipManager : IDisposable
                 }
             }
 
-            uint exStyle = WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+            uint exStyle = WS_EX_TOPMOST | WS_EX_NOACTIVATE | 0x00040000 /* WS_EX_APPWINDOW */ | WS_EX_LAYERED;
             if (_clickThrough)
             {
                 exStyle |= WS_EX_TRANSPARENT;
@@ -945,7 +976,7 @@ public class GhostPipManager : IDisposable
                 exStyle,
                 FallbackClassName,
                 _title,
-                WS_POPUP | WS_VISIBLE,
+                WS_POPUP | WS_VISIBLE | 0x00020000 /* WS_MINIMIZEBOX */ | 0x00080000 /* WS_SYSMENU */,
                 _x,
                 _y,
                 _width,
@@ -1052,7 +1083,20 @@ public class GhostPipManager : IDisposable
         }
 
         public event Action<int, int>? PositionChanged;
+        public event Action<int, int, int, int>? BoundsChanged;
         public event Action<PipInputEventArgs>? OnInteractiveInput;
+
+        public void ToggleExpand()
+        {
+            if (_width <= 480)
+            {
+                SetPositionAndSize(_x, _y, 640, 360);
+            }
+            else
+            {
+                SetPositionAndSize(_x, _y, 320, 180);
+            }
+        }
 
         public void Dispose()
         {

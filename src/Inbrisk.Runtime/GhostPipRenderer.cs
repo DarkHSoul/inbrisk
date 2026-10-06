@@ -729,14 +729,27 @@ public sealed class GhostPipRenderer : IDisposable
 
             // Title and Grip Icon
             Native.SetTextColor(hdc, RGB(224, 231, 255)); // Soft White/Cyan
-            string titleText = "\u283F Inbrisk Ghost  [Taşı / Drag]";
+            string titleText = width >= 420
+                ? "\u283F Inbrisk Ghost  [Taşı / 2x Tık: Boyut]"
+                : "\u283F Ghost  [Taşı]";
             Native.TextOutW(hdc, 8, 5, titleText, titleText.Length);
 
-            // Interactive Badge
-            Native.SetTextColor(hdc, RGB(34, 197, 94)); // Emerald Green
-            string badgeText = "● CANLI / INTERACTIVE";
-            int badgeX = Math.Max(width - 160, 170);
-            Native.TextOutW(hdc, badgeX, 5, badgeText, badgeText.Length);
+            // Action Buttons at far right of header: Expand [ 🗖 ] and Minimize [ ─ ]
+            Native.SetTextColor(hdc, RGB(203, 213, 225)); // Slate-300
+            string expandBtn = "[ 🗖 ]";
+            Native.TextOutW(hdc, width - 54, 5, expandBtn, expandBtn.Length);
+
+            string minBtn = "[ ─ ]";
+            Native.TextOutW(hdc, width - 26, 5, minBtn, minBtn.Length);
+
+            // Interactive Live Badge
+            if (width >= 340)
+            {
+                Native.SetTextColor(hdc, RGB(34, 197, 94)); // Emerald Green
+                string badgeText = width >= 480 ? "● CANLI / INTERACTIVE" : "● CANLI";
+                int badgeX = Math.Max(width - (width >= 480 ? 220 : 130), 170);
+                Native.TextOutW(hdc, badgeX, 5, badgeText, badgeText.Length);
+            }
 
             Native.SelectObject(hdc, hOldFont);
             Native.DeleteObject(hFont);
