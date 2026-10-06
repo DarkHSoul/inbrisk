@@ -176,6 +176,8 @@ internal static class NativeMethods
     public const uint WS_VISIBLE = 0x10000000;
     public const uint WS_MINIMIZEBOX = 0x00020000;
     public const uint WS_MAXIMIZEBOX = 0x00010000;
+    public const uint WS_THICKFRAME = 0x00040000;
+    public const uint WS_SIZEBOX = 0x00040000;
     public const uint WS_SYSMENU = 0x00080000;
     public const uint SWP_NOSIZE = 0x0001;
     public const uint SWP_NOMOVE = 0x0002;
@@ -423,8 +425,11 @@ internal static class NativeMethods
     public const uint NIF_INFO = 0x00000010;
 
     public const uint WM_NCHITTEST = 0x0084;
+    public const uint WM_NCCALCSIZE = 0x0083;
+    public const uint WM_NCLBUTTONDOWN = 0x00A1;
     public const uint WM_NCLBUTTONDBLCLK = 0x00A3;
     public const uint WM_GETMINMAXINFO = 0x0024;
+    public const uint WM_SYSCOMMAND = 0x0112;
     public const int HTTRANSPARENT = -1;
     public const int HTCLIENT = 1;
     public const int HTCAPTION = 2;

@@ -442,7 +442,7 @@ public sealed class GhostPipWindowHost : IDisposable
         // WS_EX_TRANSPARENT (0x20) -> Click-through passed to window underneath
         // WS_EX_APPWINDOW (0x40000) -> Appears in taskbar like a standard application
         // WS_EX_LAYERED (0x80000) -> Supports opacity & alpha blending
-        uint dwStyle = NativeMethods.WS_POPUP | NativeMethods.WS_VISIBLE | NativeMethods.WS_MINIMIZEBOX | NativeMethods.WS_SYSMENU;
+        uint dwStyle = NativeMethods.WS_POPUP | NativeMethods.WS_VISIBLE | NativeMethods.WS_MINIMIZEBOX | NativeMethods.WS_SYSMENU | NativeMethods.WS_THICKFRAME;
         uint dwExStyle = (uint)(NativeMethods.WS_EX_TOPMOST |
                                 NativeMethods.WS_EX_NOACTIVATE |
                                 NativeMethods.WS_EX_APPWINDOW |
@@ -535,6 +535,25 @@ public sealed class GhostPipWindowHost : IDisposable
     {
         if (_hwnd == IntPtr.Zero) return;
 
+        // Current monitor work area in absolute desktop coordinates
+        int monLeft = 0;
+        int monTop = 0;
+        int monRight = 1920;
+        int monBottom = 1080;
+        try
+        {
+            var hMon = NativeMethods.MonitorFromWindow(_hwnd, NativeMethods.MONITOR_DEFAULTTONEAREST);
+            var mi = new MONITORINFOEXW { CbSize = Marshal.SizeOf<MONITORINFOEXW>() };
+            if (NativeMethods.GetMonitorInfoW(hMon, ref mi))
+            {
+                monLeft = mi.RcWork.Left;
+                monTop = mi.RcWork.Top;
+                monRight = mi.RcWork.Right;
+                monBottom = mi.RcWork.Bottom;
+            }
+        }
+        catch { }
+
         // If currently compact or medium (width <= 480), expand to large mode
         if (_width <= 480)
         {
@@ -546,36 +565,28 @@ public sealed class GhostPipWindowHost : IDisposable
             int newWidth = Math.Max(640, _savedCompactWidth * 2);
             int newHeight = Math.Max(360, (newWidth * 9) / 16);
 
-            int screenW = 1920;
-            int screenH = 1080;
-            try
-            {
-                var hMon = NativeMethods.MonitorFromWindow(_hwnd, NativeMethods.MONITOR_DEFAULTTONEAREST);
-                var mi = new MONITORINFOEXW { CbSize = Marshal.SizeOf<MONITORINFOEXW>() };
-                if (NativeMethods.GetMonitorInfoW(hMon, ref mi))
-                {
-                    screenW = mi.RcWork.Right - mi.RcWork.Left;
-                    screenH = mi.RcWork.Bottom - mi.RcWork.Top;
-                }
-            }
-            catch { }
-
+            // Expand strictly in place: keep current position
             int newX = _x;
             int newY = _y;
 
-            // Expand towards the left if close to right edge
-            if (newX + newWidth > screenW)
+            // Only nudge if the expanded window would exceed its current monitor boundary
+            if (newX + newWidth > monRight)
             {
-                newX = screenW - newWidth - 16;
+                newX = monRight - newWidth;
             }
-            if (newX < 10) newX = 10;
+            if (newX < monLeft)
+            {
+                newX = monLeft;
+            }
 
-            // Expand upwards if close to bottom edge
-            if (newY + newHeight > screenH)
+            if (newY + newHeight > monBottom)
             {
-                newY = screenH - newHeight - 16;
+                newY = monBottom - newHeight;
             }
-            if (newY < 10) newY = 10;
+            if (newY < monTop)
+            {
+                newY = monTop;
+            }
 
             _x = newX;
             _y = newY;
@@ -590,11 +601,21 @@ public sealed class GhostPipWindowHost : IDisposable
         }
         else
         {
-            // Restore to compact size
+            // Restore to compact size in place
             int restoreWidth = _savedCompactWidth > 0 ? _savedCompactWidth : 320;
             int restoreHeight = _savedCompactHeight > 0 ? _savedCompactHeight : 180;
-            int restoreX = _savedCompactX >= 0 ? _savedCompactX : _x;
-            int restoreY = _savedCompactY >= 0 ? _savedCompactY : _y;
+            int restoreX = _savedCompactX;
+            int restoreY = _savedCompactY;
+
+            // If no valid saved position on current monitor, keep current position
+            if (restoreX < monLeft || restoreX > monRight)
+            {
+                restoreX = _x;
+            }
+            if (restoreY < monTop || restoreY > monBottom)
+            {
+                restoreY = _y;
+            }
 
             _x = restoreX;
             _y = restoreY;
@@ -669,8 +690,8 @@ public sealed class GhostPipWindowHost : IDisposable
                 var pt = new POINT { X = screenX, Y = screenY };
                 NativeMethods.ScreenToClient(hWnd, ref pt);
 
-                const int border = 8;
-                const int corner = 14;
+                const int border = 12;
+                const int corner = 18;
 
                 // 1. Resizing corners
                 if (pt.X <= corner && pt.Y <= corner)
@@ -705,6 +726,44 @@ public sealed class GhostPipWindowHost : IDisposable
                 }
 
                 return new IntPtr(NativeMethods.HTCLIENT);
+
+            case NativeMethods.WM_NCCALCSIZE:
+                // Return 0 so client area fills entire window without standard OS borders
+                if (wParam != IntPtr.Zero)
+                {
+                    return IntPtr.Zero;
+                }
+                break;
+
+            case NativeMethods.WM_NCLBUTTONDOWN:
+            {
+                int hit = wParam.ToInt32();
+                if (hit == NativeMethods.HTLEFT || hit == NativeMethods.HTRIGHT ||
+                    hit == NativeMethods.HTBOTTOM || hit == NativeMethods.HTTOP ||
+                    hit == NativeMethods.HTTOPLEFT || hit == NativeMethods.HTTOPRIGHT ||
+                    hit == NativeMethods.HTBOTTOMLEFT || hit == NativeMethods.HTBOTTOMRIGHT)
+                {
+                    int scDirection = hit switch
+                    {
+                        NativeMethods.HTLEFT => 1,
+                        NativeMethods.HTRIGHT => 2,
+                        NativeMethods.HTTOP => 3,
+                        NativeMethods.HTTOPLEFT => 4,
+                        NativeMethods.HTTOPRIGHT => 5,
+                        NativeMethods.HTBOTTOM => 6,
+                        NativeMethods.HTBOTTOMLEFT => 7,
+                        NativeMethods.HTBOTTOMRIGHT => 8,
+                        _ => 0
+                    };
+                    if (scDirection > 0)
+                    {
+                        NativeMethods.ReleaseCapture();
+                        NativeMethods.SendMessageW(hWnd, NativeMethods.WM_SYSCOMMAND, (IntPtr)(0xF000 + scDirection), lParam);
+                        return IntPtr.Zero;
+                    }
+                }
+                break;
+            }
 
             case NativeMethods.WM_NCLBUTTONDBLCLK:
                 if (wParam.ToInt32() == NativeMethods.HTCAPTION)
