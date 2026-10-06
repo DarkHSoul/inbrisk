@@ -48,6 +48,11 @@ public enum GhostSubcommand
     Stop,
 
     /// <summary>
+    /// Displays recent diagnostic and operational log entries from the Ghost OS file logger.
+    /// </summary>
+    Logs,
+
+    /// <summary>
     /// Displays command usage and help information.
     /// </summary>
     Help
@@ -146,6 +151,11 @@ public sealed record GhostControlOptions(
                     case "kill":
                     case "exit":
                         subcommand = GhostSubcommand.Stop;
+                        startIndex = 2;
+                        break;
+                    case "logs":
+                    case "log":
+                        subcommand = GhostSubcommand.Logs;
                         startIndex = 2;
                         break;
                     case "help":
@@ -492,6 +502,7 @@ public static class GhostControlCommand
         writer.WriteLine("  pip                     Control or view the Picture-in-Picture (PiP) display window");
         writer.WriteLine("  status                  Query live operational status of Ghost OS and PiP overlay");
         writer.WriteLine("  stop                    Safely stop and disconnect the active Ghost OS session");
+        writer.WriteLine("  logs                    View recent diagnostic and activity logs from %LOCALAPPDATA%\\inbrisk\\logs\\ghost-os.log");
         writer.WriteLine();
         writer.WriteLine("PiP Control Options (usable with 'ghost tray' and 'ghost pip'):");
         writer.WriteLine("  --interactive <on|off>  Toggle click-through transparent mode (on = clickable, off = pass-through)");
@@ -514,6 +525,7 @@ public static class GhostControlCommand
         writer.WriteLine("  inbrisk ghost pip --fullscreen");
         writer.WriteLine("  inbrisk ghost pip --position TopLeft");
         writer.WriteLine("  inbrisk ghost pip --opacity 80");
+        writer.WriteLine("  inbrisk ghost logs");
         writer.WriteLine();
     }
 
@@ -538,6 +550,7 @@ public static class GhostControlCommand
             GhostSubcommand.Pip => await RunPipAsync(options, ct).ConfigureAwait(false),
             GhostSubcommand.Status => await RunStatusAsync(options, ct).ConfigureAwait(false),
             GhostSubcommand.Stop => await RunStopAsync(options, ct).ConfigureAwait(false),
+            GhostSubcommand.Logs => RunLogs(options),
             _ => await RunTrayAsync(options, ct).ConfigureAwait(false)
         };
     }
@@ -1394,8 +1407,40 @@ public static class GhostControlCommand
         }
     }
 
+    private static int RunLogs(GhostControlOptions options)
+    {
+        string logPath = GhostLogger.LogFilePath;
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"[Ghost OS] Log file: {logPath}");
+        Console.ResetColor();
+
+        var lines = GhostLogger.ReadRecentLines(100);
+        if (lines.Length == 0)
+        {
+            Console.WriteLine("(Log file is currently empty or no entries recorded yet)");
+            return 0;
+        }
+
+        Console.WriteLine("==================================================================");
+        Console.WriteLine("                INBRISK GHOST OS — SYSTEM LOGS                    ");
+        Console.WriteLine("==================================================================");
+        foreach (var line in lines)
+        {
+            if (line.Contains("[ERROR]")) Console.ForegroundColor = ConsoleColor.Red;
+            else if (line.Contains("[WARN]")) Console.ForegroundColor = ConsoleColor.Yellow;
+            else if (line.Contains("[INFO]")) Console.ForegroundColor = ConsoleColor.Gray;
+            else Console.ForegroundColor = ConsoleColor.DarkGray;
+
+            Console.WriteLine(line);
+        }
+        Console.ResetColor();
+        Console.WriteLine("==================================================================");
+        return 0;
+    }
+
     private static void LogInfo(string message, GhostControlOptions options)
     {
+        GhostLogger.Info(message);
         if (options.JsonOutput)
         {
             Console.WriteLine(JsonSerializer.Serialize(new { level = "info", message, timestamp = DateTime.UtcNow }, JsonOptions));
@@ -1408,6 +1453,7 @@ public static class GhostControlCommand
 
     private static void LogSuccess(string message, GhostControlOptions options)
     {
+        GhostLogger.Info("✓ " + message);
         if (options.JsonOutput)
         {
             Console.WriteLine(JsonSerializer.Serialize(new { level = "success", message, timestamp = DateTime.UtcNow }, JsonOptions));
@@ -1420,6 +1466,7 @@ public static class GhostControlCommand
 
     private static void LogWarning(string message, GhostControlOptions options)
     {
+        GhostLogger.Warn(message);
         if (options.JsonOutput)
         {
             Console.WriteLine(JsonSerializer.Serialize(new { level = "warning", message, timestamp = DateTime.UtcNow }, JsonOptions));
@@ -1432,6 +1479,7 @@ public static class GhostControlCommand
 
     private static void LogError(string message, GhostControlOptions options)
     {
+        GhostLogger.Error(message);
         if (options.JsonOutput)
         {
             Console.WriteLine(JsonSerializer.Serialize(new { level = "error", message, timestamp = DateTime.UtcNow }, JsonOptions));

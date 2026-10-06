@@ -167,13 +167,21 @@ public class GhostRdpConnector
             return new GhostRdpSession(existing.SessionId, ProcessId: 0, Username: username);
         }
 
-        // 3. Prepare temporary RDP config file
+        // 3. Verify Remote Desktop service is listening on 127.0.0.1:3389
+        var (rdpReady, rdpStatus) = EnsureRdpServiceReady();
+        if (!rdpReady)
+        {
+            GhostTelemetry.RecordSessionFail();
+            throw new InvalidOperationException(rdpStatus);
+        }
+
+        // 4. Prepare temporary RDP config file
         string rdpDir = Path.Combine(Path.GetTempPath(), "Inbrisk_Ghost_RDP");
         Directory.CreateDirectory(rdpDir);
         string rdpPath = Path.Combine(rdpDir, $"ghost_{Guid.NewGuid():N}.rdp");
         GenerateRdpConfig(rdpPath, width, height);
 
-        // 4. Launch client (FreeRDP if present, otherwise mstsc.exe)
+        // 5. Launch client (FreeRDP if present, otherwise mstsc.exe)
         Process? process = null;
         string? freeRdpPath = FindFreeRdpExecutable();
 
@@ -402,6 +410,78 @@ public class GhostRdpConnector
         catch { }
 
         return null;
+    }
+
+    /// <summary>
+    /// Checks whether port 3389 is actively listening on loopback (127.0.0.1).
+    /// </summary>
+    public static bool IsRdpPortListening(int timeoutMs = 600)
+    {
+        try
+        {
+            using var client = new System.Net.Sockets.TcpClient();
+            var ar = client.BeginConnect(DefaultLoopbackAddress, DefaultRdpPort, null, null);
+            bool success = ar.AsyncWaitHandle.WaitOne(timeoutMs);
+            if (success && client.Connected)
+            {
+                client.EndConnect(ar);
+                return true;
+            }
+            return false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Verifies if Remote Desktop service is enabled and listening.
+    /// If not listening, attempts to enable TermService and fDenyTSConnections if running as admin.
+    /// </summary>
+    public static (bool Ready, string StatusMessage) EnsureRdpServiceReady()
+    {
+        if (IsRdpPortListening())
+        {
+            return (true, "RDP service is listening on 127.0.0.1:3389.");
+        }
+
+        // Try to enable and start TermService if elevated on Windows
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                using var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"System\CurrentControlSet\Control\Terminal Server", writable: true);
+                if (key != null)
+                {
+                    key.SetValue("fDenyTSConnections", 0, Microsoft.Win32.RegistryValueKind.DWord);
+                }
+            }
+            catch { }
+
+            try
+            {
+                using var proc = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "net.exe",
+                    Arguments = "start TermService",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true
+                });
+                proc?.WaitForExit(5000);
+            }
+            catch { }
+        }
+
+        // Re-check after attempt
+        if (IsRdpPortListening(1500))
+        {
+            return (true, "RDP service successfully started on 127.0.0.1:3389.");
+        }
+
+        return (false, "Remote Desktop is disabled in Windows Settings (fDenyTSConnections=1 or TermService stopped). Enable Remote Desktop in Windows Settings -> System -> Remote Desktop to allow background loopback sessions.");
     }
 
     #endregion
