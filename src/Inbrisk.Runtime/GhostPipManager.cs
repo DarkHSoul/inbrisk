@@ -46,7 +46,9 @@ public record PipConfig(
     byte Opacity = 255,
     string Title = "Inbrisk Ghost PiP",
     int TargetFps = 60,
-    string? SharedBufferMapName = null);
+    string? SharedBufferMapName = null,
+    int TargetResolutionWidth = 1920,
+    int TargetResolutionHeight = 1080);
 
 #endregion
 
@@ -92,6 +94,9 @@ public interface IGhostPipWindowHost : IDisposable
 
     /// <summary>Raised when the window is dragged or moved.</summary>
     event Action<int, int>? PositionChanged;
+
+    /// <summary>Raised when an interactive mouse or input event occurs in the PiP client area.</summary>
+    event Action<PipInputEventArgs>? OnInteractiveInput;
 }
 
 #endregion
@@ -226,6 +231,9 @@ public class GhostPipManager : IDisposable
     #region State Fields
 
     private readonly object _gate = new();
+    private readonly GhostDesktopInput _desktopInput;
+    private int _targetResolutionWidth = 1920;
+    private int _targetResolutionHeight = 1080;
     private PipConfig _currentConfig = new();
     private IGhostPipWindowHost? _windowHost;
     private GhostPipRenderer? _renderer;
@@ -242,6 +250,23 @@ public class GhostPipManager : IDisposable
     #endregion
 
     #region Properties
+
+    /// <summary>Gets the desktop input injector for sending inputs directly to the ghost desktop.</summary>
+    public GhostDesktopInput DesktopInput => _desktopInput;
+
+    /// <summary>Gets or sets the target ghost desktop resolution width (default: 1920).</summary>
+    public int TargetResolutionWidth
+    {
+        get => _targetResolutionWidth;
+        set => _targetResolutionWidth = Math.Max(1, value);
+    }
+
+    /// <summary>Gets or sets the target ghost desktop resolution height (default: 1080).</summary>
+    public int TargetResolutionHeight
+    {
+        get => _targetResolutionHeight;
+        set => _targetResolutionHeight = Math.Max(1, value);
+    }
 
     /// <summary>Gets whether the PiP window and renderer are currently active.</summary>
     public bool IsRunning => _isRunning;
@@ -278,6 +303,20 @@ public class GhostPipManager : IDisposable
 
     /// <summary>Gets the current PiP configuration.</summary>
     public PipConfig CurrentConfig => _currentConfig;
+
+    #endregion
+
+    #region Constructor
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="GhostPipManager"/> class.
+    /// </summary>
+    /// <param name="desktopInput">Optional custom desktop input injector.</param>
+    /// <param name="ipcBus">Optional IPC channel connected to the ghost desktop session.</param>
+    public GhostPipManager(GhostDesktopInput? desktopInput = null, IGhostIpcBus? ipcBus = null)
+    {
+        _desktopInput = desktopInput ?? new GhostDesktopInput(ipcBus);
+    }
 
     #endregion
 
@@ -343,6 +382,9 @@ public class GhostPipManager : IDisposable
                 _renderer.StartRendering(_windowHost.Hwnd);
             }
 
+            _targetResolutionWidth = _currentConfig.TargetResolutionWidth;
+            _targetResolutionHeight = _currentConfig.TargetResolutionHeight;
+
             if (_windowHost != null)
             {
                 _windowHost.PositionChanged += (newX, newY) =>
@@ -354,6 +396,8 @@ public class GhostPipManager : IDisposable
                         _currentPosition = PipPresetPosition.Custom;
                     }
                 };
+
+                _windowHost.OnInteractiveInput += HandleInteractiveInput;
             }
 
             _isRunning = true;
@@ -361,6 +405,36 @@ public class GhostPipManager : IDisposable
             // 3. Telemetry hook
             GhostTelemetry.RecordPipStart();
         }
+    }
+
+    private void HandleInteractiveInput(PipInputEventArgs e)
+    {
+        if (!_isInteractive || _windowHost == null)
+        {
+            return;
+        }
+
+        int pipWidth = _currentWidth;
+        int pipHeight = _currentHeight;
+        const int headerHeight = 26; // Height of the drag handle header bar
+
+        // Map PiP client coordinates (excluding 26px header) proportionally to the ghost desktop resolution (e.g. 1920x1080)
+        int contentHeight = Math.Max(1, pipHeight - headerHeight);
+        int clientY = e.Y - headerHeight;
+        if (clientY < 0)
+        {
+            // Ignore mouse actions originating inside the 26px top drag header bar
+            return;
+        }
+
+        int targetWidth = _targetResolutionWidth;
+        int targetHeight = _targetResolutionHeight;
+
+        int targetX = (int)Math.Clamp(((long)Math.Clamp(e.X, 0, pipWidth) * targetWidth) / Math.Max(1, pipWidth), 0, targetWidth - 1);
+        int targetY = (int)Math.Clamp(((long)Math.Clamp(clientY, 0, contentHeight) * targetHeight) / contentHeight, 0, targetHeight - 1);
+
+        // Forward the mapped click/move/scroll directly to the isolated ghost desktop!
+        _desktopInput.ForwardInput(e.EventType, targetX, targetY, e.Button, e.Delta);
     }
 
     /// <summary>
@@ -393,6 +467,7 @@ public class GhostPipManager : IDisposable
             {
                 if (_windowHost != null)
                 {
+                    _windowHost.OnInteractiveInput -= HandleInteractiveInput;
                     _windowHost.Dispose();
                     _windowHost = null;
                 }
@@ -402,6 +477,7 @@ public class GhostPipManager : IDisposable
                 Debug.WriteLine($"[GhostPipManager] Error disposing window host: {ex.Message}");
             }
 
+            _desktopInput.ReleaseAll();
             _isRunning = false;
 
             // Telemetry hook
@@ -514,6 +590,7 @@ public class GhostPipManager : IDisposable
         if (_disposed) return;
         _disposed = true;
         StopPip();
+        _desktopInput.Dispose();
         GC.SuppressFinalize(this);
     }
 
@@ -635,11 +712,19 @@ public class GhostPipManager : IDisposable
                     Action<int, int> handler = (nx, ny) => PositionChanged?.Invoke(nx, ny);
                     ev.AddEventHandler(_instance, handler);
                 }
+
+                var inputEv = t.GetEvent("OnInteractiveInput");
+                if (inputEv != null)
+                {
+                    Action<PipInputEventArgs> handler = (args) => OnInteractiveInput?.Invoke(args);
+                    inputEv.AddEventHandler(_instance, handler);
+                }
             }
             catch { }
         }
 
         public event Action<int, int>? PositionChanged;
+        public event Action<PipInputEventArgs>? OnInteractiveInput;
 
         public IntPtr Hwnd => (IntPtr)(_hwndProp?.GetValue(_instance) ?? IntPtr.Zero);
         public bool IsRunning => (bool)(_isRunningProp?.GetValue(_instance) ?? false);
@@ -880,6 +965,39 @@ public class GhostPipManager : IDisposable
 
             while (Native.GetMessageW(out MSG msg, IntPtr.Zero, 0, 0) > 0)
             {
+                if (!_clickThrough && msg.hwnd == _hwnd)
+                {
+                    if (msg.message is 0x0200 or 0x0201 or 0x0202 or 0x0203 or 0x0204 or 0x0205 or 0x020A)
+                    {
+                        int clientX = unchecked((short)(long)msg.lParam);
+                        int clientY = unchecked((short)((long)msg.lParam >> 16));
+                        int delta = 0;
+                        if (msg.message == 0x020A)
+                        {
+                            delta = unchecked((short)((long)msg.wParam >> 16));
+                            clientX = msg.ptX - _x;
+                            clientY = msg.ptY - _y;
+                        }
+
+                        if (clientY >= 26)
+                        {
+                            var evt = msg.message switch
+                            {
+                                0x0200 => PipInputEventType.MouseMove,
+                                0x0201 => PipInputEventType.MouseDown,
+                                0x0202 => PipInputEventType.MouseUp,
+                                0x0204 => PipInputEventType.MouseDown,
+                                0x0205 => PipInputEventType.MouseUp,
+                                0x0203 => PipInputEventType.DoubleClick,
+                                0x020A => PipInputEventType.MouseWheel,
+                                _ => PipInputEventType.MouseMove
+                            };
+                            var btn = msg.message is 0x0204 or 0x0205 ? MouseButton.Right : MouseButton.Left;
+                            OnInteractiveInput?.Invoke(new PipInputEventArgs(evt, clientX, clientY, btn, delta));
+                        }
+                    }
+                }
+
                 Native.TranslateMessage(ref msg);
                 Native.DispatchMessageW(ref msg);
             }
@@ -934,6 +1052,7 @@ public class GhostPipManager : IDisposable
         }
 
         public event Action<int, int>? PositionChanged;
+        public event Action<PipInputEventArgs>? OnInteractiveInput;
 
         public void Dispose()
         {

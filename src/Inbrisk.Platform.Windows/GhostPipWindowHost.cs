@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
+using Inbrisk.Core;
 using Inbrisk.Platform.Windows.Native;
 
 namespace Inbrisk.Platform.Windows;
@@ -72,6 +73,11 @@ public sealed class GhostPipWindowHost : IDisposable
     /// Raised when the user drags or resizes the PiP window.
     /// </summary>
     public event Action<int, int>? PositionChanged;
+
+    /// <summary>
+    /// Raised when an interactive mouse or input event occurs in the PiP client area below the header bar.
+    /// </summary>
+    public event Action<PipInputEventArgs>? OnInteractiveInput;
 
     /// <summary>
     /// Gets the native Win32 window handle (HWND).
@@ -367,7 +373,7 @@ public sealed class GhostPipWindowHost : IDisposable
             var wcx = new NativeMethods.WNDCLASSEXW
             {
                 CbSize = (uint)Marshal.SizeOf<NativeMethods.WNDCLASSEXW>(),
-                Style = 0,
+                Style = 0x0008, // CS_DBLCLKS
                 LpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate),
                 CbClsExtra = 0,
                 CbWndExtra = 0,
@@ -562,6 +568,82 @@ public sealed class GhostPipWindowHost : IDisposable
                 }
 
                 return new IntPtr(NativeMethods.HTCLIENT);
+
+            case NativeMethods.WM_MOUSEMOVE:
+            case NativeMethods.WM_LBUTTONDOWN:
+            case NativeMethods.WM_LBUTTONUP:
+            case NativeMethods.WM_RBUTTONDOWN:
+            case NativeMethods.WM_RBUTTONUP:
+            case NativeMethods.WM_LBUTTONDBLCLK:
+            case NativeMethods.WM_RBUTTONDBLCLK:
+            case NativeMethods.WM_MBUTTONDOWN:
+            case NativeMethods.WM_MBUTTONUP:
+            {
+                if (!_clickThrough)
+                {
+                    int clientX = unchecked((short)(long)lParam);
+                    int clientY = unchecked((short)((long)lParam >> 16));
+
+                    // Only handle mouse messages in the client area below the 26px header bar
+                    if (clientY >= HeaderHeight)
+                    {
+                        if (msg == NativeMethods.WM_LBUTTONDOWN)
+                        {
+                            NativeMethods.SetFocus(hWnd);
+                            NativeMethods.SetCapture(hWnd);
+                        }
+                        else if (msg == NativeMethods.WM_LBUTTONUP)
+                        {
+                            NativeMethods.ReleaseCapture();
+                        }
+
+                        PipInputEventType eventType = msg switch
+                        {
+                            NativeMethods.WM_MOUSEMOVE => PipInputEventType.MouseMove,
+                            NativeMethods.WM_LBUTTONDOWN => PipInputEventType.MouseDown,
+                            NativeMethods.WM_LBUTTONUP => PipInputEventType.MouseUp,
+                            NativeMethods.WM_RBUTTONDOWN => PipInputEventType.MouseDown,
+                            NativeMethods.WM_RBUTTONUP => PipInputEventType.MouseUp,
+                            NativeMethods.WM_MBUTTONDOWN => PipInputEventType.MouseDown,
+                            NativeMethods.WM_MBUTTONUP => PipInputEventType.MouseUp,
+                            NativeMethods.WM_LBUTTONDBLCLK => PipInputEventType.DoubleClick,
+                            NativeMethods.WM_RBUTTONDBLCLK => PipInputEventType.DoubleClick,
+                            _ => PipInputEventType.MouseMove
+                        };
+
+                        MouseButton button = msg switch
+                        {
+                            NativeMethods.WM_RBUTTONDOWN or NativeMethods.WM_RBUTTONUP or NativeMethods.WM_RBUTTONDBLCLK => MouseButton.Right,
+                            NativeMethods.WM_MBUTTONDOWN or NativeMethods.WM_MBUTTONUP => MouseButton.Middle,
+                            _ => MouseButton.Left
+                        };
+
+                        OnInteractiveInput?.Invoke(new PipInputEventArgs(eventType, clientX, clientY, button));
+                        return IntPtr.Zero;
+                    }
+                }
+                break;
+            }
+
+            case NativeMethods.WM_MOUSEWHEEL:
+            {
+                if (!_clickThrough)
+                {
+                    int wheelScreenX = unchecked((short)(long)lParam);
+                    int wheelScreenY = unchecked((short)((long)lParam >> 16));
+                    var ptWheel = new POINT { X = wheelScreenX, Y = wheelScreenY };
+                    NativeMethods.ScreenToClient(hWnd, ref ptWheel);
+
+                    // Only handle mouse wheel in the client area below the 26px header bar
+                    if (ptWheel.Y >= HeaderHeight)
+                    {
+                        int wheelDelta = unchecked((short)((long)wParam >> 16));
+                        OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.MouseWheel, ptWheel.X, ptWheel.Y, MouseButton.Left, wheelDelta));
+                        return IntPtr.Zero;
+                    }
+                }
+                break;
+            }
 
             case 0x0232: // WM_EXITSIZEMOVE
             case 0x0003: // WM_MOVE

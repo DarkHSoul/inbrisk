@@ -7,6 +7,11 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Runtime.InteropServices;
 using Inbrisk.Core;
 using Inbrisk.Platform.Windows;
 using Inbrisk.Runtime;
@@ -255,7 +260,34 @@ public sealed class GhostMcpBridge : IDisposable
     private readonly bool _ownsPipManager;
     private readonly bool _ownsSessionManager;
     private readonly bool _ownsIpcServer;
+    private readonly object _desktopGate = new();
+    private GhostLocalDesktop? _localDesktop;
+    private Inbrisk.Platform.Windows.GhostDesktopInput? _desktopInput;
     private int _disposed;
+
+    private GhostLocalDesktop GetOrCreateDesktop()
+    {
+        lock (_desktopGate)
+        {
+            if (_localDesktop == null || !_localDesktop.IsCreated)
+            {
+                _localDesktop = new GhostLocalDesktop(GhostDesktopNative.DefaultGhostDesktopName, createIfNotExists: true);
+            }
+            return _localDesktop;
+        }
+    }
+
+    private Inbrisk.Platform.Windows.GhostDesktopInput GetOrCreateInput()
+    {
+        lock (_desktopGate)
+        {
+            if (_desktopInput == null)
+            {
+                _desktopInput = new Inbrisk.Platform.Windows.GhostDesktopInput(GhostDesktopNative.DefaultGhostDesktopName);
+            }
+            return _desktopInput;
+        }
+    }
 
     /// <summary>
     /// Primary constructor for MCP Host dependency injection.
@@ -629,9 +661,303 @@ public sealed class GhostMcpBridge : IDisposable
         return SuccessResult(result);
     }
 
+    /// <summary>
+    /// Returns the operational status of the isolated Ghost Desktop, including resolution, active windows, and running state.
+    /// </summary>
+    [McpServerTool(Name = "ghost_desktop_status"), Description(
+        "Returns the operational status of the isolated Ghost Desktop, including resolution, active windows, and running state.")]
+    public async Task<CallToolResult> GhostDesktopStatus(CancellationToken ct = default)
+    {
+        PerfTrace.Count("ghostDesktopStatus");
+        int width = 1920;
+        int height = 1080;
+        bool isActive = false;
+        var windows = new List<object>();
+        int processCount = 0;
+
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            try
+            {
+                var hDesktop = GhostDesktopNative.OpenDesktop(GhostDesktopNative.DefaultGhostDesktopName, GhostDesktopNative.DESKTOP_ALL_ACCESS, false);
+                if (hDesktop != IntPtr.Zero)
+                {
+                    try
+                    {
+                        isActive = true;
+                        var hwnds = GhostDesktopNative.EnumerateWindows(hDesktop);
+                        foreach (var hwnd in hwnds)
+                        {
+                            var (title, className, visible) = GhostDesktopNative.GetWindowDetails(hwnd);
+                            if (!string.IsNullOrWhiteSpace(title) || visible)
+                            {
+                                windows.Add(new
+                                {
+                                    hwnd = $"0x{hwnd:X}",
+                                    title,
+                                    className,
+                                    isVisible = visible
+                                });
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        GhostDesktopNative.CloseDesktop(hDesktop);
+                    }
+                }
+            }
+            catch { }
+
+            lock (_desktopGate)
+            {
+                if (_localDesktop != null && _localDesktop.IsCreated)
+                {
+                    isActive = true;
+                    processCount = _localDesktop.ProcessCount;
+                }
+            }
+        }
+
+        var result = new
+        {
+            success = true,
+            isActive,
+            desktopName = GhostDesktopNative.DefaultGhostDesktopName,
+            resolution = $"{width}x{height}",
+            width,
+            height,
+            windowsCount = windows.Count,
+            windows,
+            processCount,
+            pipActive = _pipManager.IsRunning,
+            pipPosition = _pipManager.CurrentPosition.ToString(),
+            pipInteractive = _pipManager.IsInteractive,
+            message = isActive
+                ? $"Ghost Desktop '{GhostDesktopNative.DefaultGhostDesktopName}' is ACTIVE with {windows.Count} window(s)."
+                : $"Ghost Desktop '{GhostDesktopNative.DefaultGhostDesktopName}' is inactive."
+        };
+
+        return SuccessResult(result);
+    }
+
+    /// <summary>
+    /// Launches an application or command-line process directly on the isolated Ghost Desktop without interfering with the user's desktop.
+    /// </summary>
+    [McpServerTool(Name = "ghost_desktop_launch"), Description(
+        "Launches an application or command-line process directly on the isolated Ghost Desktop without interfering with the user's desktop.")]
+    public async Task<CallToolResult> GhostDesktopLaunch(
+        [Description("Executable path or command name to run (e.g. 'cmd.exe', 'powershell.exe', 'notepad.exe', 'chrome.exe')")] string program,
+        [Description("Optional command-line arguments")] string? args = null,
+        [Description("Optional working directory")] string? workingDir = null,
+        CancellationToken ct = default)
+    {
+        PerfTrace.Count("ghostDesktopLaunch");
+        ArgumentException.ThrowIfNullOrWhiteSpace(program);
+
+        try
+        {
+            var desktop = GetOrCreateDesktop();
+            var proc = desktop.StartProcess(program, args, workingDir);
+
+            var result = new
+            {
+                success = true,
+                processId = proc.Id,
+                processName = proc.ProcessName,
+                program,
+                arguments = args,
+                workingDirectory = workingDir,
+                desktopName = desktop.DesktopName,
+                message = $"Process '{program}' successfully launched on isolated desktop '{desktop.DesktopName}' (PID: {proc.Id})."
+            };
+
+            return SuccessResult(result);
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult("LaunchFailed", $"Failed to launch '{program}' on Ghost Desktop: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Performs a mouse click at the specified coordinates on the isolated Ghost Desktop. Does NOT move or affect the user's physical mouse cursor.
+    /// </summary>
+    [McpServerTool(Name = "ghost_desktop_click"), Description(
+        "Performs a mouse click at the specified coordinates on the isolated Ghost Desktop. Does NOT move or affect the user's physical mouse cursor.")]
+    public async Task<CallToolResult> GhostDesktopClick(
+        [Description("Physical X coordinate on the ghost desktop (0 to 1919)")] int x,
+        [Description("Physical Y coordinate on the ghost desktop (0 to 1079)")] int y,
+        [Description("Mouse button: left|right|middle (default: left)")] string? button = "left",
+        [Description("Whether to perform a double-click (default: false)")] bool? doubleClick = false,
+        CancellationToken ct = default)
+    {
+        PerfTrace.Count("ghostDesktopClick");
+        await Task.CompletedTask;
+        try
+        {
+            var input = GetOrCreateInput();
+            MouseButton mb = (button?.Trim().ToLowerInvariant()) switch
+            {
+                "right" => MouseButton.Right,
+                "middle" => MouseButton.Middle,
+                _ => MouseButton.Left
+            };
+
+            bool dbl = doubleClick ?? false;
+            input.SendMouseClick(x, y, mb, dbl);
+
+            var result = new
+            {
+                success = true,
+                x,
+                y,
+                button = mb.ToString(),
+                doubleClick = dbl,
+                desktopName = input.DesktopName,
+                message = $"Injected mouse {(dbl ? "double-" : "")}click with {mb} button at ({x}, {y}) on {input.DesktopName}."
+            };
+
+            return SuccessResult(result);
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult("ClickFailed", $"Failed to inject mouse click: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Types text into the active/focused window on the isolated Ghost Desktop. Does NOT affect the user's foreground typing.
+    /// </summary>
+    [McpServerTool(Name = "ghost_desktop_type"), Description(
+        "Types text into the active/focused window on the isolated Ghost Desktop. Does NOT affect the user's foreground typing.")]
+    public async Task<CallToolResult> GhostDesktopType(
+        [Description("Text string to type into the ghost desktop")] string text,
+        CancellationToken ct = default)
+    {
+        PerfTrace.Count("ghostDesktopType");
+        await Task.CompletedTask;
+        ArgumentNullException.ThrowIfNull(text);
+
+        try
+        {
+            var input = GetOrCreateInput();
+            input.SendText(text);
+
+            var result = new
+            {
+                success = true,
+                charactersTyped = text.Length,
+                desktopName = input.DesktopName,
+                message = $"Typed {text.Length} character(s) into Ghost Desktop."
+            };
+
+            return SuccessResult(result);
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult("TypeFailed", $"Failed to inject text input: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Captures a high-resolution screenshot from the isolated Ghost Desktop frame buffer.
+    /// </summary>
+    [McpServerTool(Name = "ghost_desktop_screenshot"), Description(
+        "Captures a high-resolution screenshot from the isolated Ghost Desktop frame buffer.")]
+    public async Task<CallToolResult> GhostDesktopScreenshot(CancellationToken ct = default)
+    {
+        PerfTrace.Count("ghostDesktopScreenshot");
+        await Task.CompletedTask;
+        byte[]? pngBytes = TryReadSharedFrameToPng(out int width, out int height, out long frameIndex);
+
+        if (pngBytes == null)
+        {
+            try
+            {
+                pngBytes = GhostDesktopCapture.CaptureDesktopToPng(GhostDesktopNative.DefaultGhostDesktopName, width, height);
+            }
+            catch (Exception ex)
+            {
+                return ErrorResult("ScreenshotFailed", $"Could not capture ghost desktop: {ex.Message}");
+            }
+        }
+
+        var meta = new
+        {
+            success = true,
+            width,
+            height,
+            frameIndex,
+            bytes = pngBytes.Length,
+            message = $"Captured {width}x{height} screenshot from Inbrisk Ghost Desktop."
+        };
+
+        return new CallToolResult
+        {
+            IsError = false,
+            Content =
+            [
+                new TextContentBlock { Text = JsonSerializer.Serialize(meta, SerializerOptions) },
+                ImageContentBlock.FromBytes(pngBytes, "image/png")
+            ]
+        };
+    }
+
     #endregion
 
     #region Helper Methods
+
+    private static byte[]? TryReadSharedFrameToPng(out int width, out int height, out long frameIndex)
+    {
+        width = 1920;
+        height = 1080;
+        frameIndex = 0;
+
+        try
+        {
+            if (GhostSharedFrameBuffer.TryOpenConsumer(out var consumer, GhostSharedFrameBuffer.DefaultMapName) && consumer != null)
+            {
+                using (consumer)
+                {
+                    int approxSize = 1920 * 1080 * 4;
+                    byte[] buffer = new byte[approxSize];
+                    if (consumer.TryReadLatestFrame(buffer, out var header))
+                    {
+                        width = header.Width;
+                        height = header.Height;
+                        frameIndex = header.FrameIndex;
+                        return ConvertRawBgraToPng(header.Width, header.Height, header.Stride, buffer);
+                    }
+                }
+            }
+        }
+        catch { }
+
+        return null;
+    }
+
+    private static byte[] ConvertRawBgraToPng(int width, int height, int stride, byte[] rawBgra)
+    {
+        using var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+        var bmpData = bmp.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            int rowBytes = Math.Min(stride, bmpData.Stride);
+            for (int y = 0; y < height; y++)
+            {
+                Marshal.Copy(rawBgra, y * stride, IntPtr.Add(bmpData.Scan0, y * bmpData.Stride), rowBytes);
+            }
+        }
+        finally
+        {
+            bmp.UnlockBits(bmpData);
+        }
+
+        using var ms = new MemoryStream();
+        bmp.Save(ms, ImageFormat.Png);
+        return ms.ToArray();
+    }
 
     private static CallToolResult SuccessResult(object data) => new()
     {
@@ -663,6 +989,21 @@ public sealed class GhostMcpBridge : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+        lock (_desktopGate)
+        {
+            if (_localDesktop != null)
+            {
+                try { _localDesktop.Dispose(); } catch { }
+                _localDesktop = null;
+            }
+
+            if (_desktopInput != null)
+            {
+                try { _desktopInput.Dispose(); } catch { }
+                _desktopInput = null;
+            }
+        }
 
         if (_ownsPipManager)
         {

@@ -460,12 +460,16 @@ public static class GhostControlCommand
         public const int SW_HIDE = 0;
         public const int SW_SHOW = 5;
         public const int SW_SHOWNOACTIVATE = 4;
+        public const uint WM_CLOSE = 0x0010;
 
         [DllImport("user32.dll")]
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 
         [DllImport("user32.dll")]
         public static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        public static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     }
 
     #endregion
@@ -593,6 +597,8 @@ public static class GhostControlCommand
 
         LogHeader(options);
 
+        GhostLocalDesktop? localDesktop = null;
+        GhostDesktopCapture? desktopCapture = null;
         GhostSessionManager? sessionManager = null;
         GhostPipManager? pipManager = null;
         GhostPipExpander? expander = null;
@@ -603,57 +609,48 @@ public static class GhostControlCommand
 
         try
         {
-            // 1. Session Management: Provision & Start Headless Session (if enabled)
-            if (options.StartSession && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            // 1. Initialize Isolated Win32 Ghost Desktop ("InbriskGhostDesktop")
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                // Check if target user already has an active or connected session
-                var targetExisting = GhostWtsInterop.FindSessionByUsername(options.Username);
-                if (targetExisting != null &&
-                    (targetExisting.State == WTS_CONNECTSTATE_CLASS.WTSActive || targetExisting.State == WTS_CONNECTSTATE_CLASS.WTSConnected))
+                try
                 {
-                    LogInfo($"Active session already exists for '{options.Username}' (Session ID: {targetExisting.SessionId}, State: {targetExisting.State}). Reusing session.", options);
+                    localDesktop = new GhostLocalDesktop(GhostLocalDesktop.DefaultDesktopName, createIfNotExists: true);
+                    LogSuccess($"Isolated Ghost Desktop active: '{localDesktop.DesktopName}' (Handle: 0x{localDesktop.DesktopHandle:X}, New: {localDesktop.WasCreatedNew})", options);
                 }
-                else if (!options.ExtraSession)
+                catch (Exception ex)
                 {
-                    // Existing session check: an interactive console session is already active (e.g. current user)
-                    string currentUser = Environment.UserName;
-                    LogInfo($"Active Windows desktop session detected for '{currentUser}'.", options);
-                    LogInfo("Spawning additional loopback RDP session was skipped to prevent session conflict.", options);
-                    LogInfo("Hint: To force an isolated secondary RDP session, specify '--extra-session'.", options);
-                    LogInfo("Proceeding with zero-conflict PiP overlay on shared framebuffer.", options);
-                }
-                else
-                {
-                    LogInfo($"Explicit secondary session requested (--extra-session). Checking Ghost desktop account ({options.Username})...", options);
-                    sessionManager = new GhostSessionManager();
-
-                    try
-                    {
-                        var status = await sessionManager.StartSessionAsync(new GhostSessionConfig
-                        {
-                            Username = options.Username,
-                            AutoProvision = true,
-                            TimeoutSeconds = 25
-                        }, linkedCts.Token).ConfigureAwait(false);
-
-                        if (status.IsActive)
-                        {
-                            LogSuccess($"Ghost session active (SessionId: {status.SessionId}, State: {status.State})", options);
-                        }
-                        else
-                        {
-                            LogWarning($"Ghost session started with state '{status.State}'. Proceeding with PiP overlay...", options);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        LogWarning($"Could not auto-start headless session ({ex.Message}). Continuing with PiP overlay...", options);
-                    }
+                    LogWarning($"Failed to initialize GhostLocalDesktop: {ex.Message}. Continuing with default session.", options);
                 }
             }
-            else
+
+            // 1b. Secondary RDP Session (if explicitly requested via --extra-session)
+            if (options.ExtraSession && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                LogInfo("Session auto-start bypassed (--no-session). Using active shared framebuffer.", options);
+                LogInfo($"Explicit secondary session requested (--extra-session). Checking Ghost desktop account ({options.Username})...", options);
+                sessionManager = new GhostSessionManager();
+
+                try
+                {
+                    var status = await sessionManager.StartSessionAsync(new GhostSessionConfig
+                    {
+                        Username = options.Username,
+                        AutoProvision = true,
+                        TimeoutSeconds = 25
+                    }, linkedCts.Token).ConfigureAwait(false);
+
+                    if (status.IsActive)
+                    {
+                        LogSuccess($"Secondary RDP ghost session active (SessionId: {status.SessionId}, State: {status.State})", options);
+                    }
+                    else
+                    {
+                        LogWarning($"Secondary session started with state '{status.State}'. Proceeding with PiP overlay...", options);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogWarning($"Could not auto-start headless session ({ex.Message}). Continuing with local Ghost Desktop...", options);
+                }
             }
 
             // 2. Initialize Picture-in-Picture (PiP) Display Manager
@@ -675,26 +672,40 @@ public static class GhostControlCommand
 
             LogSuccess($"Ghost PiP window started ({pipManager.Width}x{pipManager.Height} at {pipManager.CurrentPosition}, HWND: 0x{pipManager.WindowHandle:X8})", options);
 
-            // 2b. Start desktop capture producer so PiP receives real-time screen frames!
-            if (sessionManager == null)
+            // 3. Initialize Ghost Desktop Capture Engine (streaming ghost desktop to GhostSharedFrameBuffer)
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 try
                 {
-                    localWorker = new GhostWorkerDaemon(new GhostWorkerDaemonConfig
-                    {
-                        TargetFps = options.TargetFps,
-                        AutoStartCapture = true
-                    });
-                    await localWorker.StartAsync(linkedCts.Token).ConfigureAwait(false);
-                    LogSuccess("Desktop screen capture engine active. Streaming to PiP overlay.", options);
+                    IntPtr hDesktop = localDesktop?.DesktopHandle ?? IntPtr.Zero;
+                    desktopCapture = hDesktop != IntPtr.Zero
+                        ? new GhostDesktopCapture(hDesktop, width: 1920, height: 1080, targetFps: options.TargetFps)
+                        : new GhostDesktopCapture(GhostLocalDesktop.DefaultDesktopName, width: 1920, height: 1080, targetFps: options.TargetFps);
+
+                    desktopCapture.Start();
+                    LogSuccess("Ghost Desktop screen capture active. Streaming frames to shared frame buffer.", options);
                 }
                 catch (Exception ex)
                 {
-                    LogWarning($"Could not start screen capture engine: {ex.Message}", options);
+                    LogWarning($"Could not start Ghost Desktop screen capture engine: {ex.Message}", options);
                 }
             }
 
-            // 3. Initialize Full-Screen Expander (Shadow Mode)
+            // 4. Start lightweight initial app or terminal on the ghost desktop so it is immediately live and visible in PiP
+            if (localDesktop != null && localDesktop.IsCreated)
+            {
+                try
+                {
+                    var initialProc = localDesktop.StartProcess("cmd.exe", "/k title Inbrisk Ghost Desktop && echo Inbrisk Ghost OS Desktop Active.");
+                    LogSuccess($"Started initial terminal on Ghost Desktop (PID: {initialProc.Id}).", options);
+                }
+                catch (Exception ex)
+                {
+                    LogInfo($"Ghost Desktop canvas active ({ex.Message}).", options);
+                }
+            }
+
+            // 5. Initialize Full-Screen Expander (Shadow Mode)
             expander = new GhostPipExpander(pipManager.Renderer);
 
             // 4. Initialize Windows System Tray Icon Application
@@ -787,9 +798,24 @@ public static class GhostControlCommand
                 try { trayApp.Dispose(); } catch { }
             }
 
+            if (desktopCapture != null)
+            {
+                try
+                {
+                    desktopCapture.Stop();
+                    desktopCapture.Dispose();
+                }
+                catch { }
+            }
+
             if (pipManager != null)
             {
                 try { pipManager.Dispose(); } catch { }
+            }
+
+            if (localDesktop != null)
+            {
+                try { localDesktop.Dispose(); } catch { }
             }
 
             if (localWorker != null)
@@ -1397,7 +1423,26 @@ public static class GhostControlCommand
             return 1;
         }
 
-        // Run comprehensive cleanup
+        // Run comprehensive cleanup (RDP sessions + local isolated desktop)
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            try
+            {
+                var hDesktop = GhostDesktopNative.OpenDesktop(GhostDesktopNative.DefaultGhostDesktopName, GhostDesktopNative.DESKTOP_ALL_ACCESS, false);
+                if (hDesktop != IntPtr.Zero)
+                {
+                    var windows = GhostDesktopNative.EnumerateWindows(hDesktop);
+                    foreach (var hwnd in windows)
+                    {
+                        try { Win32.PostMessageW(hwnd, Win32.WM_CLOSE, IntPtr.Zero, IntPtr.Zero); } catch { }
+                    }
+                    GhostDesktopNative.CloseDesktop(hDesktop);
+                    LogSuccess("Isolated Ghost Desktop windows and handles closed.", options);
+                }
+            }
+            catch { }
+        }
+
         try
         {
             await GhostRdpConnector.CleanupAllSessionsAsync(options.Username).ConfigureAwait(false);

@@ -1616,8 +1616,126 @@ public sealed class GhostWorkerDaemon : IAsyncDisposable, IDisposable
             return JsonSerializer.Serialize(result);
         });
 
+        // 5b. "forward_input" -> Real-time mouse and input forwarded from interactive PiP
+        _ipcClient.RegisterHandler("forward_input", payloadJson =>
+        {
+            if (!string.IsNullOrWhiteSpace(payloadJson))
+            {
+                try
+                {
+                    var packet = GhostInputPacket.FromJson(payloadJson);
+                    if (packet != null)
+                    {
+                        ExecuteForwardedInput(packet);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[GhostWorkerDaemon] forward_input execution error: {ex.Message}");
+                }
+            }
+            return Task.FromResult(JsonSerializer.Serialize(new { status = "ok" }));
+        });
+
+        // 5c. "forward_keyboard" -> Real-time keyboard input forwarded from interactive PiP
+        _ipcClient.RegisterHandler("forward_keyboard", payloadJson =>
+        {
+            if (!string.IsNullOrWhiteSpace(payloadJson))
+            {
+                try
+                {
+                    ExecuteForwardedKeyboard(payloadJson);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[GhostWorkerDaemon] forward_keyboard execution error: {ex.Message}");
+                }
+            }
+            return Task.FromResult(JsonSerializer.Serialize(new { status = "ok" }));
+        });
+
         // 6. "status" -> Live diagnostic summary
         _ipcClient.RegisterHandler("status", _ => Task.FromResult(JsonSerializer.Serialize(GetStatus())));
+    }
+
+    private void ExecuteForwardedInput(GhostInputPacket packet)
+    {
+        var type = packet.Type?.ToLowerInvariant() ?? "";
+        var action = packet.Action?.ToLowerInvariant() ?? "";
+        var btn = PipInputTranslator.ParseMouseButton(packet.Button);
+
+        if (type.Contains("move") || action == "move")
+        {
+            _inputExecutor.InputService.MoveMouse(packet.X, packet.Y);
+        }
+        else if (type.Contains("down") || action == "down")
+        {
+            _inputExecutor.InputService.MoveMouse(packet.X, packet.Y);
+            if (_inputExecutor.InputService is GhostDesktopInput.ILocalMouseControl mc)
+            {
+                mc.MouseDown(btn, packet.X, packet.Y);
+            }
+            else
+            {
+                _inputExecutor.InputService.Click(packet.X, packet.Y, btn, 1);
+            }
+        }
+        else if (type.Contains("up") || action == "up")
+        {
+            _inputExecutor.InputService.MoveMouse(packet.X, packet.Y);
+            if (_inputExecutor.InputService is GhostDesktopInput.ILocalMouseControl mc)
+            {
+                mc.MouseUp(btn, packet.X, packet.Y);
+            }
+        }
+        else if (type.Contains("double") || action == "doubleclick")
+        {
+            _inputExecutor.InputService.Click(packet.X, packet.Y, btn, 2);
+        }
+        else if (type.Contains("click") || action == "click")
+        {
+            _inputExecutor.InputService.Click(packet.X, packet.Y, btn, 1);
+        }
+        else if (type.Contains("wheel") || type.Contains("scroll") || action == "scroll")
+        {
+            _inputExecutor.InputService.Scroll(packet.X, packet.Y, packet.Delta);
+        }
+        else if (type.Contains("release") || action == "release_all")
+        {
+            _inputExecutor.InputService.ReleaseAll();
+        }
+    }
+
+    private void ExecuteForwardedKeyboard(string payloadJson)
+    {
+        using var doc = JsonDocument.Parse(payloadJson);
+        var root = doc.RootElement;
+        string evt = root.TryGetProperty("event", out var evProp) ? evProp.GetString()?.ToLowerInvariant() ?? "" : "";
+
+        if (evt == "char" && root.TryGetProperty("char", out var charProp))
+        {
+            string? c = charProp.GetString();
+            if (!string.IsNullOrEmpty(c)) _inputExecutor.InputService.TypeText(c);
+        }
+        else if (evt == "type" && root.TryGetProperty("char", out var textProp))
+        {
+            string? t = textProp.GetString();
+            if (!string.IsNullOrEmpty(t)) _inputExecutor.InputService.TypeText(t);
+        }
+        else if (evt == "keydown" && root.TryGetProperty("vk", out var vkProp) && vkProp.TryGetInt32(out int vk))
+        {
+            if (Enum.IsDefined(typeof(KeyCode), vk))
+            {
+                _inputExecutor.InputService.KeyDown((KeyCode)vk);
+            }
+        }
+        else if (evt == "keyup" && root.TryGetProperty("vk", out var vkUpProp) && vkUpProp.TryGetInt32(out int vkUp))
+        {
+            if (Enum.IsDefined(typeof(KeyCode), vkUp))
+            {
+                _inputExecutor.InputService.KeyUp((KeyCode)vkUp);
+            }
+        }
     }
 
     #endregion

@@ -432,6 +432,11 @@ internal static class NativeMethods
     public const uint WM_LBUTTONDBLCLK = 0x0203;
     public const uint WM_RBUTTONDOWN = 0x0204;
     public const uint WM_RBUTTONUP = 0x0205;
+    public const uint WM_RBUTTONDBLCLK = 0x0206;
+    public const uint WM_MBUTTONDOWN = 0x0207;
+    public const uint WM_MBUTTONUP = 0x0208;
+    public const uint WM_MBUTTONDBLCLK = 0x0209;
+    public const uint WM_MOUSEWHEEL = 0x020A;
     public const uint WM_CONTEXTMENU = 0x007B;
     public const uint NIN_SELECT = 0x0400;
     public const uint NIN_KEYSELECT = 0x0401;
@@ -462,6 +467,8 @@ internal static class NativeMethods
     [DllImport("user32.dll")] internal static extern IntPtr SetCapture(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern IntPtr GetCapture();
     [DllImport("user32.dll")] internal static extern bool ReleaseCapture();
+    [DllImport("user32.dll")] internal static extern IntPtr SetFocus(IntPtr hWnd);
+    [DllImport("user32.dll")] internal static extern IntPtr SetActiveWindow(IntPtr hWnd);
 
     public const uint WM_SETCURSOR = 0x0020;
     public static readonly IntPtr IDI_APPLICATION = new(32512);
