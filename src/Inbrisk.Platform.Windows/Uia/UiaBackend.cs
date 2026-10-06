@@ -35,6 +35,17 @@ public sealed class UiaBackend : IElementBackend
     private long _liveClock;
     private int _idCounter;
 
+    /// <summary>elementId → re-resolution fingerprint (hwnd, bounds,
+    /// runtimeId). Survives live-map eviction so ReResolve can re-locate an
+    /// element with one provider-side match instead of the ancestry walk.</summary>
+    private readonly HwndLockedElementPool _pool = new();
+
+    /// <summary>UIA_LegacyIAccessibleStatePropertyId — element-level mirror
+    /// of LegacyIAccessiblePattern.State; in the cache request it lets the
+    /// "selected" bit resolve locally instead of one live pattern read per
+    /// legacy element.</summary>
+    private const int LegacyIAccessibleStatePropertyId = 30146;
+
     /// <summary>Live-map capacity. Generous enough that a full Inspect of a
     /// large window (≤ MaxElements) never self-evicts.</summary>
     public int MaxLiveElements { get; set; } = 4096;
@@ -75,10 +86,15 @@ public sealed class UiaBackend : IElementBackend
     {
         foreach (var kv in _live)
             if (kv.Value.Hwnd == hwnd) _live.TryRemove(kv.Key, out _);
+        _pool.InvalidateWindow(hwnd);
     }
 
     /// <summary>Drop every live handle (desktop-wide structural reset).</summary>
-    public void InvalidateAll() => _live.Clear();
+    public void InvalidateAll()
+    {
+        _live.Clear();
+        _pool.Clear();
+    }
 
     public BackendId Id => BackendId.Uia;
 
@@ -535,6 +551,7 @@ public sealed class UiaBackend : IElementBackend
                 // dead handle — evict it so every later touch also misses,
                 // then fall through to hwnd/pid/global re-resolution
                 _live.TryRemove(sid, out _);
+                _pool.Remove(sid); // confirmed dead — drop the fingerprint too
             }
         }
         if (spec.Hwnd is { } h)
@@ -634,6 +651,7 @@ public sealed class UiaBackend : IElementBackend
                 UiaIds.IsOffscreenProperty, UiaIds.ValueValueProperty,
                 UiaIds.SelectionItemIsSelectedProperty,
                 UiaIds.ExpandCollapseStateProperty, UiaIds.ToggleStateProperty,
+                LegacyIAccessibleStatePropertyId,
             })
             {
                 try { c.AddProperty(p); cacheProps++; }
@@ -1228,6 +1246,7 @@ public sealed class UiaBackend : IElementBackend
     {
         element.IsStale = true;
         _live.TryRemove(element.Handle.BackendRef, out _);
+        _pool.Remove(element.Handle.BackendRef); // confirmed dead — poison the fingerprint too
         return new InbriskException(ErrorCode.Stale, "element gone");
     }
 
@@ -1537,7 +1556,8 @@ public sealed class UiaBackend : IElementBackend
         ct.ThrowIfCancellationRequested();
         UiaPerf.TakeReads();
         var t = Stopwatch.StartNew();
-        var result = ReResolveCore(uia, recipe, hwnd);
+        var result = ReResolveCore(uia, handle.BackendRef, recipe, hwnd,
+            out var poolOutcome, out var poolMs);
         var (live, cachedReads, comOps) = UiaPerf.TakeReads();
         UiaPerf.Write(new
         {
@@ -1547,6 +1567,11 @@ public sealed class UiaBackend : IElementBackend
             elementId = handle.BackendRef,
             hwnd,
             resolved = result != null,
+            pool = poolOutcome,
+            poolMs = Math.Round(poolMs, 2),
+            poolHits = _pool.Hits,
+            poolMisses = _pool.Misses,
+            poolSize = _pool.Count,
             crossProcessPropertyReads = live,
             cachedReads,
             comOps,
@@ -1556,9 +1581,12 @@ public sealed class UiaBackend : IElementBackend
         return result;
     };
 
-    private UiElement? ReResolveCore(IUIAutomation uia,
-        ReResolveRecipe recipe, long hwnd)
+    private UiElement? ReResolveCore(IUIAutomation uia, string elementId,
+        ReResolveRecipe recipe, long hwnd,
+        out string poolOutcome, out double poolMs)
     {
+        poolOutcome = "skip:noRoot";
+        poolMs = 0;
         IUIAutomationElement? root = null;
         try { UiaPerf.ComCall(); root = uia.ElementFromHandle(new IntPtr(hwnd)); }
         catch { /* dead handle → fall through to title re-resolution */ }
@@ -1593,6 +1621,44 @@ public sealed class UiaBackend : IElementBackend
             }
         }
         if (root == null) return (UiElement?)null;
+
+        // ---- hwnd-locked pool fast path ---------------------------------
+        // When the live map dropped this element's handle (LRU overflow or a
+        // dead-handle eviction) but the fingerprint survives, ONE provider-
+        // side runtimeId (or exact-bounds) FindFirst replaces the per-level
+        // children walk below. Validation failures fall through to the walk —
+        // the pool never fabricates an element.
+        {
+            var pt = Stopwatch.StartNew();
+            if (_pool.TryGet(elementId, hwnd, out var pe,
+                    out var miss) && pe != null)
+            {
+                var fast = TryPoolResolve(uia, root, pe, recipe);
+                poolMs = pt.Elapsed.TotalMilliseconds;
+                if (fast != null)
+                {
+                    _pool.NoteHit();
+                    _pool.Remove(elementId); // consumed — the re-minted id replaces it
+                    poolOutcome = fast.Value.Via;
+                    return fast.Value.Element;
+                }
+                _pool.NoteMiss();
+                _pool.Remove(elementId); // fingerprint failed validation
+                poolOutcome = "miss:notFound";
+            }
+            else
+            {
+                poolMs = pt.Elapsed.TotalMilliseconds;
+                poolOutcome = miss switch
+                {
+                    HwndLockedElementPool.MissReason.HwndChanged =>
+                        "miss:hwndChanged",
+                    HwndLockedElementPool.MissReason.DeadHwnd =>
+                        "miss:deadHwnd",
+                    _ => "miss:noEntry",
+                };
+            }
+        }
 
         IUIAutomationElement? cur = root;
         // one cached children fetch per level — sig props for every
@@ -1670,6 +1736,101 @@ public sealed class UiaBackend : IElementBackend
         // path or a second re-resolve would stop at its parent
         return ToUiElement(uia, finalEl, recipe.AncestryPath.ToList(),
             recipe.Hwnd, recipe.OwnerTitle, cached: cachedFinal, allowOffscreen: true);
+    }
+
+    /// <summary>This UIA build may reject RuntimeId / BoundingRectangle as
+    /// search-condition properties — same tri-state pattern as
+    /// _ancestorCacheSupported so the failure is paid once, not per resolve.</summary>
+    private static int _runtimeIdCondSupported = -1; // -1 unknown, 0 no, 1 yes
+    private static int _boundsCondSupported = -1;
+
+    /// <summary>Pool-hit resolution: locate the element under the window root
+    /// with ONE provider-side condition instead of the ancestry walk.
+    /// Path A (runtimeId property condition) is authoritative — the provider
+    /// itself performs the identity match. Path B (exact bounds + control
+    /// type) covers providers that reassign runtime ids without tripping a
+    /// structure event; it is corroborated by name/automationId before the
+    /// candidate is trusted. Either way the winning element is refreshed
+    /// through the full cache request so ToUiElement converts it locally.</summary>
+    private (UiElement Element, string Via)? TryPoolResolve(IUIAutomation uia,
+        IUIAutomationElement root, HwndLockedElementPool.Entry pe,
+        ReResolveRecipe recipe)
+    {
+        IUIAutomationElement? el = null;
+        var via = "hit:runtimeId";
+
+        // Path A — runtimeId is the authoritative element identity. The
+        // condition makes the PROVIDER do the match in the same cross-process
+        // call that returns the element, so a non-null result is already
+        // validated (spec: "runtimeId match …").
+        if (pe.RuntimeId is { Length: > 0 } rt && _runtimeIdCondSupported != 0)
+        {
+            try
+            {
+                var cond = uia.CreatePropertyCondition(
+                    HwndLockedElementPool.RuntimeIdPropertyId, rt);
+                UiaPerf.ComCall();
+                el = root.FindFirst(TreeScope.TreeScope_Descendants, cond);
+                _runtimeIdCondSupported = 1;
+            }
+            catch { _runtimeIdCondSupported = 0; el = null; }
+        }
+
+        // Path B — runtime ids are provider-volatile: an element rebuilt
+        // without a structure event keeps neither its COM handle nor its
+        // runtime id. An exact bounds+controlType match is the fallback
+        // identity; name/aid corroboration happens after the refresh below.
+        if (el == null && !pe.Bounds.IsEmpty && _boundsCondSupported != 0)
+        {
+            try
+            {
+                var cond = uia.CreateAndConditionFromArray(new[]
+                {
+                    uia.CreatePropertyCondition(
+                        UiaIds.ControlTypeProperty, pe.ControlType),
+                    uia.CreatePropertyCondition(
+                        UiaIds.BoundingRectangleProperty,
+                        new double[] { pe.Bounds.X, pe.Bounds.Y,
+                            pe.Bounds.Width, pe.Bounds.Height }),
+                });
+                UiaPerf.ComCall();
+                el = root.FindFirst(TreeScope.TreeScope_Descendants, cond);
+                _boundsCondSupported = 1;
+                via = "hit:bounds";
+            }
+            catch { _boundsCondSupported = 0; el = null; }
+        }
+        if (el == null) return null;
+
+        // one cache-update call covers every property the conversion needs
+        var finalEl = el;
+        var cached = false;
+        if (TryCreateCache(uia, out _) is { } fc)
+        {
+            try
+            {
+                UiaPerf.ComCall();
+                var u = el.BuildUpdatedCache(fc);
+                if (u != null) { finalEl = u; cached = true; }
+            }
+            catch { }
+        }
+
+        // bounds matched a rectangle, not an identity — require the signature
+        // (name AND automationId) to corroborate before trusting the
+        // candidate; a same-rect different element must fall through to the
+        // ancestry walk rather than be acted on.
+        if (via == "hit:bounds")
+        {
+            var (_, bn, ba) = Sig(finalEl, cached);
+            if (!string.Equals(bn ?? "", pe.Name ?? "", StringComparison.Ordinal) ||
+                !string.Equals(ba ?? "", pe.AutomationId ?? "", StringComparison.Ordinal))
+                return null;
+        }
+
+        var uie = ToUiElement(uia, finalEl, recipe.AncestryPath.ToList(),
+            recipe.Hwnd, recipe.OwnerTitle, cached, allowOffscreen: true);
+        return uie == null ? null : (uie, via);
     }
 
     // ------------------------------------------------------------------
@@ -1764,7 +1925,22 @@ public sealed class UiaBackend : IElementBackend
                 : si.CurrentIsSelected != 0;
         else if (Pattern<IUIAutomationLegacyIAccessiblePattern>(el, UiaIds.LegacyIAccessiblePattern, cached) is { } l2)
         { // STATE_SYSTEM_SELECTED bit — legacy fallback for list items
-            try { UiaPerf.LiveRead(); props["selected"] = (l2.CurrentState & 0x2) != 0; } catch { }
+            if (cached)
+            {
+                // the state is in the cache request — a local read instead of
+                // a cross-process LegacyIAccessible.State call per element
+                try
+                {
+                    UiaPerf.CachedRead();
+                    if (el.GetCachedPropertyValue(LegacyIAccessibleStatePropertyId) is int ls)
+                        props["selected"] = (ls & 0x2) != 0;
+                }
+                catch { }
+            }
+            else
+            {
+                try { UiaPerf.LiveRead(); props["selected"] = (l2.CurrentState & 0x2) != 0; } catch { }
+            }
         }
 
         var owner = ownerHwnd ?? (hwnd == IntPtr.Zero ? null : hwnd.ToInt64());
@@ -1773,6 +1949,13 @@ public sealed class UiaBackend : IElementBackend
         var handle = new ElementHandle(BackendId.Uia, id, recipe);
 
         LivePut(id, el, owner);
+        // fingerprint for the hwnd-locked re-resolution pool — GetRuntimeId
+        // is local on a cached element; on the uncached fallback it is one
+        // extra read that pays for O(1) re-resolves over the element's whole
+        // registration life. Entries with no owning window can't be locked.
+        if (owner is { } poolHwnd)
+            _pool.Put(id, poolHwnd, bounds, controlType, name, aid,
+                RuntimeIdOf(el, cached));
         var uie = new UiElement(id, BackendId.Uia, MapControlType(controlType),
             string.IsNullOrEmpty(name) ? null : name, bounds,
             UiaIds.ActionsFor(uia, el, cached, enabled != 0), props, handle,
