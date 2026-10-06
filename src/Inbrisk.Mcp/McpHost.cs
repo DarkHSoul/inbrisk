@@ -93,7 +93,8 @@ public static class McpHost
             var isDestructive = name is "computer_batch" or "computer_do" or "computer_run"
                 or "computer_click" or "computer_type" or "computer_hotkey"
                 or "computer_close_window" or "browser_click" or "browser_type"
-                or "computer_app_shutdown" or "computer_app_restart" or "computer_cancel_task";
+                or "computer_app_shutdown" or "computer_app_restart" or "computer_cancel_task"
+                or "computer_cleanup";
 
             var isIdempotent = name is "computer_windows" or "computer_observe" or "computer_find"
                 or "computer_inspect" or "computer_read" or "computer_screenshot" or "computer_capabilities"

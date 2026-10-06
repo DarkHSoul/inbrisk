@@ -67,6 +67,7 @@ public sealed class ThinStdioProxy : IAsyncDisposable, IDisposable
             or "computer_app_restart"
             or "computer_app_shutdown"
             or "computer_cancel_task"
+            or "computer_cleanup"
             or "browser_click"
             or "browser_type"
             or "browser_browse";

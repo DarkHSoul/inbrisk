@@ -745,7 +745,7 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter, IAsyncDisposabl
         var profileDir = Path.Combine(Path.GetTempPath(), $"inbrisk_debug_profile_{port}");
         try
         {
-            Process.Start(new ProcessStartInfo
+            var proc = Process.Start(new ProcessStartInfo
             {
                 FileName = exe,
                 Arguments = $"--remote-debugging-port={port} --remote-allow-origins=* " +
@@ -753,6 +753,18 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter, IAsyncDisposabl
                             $"--user-data-dir=\"{profileDir}\"",
                 UseShellExecute = false,
             });
+            // The adapter is static and holds no runtime reference — record
+            // the spawned browser on the ambient tracker so session teardown
+            // can reap it.
+            if (proc?.Id is int spawnedPid)
+            {
+                try
+                {
+                    SessionProcessTracker.Ambient?.Track(spawnedPid,
+                        tool: "adapter:chrome-devtools");
+                }
+                catch { }
+            }
         }
         catch { return false; }
 

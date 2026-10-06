@@ -248,6 +248,9 @@ public sealed class McpSession : IDisposable
             MonitorTopologyCache: MonitorCache,
             VdmHolder: VdmHolder));
         Rt.Event += OnEvent;
+        // Stamp every process this session spawns with our id — Dispose then
+        // reaps only this session's launches.
+        Rt.ProcessTracker.SessionId = SessionId;
         var p = Rt.Parts;
         _inputRegistration = control.RegisterInput(p.Input);
         // screen-control indicator: the session refcounted-lease pattern
@@ -260,7 +263,7 @@ public sealed class McpSession : IDisposable
             Rt.CaptureRaw, p.EventBuffer, null, (h, ct) => Rt.ObserveSceneAsync(h, ct: ct));
         Resolver = new ActionResolver(p.Registry, p.Executor, p.Waits,
             p.Windows, new AutoVerifier(p.Registry, p.Backends, p.Windows,
-                p.EventBuffer));
+                p.EventBuffer), p.Capture, p.Ocr);
         if (Arbiter is DesktopArbiter da && da.OnInputCleanup == null)
             da.OnInputCleanup = () => { try { Rt.Parts.Input.SweepAll(); } catch { } };
 
@@ -635,6 +638,11 @@ public sealed class McpSession : IDisposable
         try { _inputRegistration.Dispose(); } catch { }
         try { Control.StateChanged -= OnControlState; } catch { }
         try { _clientLease.Dispose(); } catch { }
+        // Reap processes this session spawned — graceful WM_CLOSE first, a
+        // hard kill only for verified-spawned, unprotected, windowless
+        // leftovers. Best-effort: outcomes are emitted to the session.reaper
+        // perf event; failures are logged there, never thrown.
+        try { Rt.ProcessTracker.ReapAll(SessionId); } catch { }
         try { Rt.Dispose(); } catch { }
         try { SessionCts.Dispose(); } catch { }
     }
