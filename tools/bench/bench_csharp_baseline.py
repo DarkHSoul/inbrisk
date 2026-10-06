@@ -109,14 +109,28 @@ class Server:
         return res, wall, texts, r.get("_lineBytes", 0), img_b, n_img, bool(res.get("isError"))
 
     def close(self):
+        """Guarantee the spawned `dotnet inbrisk.dll mcp` process terminates:
+        polite stdin-EOF first, then kill OUR spawned pid (allowed — we
+        spawned it this run) and reap it so a wedged server cannot leak a
+        live process or hold cross-process locks (physical_input.lock etc.)."""
         try:
             self.proc.stdin.close()
-            self.proc.wait(timeout=8)
         except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=4)
+        except Exception:
+            pass
+        if self.proc.poll() is None:
             try:
                 self.proc.kill()
+                self.proc.wait(timeout=5)
             except Exception:
                 pass
+        try:
+            self.proc.stdout.close()
+        except Exception:
+            pass
         try:
             self._err.close()
         except Exception:
@@ -180,7 +194,9 @@ def close_bench_notepads(sv):
     for line in wins.splitlines():
         m = re.match(r'\s*(0x[0-9A-Fa-f]+)\s+"([^"]*)"', line)
         if m and any(h.lower() in m.group(2).lower() for h in BENCH_TITLE_HINTS):
-            sv.tool("computer_close_window", {"hwnd": m.group(1), "force": True})
+            # never force — force escalates to Process.Kill (incident: force
+            # close of a diff-captured hwnd killed the IDE host window)
+            sv.tool("computer_close_window", {"hwnd": m.group(1)})
 
 # ------------------------------------------------------------- perf-trace slicing
 # perf-trace.jsonl / find-perf.jsonl are shared with the user's live
@@ -445,7 +461,7 @@ def main():
             "note": "dotnet.exe hosting inbrisk.dll mcp, after warm run"}
 
         if note_hwnd:
-            sv.tool("computer_close_window", {"hwnd": note_hwnd, "force": True})
+            sv.tool("computer_close_window", {"hwnd": note_hwnd})
     finally:
         sv.close()
 

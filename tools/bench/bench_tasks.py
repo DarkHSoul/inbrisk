@@ -14,7 +14,7 @@ from ctypes import wintypes
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bench_csharp_baseline import (
     Server, REPO, OFF_PRIMARY, park_offscreen, window_hwnds,
-    hwnd_from_result, CALL_TIMEOUT)
+    hwnd_from_result, CALL_TIMEOUT, _top_windows)
 
 OUT = os.path.join(REPO, "benchmarks", "baseline_2026-10-06.json")
 _user32 = ctypes.windll.user32
@@ -29,8 +29,21 @@ WM_CLOSE = 0x0010
 def wm_close(hwnd):
     _user32.PostMessageW(int(hwnd), WM_CLOSE, 0, 0)
 
-def find_windows(sv, proc_re=None, title_re=None):
-    _, _, wins, *_ = sv.tool("computer_windows")
+POLICY_RE = re.compile(
+    r"policydenied|protected|refusing to launch|denied", re.I)
+
+def is_policy_denied(txt):
+    """Launch result text that is a policy Deny/Protected outcome rather
+    than a real failure — ProtectedProcesses in user settings (Deny mode)
+    or the shell-host guard refuse the spawn."""
+    return bool(POLICY_RE.search(txt or ""))
+
+def pid_from_result(txt):
+    m = re.search(r'"pid"\s*:\s*(\d+)', txt or "")
+    return int(m.group(1)) if m else None
+
+def find_windows(ctx, proc_re=None, title_re=None):
+    _, _, wins, _iserr = ctx.tool("computer_windows")
     out = []
     for line in wins.splitlines():
         m = re.match(r'\s*(0x[0-9A-Fa-f]+)\s+"([^"]*)"\s+app=([^\s]+)', line)
@@ -45,56 +58,116 @@ def find_windows(sv, proc_re=None, title_re=None):
     return out
 
 class Ctx:
-    """Per-task accounting + cleanup registry."""
+    """Per-task accounting + cleanup registry.
+
+    Cleanup targets come ONLY from our own launch results in this run —
+    never from a whole-desktop diff (run 1 diff-closed + force-killed the
+    IDE host window). hwnds = launch-reported hwnds plus NEW windows owned
+    by the launched pid; pids = pids our launches reported."""
     def __init__(self, sv):
         self.sv = sv
         self.calls = 0
         self.screenshots = 0
         self.hwnds = []
-        self.edge_pids = []
+        self.pids = []
+        self.edge_pids = []   # msedge pids WE spawned (unique bench profile)
+        self.transport_ok = True
+        self.leftovers = []
     def tool(self, name, args=None):
         self.calls += 1
-        res, wall, txt, rb, ib, nimg, iserr = self.sv.tool(name, args)
+        try:
+            res, wall, txt, rb, ib, nimg, iserr = self.sv.tool(name, args)
+        except (TimeoutError, EOFError, OSError, ValueError):
+            self.transport_ok = False
+            raise
         self.screenshots += nimg
         return res, wall, txt, iserr
     def run(self, steps):
         self.calls += 1
-        res, wall, txt, rb, ib, nimg, iserr = self.sv.tool(
-            "computer_run", {"steps": steps})
+        try:
+            res, wall, txt, rb, ib, nimg, iserr = self.sv.tool(
+                "computer_run", {"steps": steps})
+        except (TimeoutError, EOFError, OSError, ValueError):
+            self.transport_ok = False
+            raise
         self.screenshots += nimg
         return res, wall, txt, iserr
     def park(self):
         if OFF_PRIMARY and self.hwnds:
             park_offscreen(extra_hwnds=self.hwnds)
     def cleanup(self):
+        """Close ONLY launch-captured hwnds: WM_CLOSE first, then a single
+        NON-force computer_close_window fallback (force escalates to
+        Process.Kill — banned after run 1). If the transport is dead we do
+        not poke the wedged server — wm_close only. Whatever survives is
+        reported as a leftover, not hunted."""
         for h in self.hwnds:
-            try:
-                self.tool("computer_close_window", {"hwnd": "0x%X" % h, "force": True})
-            except Exception:
-                pass
             try:
                 wm_close(h)
             except Exception:
                 pass
+        if self.hwnds:
+            time.sleep(0.7)
+        for h in self.hwnds:
+            try:
+                alive = bool(_user32.IsWindow(h))
+            except Exception:
+                alive = False
+            if not alive:
+                continue
+            if self.transport_ok:
+                try:
+                    self.tool("computer_close_window",
+                              {"hwnd": "0x%X" % h})
+                except Exception:
+                    self.transport_ok = False
+            try:
+                if _user32.IsWindow(h):
+                    self.leftovers.append(h)
+            except Exception:
+                pass
         for pid in self.edge_pids:
+            # spawned by THIS run — the WMI query filtered on the bench-only
+            # --user-data-dir path and the pre/post diff kept only new pids
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                            capture_output=True)
 
 def new_hwnds(ctx, before, launch_txt):
-    after = window_hwnds(ctx.sv)
+    """Register cleanup targets from OUR launch result only: the launch-
+    reported hwnd, plus any NEW desktop window (before→after diff) owned
+    by the launched pid. The pid filter is required — a bare diff picks up
+    foreign windows (the run-1 incident), and a bare pid would adopt every
+    pre-existing window of shared processes (explorer.exe shell, single-
+    instance code.exe/notepad). Returns the launch-reported hwnd string."""
+    try:
+        after = window_hwnds(ctx.sv)
+    except Exception:
+        after = set()
+    new = set(after) - set(before)
     h = hwnd_from_result(launch_txt)
-    hs = set(after - before)
     if h:
-        try: hs.add(int(h, 16))
-        except ValueError: pass
-    ctx.hwnds.extend(sorted(hs))
+        try:
+            ctx.hwnds.append(int(h, 16))
+        except ValueError:
+            pass
+    pid = pid_from_result(launch_txt)
+    if pid:
+        ctx.pids.append(pid)
+        try:
+            own = set(_top_windows({pid}))
+            ctx.hwnds.extend(sorted(new & own))
+        except Exception:
+            pass
     return h
 
-def wait_ready(sv, timeout=10.0):
+def wait_ready(sv, timeout=12.0):
+    """Wait for app_status running AND not EmergencyStopped — a fresh server
+    may boot stopped while it reacquires the panic chord from a killed peer
+    (EmergencyControl.TryReacquireAuthority ticks every ~3s)."""
     t0 = time.time()
     while time.time() - t0 < timeout:
         _, _, txt, *_ = sv.tool("computer_app_status")
-        if '"running"' in txt:
+        if '"running"' in txt and "EmergencyStopped" not in txt:
             return True
         time.sleep(0.5)
     return False
@@ -118,11 +191,7 @@ def task_notepad(ctx):
         {"action": "key", "keys": "ctrl+s"},
         {"action": "wait", "ms": 400},
     ])
-    hwnd = hwnd_from_result(txt)
-    if hwnd:
-        try: ctx.hwnds.append(int(hwnd, 16))
-        except ValueError: pass
-    ctx.hwnds.extend(sorted(set(window_hwnds(ctx.sv)) - before))
+    hwnd = new_hwnds(ctx, before, txt)
     ctx.park()
     time.sleep(0.5)
     try:
@@ -141,7 +210,7 @@ def task_calculator(ctx):
         "waitFor": "window", "timeoutMs": 25000})
     hwnd = new_hwnds(ctx, before, ltxt)
     ctx.park()
-    wins = find_windows(ctx.sv, proc_re=r"calculatorapp|applicationframehost")
+    wins = find_windows(ctx, proc_re=r"calculatorapp|applicationframehost")
     ok = bool(hwnd) or bool(wins)
     return ok, ("hwnd=%s calcWins=%s" % (hwnd, [w[1] for w in wins][:3])) \
         if ok else ("launch=" + ltxt[:200]), lms
@@ -167,9 +236,8 @@ def task_edge_cdp(ctx):
         "(Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
         "Where-Object {$_.CommandLine -like '*inbrisk-bench-tasks*'}).ProcessId"],
         capture_output=True, text=True).stdout or ""
-    for tok in re.findall(r"\d+", post):
-        if tok not in pre:
-            ctx.edge_pids.append(int(tok))
+    for tok in set(re.findall(r"\d+", post)) - set(re.findall(r"\d+", pre)):
+        ctx.edge_pids.append(int(tok))
     if lerr:
         return False, "edge launch error: " + ltxt[:200], lms
     time.sleep(1.0)
@@ -193,7 +261,9 @@ def task_explorer(ctx):
          "waitFor": "window", "timeoutMs": 15000})
     hwnd = new_hwnds(ctx, before, ltxt)
     ctx.park()
-    wins = find_windows(ctx.sv, proc_re=r"explorer")
+    if is_policy_denied(ltxt) and not hwnd:
+        return None, "policy-protected: " + ltxt[:160], lms
+    wins = find_windows(ctx, proc_re=r"explorer")
     ok = bool(hwnd) or any("expldir" in w[1].lower() for w in wins)
     if lerr and not ok:
         return False, "launch error: " + ltxt[:200], lms
@@ -210,8 +280,10 @@ def task_vscode(ctx):
          "waitFor": "window", "timeoutMs": 30000})
     hwnd = new_hwnds(ctx, before, ltxt)
     ctx.park()
+    if is_policy_denied(ltxt) and not hwnd:
+        return None, "policy-protected: " + ltxt[:160], lms
     time.sleep(2.0)
-    wins = find_windows(ctx.sv, proc_re=r"code\.exe")
+    wins = find_windows(ctx, proc_re=r"code\.exe")
     ok = bool(hwnd) or bool(wins)
     if lerr and not ok:
         return False, "launch error: " + ltxt[:200], lms
@@ -243,17 +315,24 @@ TASKS = [
     ("custom_app", task_custom_app),
 ]
 
+# Per-task server env overrides. The ambient ToolProfile is "core" (16
+# tools — no browser_*), so edge_cdp spawns its server with the full
+# profile; every other task uses ambient like the baseline run.
+TASK_ENV = {
+    "edge_cdp": {"INBRISK_TOOL_PROFILE": "full"},
+}
+
 def main():
     results = {}
     for name, fn in TASKS:
-        sv = Server()   # fresh session per task — a hung call poisons the
-                        # serialized executor for the rest of a session
-        ctx = Ctx(sv)
         t0 = time.perf_counter()
         status, note, launch_ms = "FAIL", "", None
+        sv = ctx = None
         try:
-            if not wait_ready(sv):
-                raise TimeoutError("server never became ready")
+            sv = Server(extra_env=TASK_ENV.get(name))  # fresh session per
+            ctx = Ctx(sv)                            # task — a hung call
+            if not wait_ready(sv):                   # poisons the session's
+                raise TimeoutError("server never became ready")  # executor
             ok, note, launch_ms = fn(ctx)
             status = "SKIPPED" if ok is None else ("PASS" if ok else "FAIL")
         except (TimeoutError, EOFError) as e:
@@ -261,18 +340,26 @@ def main():
         except Exception as e:
             note = "exception: " + str(e)[:160]
         wall = (time.perf_counter() - t0) * 1000
-        try:
-            ctx.cleanup()
-        except Exception:
-            pass
-        sv.close()
+        if ctx is not None:
+            try:
+                ctx.cleanup()
+            except Exception:
+                pass
+        if sv is not None:
+            sv.close()   # reaps the spawned dotnet — kills it if stdin-EOF
+                         # didn't exit it (wedged mid-call)
+        calls = ctx.calls if ctx is not None else 0
+        shots = ctx.screenshots if ctx is not None else 0
+        if ctx is not None and ctx.leftovers:
+            note += " | leftover hwnds: " + ",".join(
+                "0x%X" % h for h in ctx.leftovers)
         results[name] = {
             "status": status, "wallMs": round(wall, 1),
             "launchMs": round(launch_ms, 1) if launch_ms else None,
-            "toolCalls": ctx.calls, "screenshots": ctx.screenshots,
+            "toolCalls": calls, "screenshots": shots,
             "notes": note[:400]}
         print("%-16s %-7s %7dms calls=%d shots=%d %s" %
-              (name, status, round(wall), ctx.calls, ctx.screenshots,
+              (name, status, round(wall), calls, shots,
                note[:120]), flush=True)
         time.sleep(1.0)
 
@@ -284,10 +371,18 @@ def main():
     rep["tasksNote"] = (
         "custom_app uses tests/Inbrisk.TestApp (WPF) as the "
         "'custom-rendered-ish' target — a real game was unavailable. "
-        "explorer.exe and code.exe are ProtectedProcesses in user settings. "
+        "explorer.exe and code.exe are ProtectedProcesses in user settings "
+        "(launch denial → SKIPPED 'policy-protected', not FAIL). "
         "computer_type hangs >30s on this build (observed twice); the "
         "computer_run 'type' step (UIA.ValuePattern) works fine — tasks use "
-        "the run-plan path for typing.")
+        "the run-plan path for typing. edge_cdp runs its server with "
+        "INBRISK_TOOL_PROFILE=full (ambient 'core' profile has no browser_* "
+        "tools). Cleanup is launch-scoped: only hwnds our own computer_launch "
+        "results report (plus new windows owned by the launched pid) get "
+        "WM_CLOSE, then a single non-force computer_close_window — never "
+        "force, never a whole-desktop diff; a dead transport short-circuits "
+        "to wm_close only. Server.close() now guarantees the spawned dotnet "
+        "process is killed and reaped.")
     json.dump(rep, open(OUT, "w"), indent=1)
     print("[bench] merged tasks ->", OUT)
 
