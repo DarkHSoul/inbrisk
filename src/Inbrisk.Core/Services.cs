@@ -234,3 +234,35 @@ public interface ISilentInputService
     /// <summary>Graceful background close — posts WM_CLOSE.</summary>
     SilentInputResult TryClose(long hwnd);
 }
+
+// ----------------------- reflex engine contracts -----------------------
+// Cross-layer event contract for the auto-dismiss reflex path. The
+// platform's modal interceptor produces sightings; the Runtime
+// ReflexEngine consumes them. It lives in Core because Runtime cannot
+// reference the Platform layer where the interceptor's own payload type
+// exists — wiring maps the interceptor's event args onto this shape (a
+// strict superset of what the engine needs), or the interceptor raises it
+// directly.
+
+/// <summary>A modal-window sighting raised by the platform's modal
+/// interceptor on a background event. Pure observation — the engine
+/// re-verifies liveness, modality and ownership before acting.
+/// <paramref name="Detection"/> records which predicate matched, for
+/// telemetry.</summary>
+public sealed record ModalInterrupt(
+    long Hwnd,
+    string? Title,
+    string? ClassName,
+    int Pid,
+    long? OwnerHwnd,
+    DateTimeOffset At = default,
+    string? Detection = null);
+
+/// <summary>Event source for modal sightings — implemented by the
+/// platform's modal interceptor, consumed by ReflexEngine.
+/// Implementations must raise <see cref="ModalDetected"/> on a background
+/// thread and keep the handler cost near zero (the engine only enqueues).</summary>
+public interface IModalInterruptSource
+{
+    event Action<ModalInterrupt>? ModalDetected;
+}
