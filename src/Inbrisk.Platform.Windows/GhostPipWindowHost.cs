@@ -1,0 +1,637 @@
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+using Inbrisk.Platform.Windows.Native;
+
+namespace Inbrisk.Platform.Windows;
+
+/// <summary>
+/// Pure Win32 native Picture-in-Picture (PiP) window host.
+/// Stays topmost on the user's desktop, never steals focus (WS_EX_NOACTIVATE),
+/// and passes clicks through (WS_EX_TRANSPARENT) so games or active applications
+/// are never interrupted.
+/// Supports dynamic click-through toggling, alpha opacity, resizing/repositioning,
+/// and a clean WndProc message loop lifecycle.
+/// </summary>
+public sealed class GhostPipWindowHost : IDisposable
+{
+    private const string WindowClassName = "InbriskGhostPipWindowClass";
+    private const int GwlpUserdata = -21;
+    private const uint WM_ERASEBKGND = 0x0014;
+    private const int SW_HIDE = 0;
+    private const int SW_SHOWNA = 8;
+
+    private const uint WmAppSetClickThrough = NativeMethods.WM_APP + 210;
+    private const uint WmAppSetOpacity = NativeMethods.WM_APP + 211;
+    private const uint WmAppSetPosSize = NativeMethods.WM_APP + 212;
+    private const uint WmAppSetVisible = NativeMethods.WM_APP + 213;
+    private const uint WmAppInvalidate = NativeMethods.WM_APP + 214;
+
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private static readonly object ClassGate = new();
+    private static ushort _classAtom;
+    private static NativeMethods.WndProc? _wndProcDelegate;
+
+    private readonly ManualResetEventSlim _ready = new();
+    private readonly string _title;
+    private Thread? _thread;
+    private uint _threadId;
+    private IntPtr _hwnd = IntPtr.Zero;
+    private GCHandle _hwndHandle;
+
+    private volatile bool _clickThrough;
+    private volatile byte _opacity;
+    private volatile int _x;
+    private volatile int _y;
+    private volatile int _width;
+    private volatile int _height;
+    private volatile bool _visible = true;
+    private volatile bool _disposed;
+
+    /// <summary>
+    /// Raised during WM_PAINT so custom renderers (GDI / DirectX / Capture streams) can paint directly.
+    /// Parameters: HDC, width, height.
+    /// </summary>
+    public event Action<IntPtr, int, int>? Paint;
+
+    /// <summary>
+    /// Raised when the native window handle has been created.
+    /// </summary>
+    public event Action<GhostPipWindowHost>? WindowCreated;
+
+    /// <summary>
+    /// Raised when the native window handle is destroyed.
+    /// </summary>
+    public event Action<GhostPipWindowHost>? WindowDestroyed;
+
+    /// <summary>
+    /// Gets the native Win32 window handle (HWND).
+    /// </summary>
+    public IntPtr Hwnd => _hwnd;
+
+    /// <summary>
+    /// Gets whether the message pump thread is currently running.
+    /// </summary>
+    public bool IsRunning => _thread != null && _thread.IsAlive && _hwnd != IntPtr.Zero;
+
+    /// <summary>
+    /// Gets whether click-through (WS_EX_TRANSPARENT) is currently enabled.
+    /// </summary>
+    public bool ClickThrough => _clickThrough;
+
+    /// <summary>
+    /// Gets the current alpha opacity (0 = transparent, 255 = opaque).
+    /// </summary>
+    public byte Opacity => _opacity;
+
+    /// <summary>
+    /// Gets the current X coordinate.
+    /// </summary>
+    public int X => _x;
+
+    /// <summary>
+    /// Gets the current Y coordinate.
+    /// </summary>
+    public int Y => _y;
+
+    /// <summary>
+    /// Gets the current window width.
+    /// </summary>
+    public int Width => _width;
+
+    /// <summary>
+    /// Gets the current window height.
+    /// </summary>
+    public int Height => _height;
+
+    /// <summary>
+    /// Gets whether the window is currently visible.
+    /// </summary>
+    public bool Visible => _visible;
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="GhostPipWindowHost"/> class.
+    /// </summary>
+    /// <param name="x">Initial X position.</param>
+    /// <param name="y">Initial Y position.</param>
+    /// <param name="width">Initial window width.</param>
+    /// <param name="height">Initial window height.</param>
+    /// <param name="initialOpacity">Initial alpha opacity (0-255).</param>
+    /// <param name="clickThrough">Whether mouse clicks pass through the window.</param>
+    /// <param name="autoStart">Whether to automatically start the message pump thread.</param>
+    /// <param name="title">Window title text.</param>
+    public GhostPipWindowHost(
+        int x = 100,
+        int y = 100,
+        int width = 480,
+        int height = 270,
+        byte initialOpacity = 255,
+        bool clickThrough = true,
+        bool autoStart = true,
+        string title = "Inbrisk Ghost PiP")
+    {
+        _x = x;
+        _y = y;
+        _width = Math.Max(1, width);
+        _height = Math.Max(1, height);
+        _opacity = initialOpacity;
+        _clickThrough = clickThrough;
+        _title = title;
+
+        if (autoStart)
+        {
+            Start();
+        }
+    }
+
+    /// <summary>
+    /// Starts the dedicated STA message pump thread and creates the PiP host window.
+    /// Blocks until the window handle is initialized or timeout expires.
+    /// </summary>
+    /// <param name="timeoutMs">Timeout in milliseconds to wait for window initialization.</param>
+    public bool Start(int timeoutMs = 5000)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(GhostPipWindowHost));
+        if (_thread != null && _thread.IsAlive) return true;
+
+        _ready.Reset();
+        _thread = new Thread(Pump)
+        {
+            IsBackground = true,
+            Name = "InbriskGhostPipWindow"
+        };
+        _thread.SetApartmentState(ApartmentState.STA);
+        _thread.Start();
+
+        return _ready.Wait(timeoutMs);
+    }
+
+    /// <summary>
+    /// Blocks until the message pump thread has completed initialization.
+    /// </summary>
+    public bool WaitForReady(int timeoutMs = 5000) => _ready.Wait(timeoutMs);
+
+    /// <summary>
+    /// Dynamically enables or disables click-through behavior (WS_EX_TRANSPARENT).
+    /// When enabled, mouse clicks pass directly through to whatever window is beneath.
+    /// When disabled, mouse clicks are received by this PiP window (interactive mode).
+    /// </summary>
+    public void SetClickThrough(bool enabled)
+    {
+        _clickThrough = enabled;
+        if (_threadId != 0 && Thread.CurrentThread.ManagedThreadId != _thread?.ManagedThreadId)
+        {
+            NativeMethods.PostThreadMessageW(_threadId, WmAppSetClickThrough, enabled ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero);
+        }
+        else
+        {
+            ApplyClickThrough(enabled);
+        }
+    }
+
+    /// <summary>
+    /// Sets the window opacity (0 = completely transparent, 255 = completely opaque).
+    /// </summary>
+    public void SetOpacity(byte alpha)
+    {
+        _opacity = alpha;
+        if (_threadId != 0 && Thread.CurrentThread.ManagedThreadId != _thread?.ManagedThreadId)
+        {
+            NativeMethods.PostThreadMessageW(_threadId, WmAppSetOpacity, new IntPtr(alpha), IntPtr.Zero);
+        }
+        else
+        {
+            ApplyOpacity(alpha);
+        }
+    }
+
+    /// <summary>
+    /// Updates the window position and size on the desktop.
+    /// </summary>
+    public void SetPositionAndSize(int x, int y, int width, int height)
+    {
+        _x = x;
+        _y = y;
+        _width = Math.Max(1, width);
+        _height = Math.Max(1, height);
+
+        if (_threadId != 0 && Thread.CurrentThread.ManagedThreadId != _thread?.ManagedThreadId)
+        {
+            NativeMethods.PostThreadMessageW(_threadId, WmAppSetPosSize, IntPtr.Zero, IntPtr.Zero);
+        }
+        else
+        {
+            ApplyPositionAndSize(_x, _y, _width, _height);
+        }
+    }
+
+    /// <summary>
+    /// Shows or hides the PiP window without taking focus.
+    /// </summary>
+    public void SetVisible(bool visible)
+    {
+        _visible = visible;
+        if (_threadId != 0 && Thread.CurrentThread.ManagedThreadId != _thread?.ManagedThreadId)
+        {
+            NativeMethods.PostThreadMessageW(_threadId, WmAppSetVisible, visible ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero);
+        }
+        else
+        {
+            ApplyVisibility(visible);
+        }
+    }
+
+    /// <summary>
+    /// Forces the window client area to be invalidated and repainted.
+    /// </summary>
+    public void Invalidate(bool erase = false)
+    {
+        if (_threadId != 0 && Thread.CurrentThread.ManagedThreadId != _thread?.ManagedThreadId)
+        {
+            NativeMethods.PostThreadMessageW(_threadId, WmAppInvalidate, erase ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero);
+        }
+        else if (_hwnd != IntPtr.Zero)
+        {
+            NativeMethods.InvalidateRect(_hwnd, IntPtr.Zero, erase);
+        }
+    }
+
+    /// <summary>
+    /// Configures screen capture exclusion (WDA_EXCLUDEFROMCAPTURE) so screen recorders
+    /// or Inbrisk's own desktop vision can omit this PiP overlay.
+    /// </summary>
+    public void SetExcludeFromCapture(bool exclude)
+    {
+        if (_hwnd != IntPtr.Zero)
+        {
+            uint affinity = exclude ? NativeMethods.WDA_EXCLUDEFROMCAPTURE : NativeMethods.WDA_NONE;
+            NativeMethods.SetWindowDisplayAffinity(_hwnd, affinity);
+        }
+    }
+
+    private void Pump()
+    {
+        try
+        {
+            PumpCore();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[GhostPipWindowHost] Pump crashed: {ex}");
+        }
+        finally
+        {
+            _ready.Set();
+        }
+    }
+
+    private void PumpCore()
+    {
+        DesktopBridge.TrySwitchCurrentThread();
+        _threadId = NativeMethods.GetCurrentThreadId();
+
+        // PMv2 DPI awareness is required so coordinates match physical screen pixels
+        NativeMethods.SetProcessDpiAwarenessContext(
+            NativeMethods.DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        try
+        {
+            EnsureClassRegistered();
+            CreatePipWindow();
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[GhostPipWindowHost] Window initialization fault: {ex}");
+        }
+        finally
+        {
+            _ready.Set();
+        }
+
+        while (NativeMethods.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
+        {
+            try
+            {
+                if (msg.Message == WmAppSetClickThrough)
+                {
+                    ApplyClickThrough(msg.WParam != IntPtr.Zero);
+                }
+                else if (msg.Message == WmAppSetOpacity)
+                {
+                    ApplyOpacity((byte)(msg.WParam.ToInt64() & 0xFF));
+                }
+                else if (msg.Message == WmAppSetPosSize)
+                {
+                    ApplyPositionAndSize(_x, _y, _width, _height);
+                }
+                else if (msg.Message == WmAppSetVisible)
+                {
+                    ApplyVisibility(msg.WParam != IntPtr.Zero);
+                }
+                else if (msg.Message == WmAppInvalidate)
+                {
+                    if (_hwnd != IntPtr.Zero)
+                    {
+                        NativeMethods.InvalidateRect(_hwnd, IntPtr.Zero, msg.WParam != IntPtr.Zero);
+                    }
+                }
+
+                NativeMethods.TranslateMessage(ref msg);
+                NativeMethods.DispatchMessageW(ref msg);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[GhostPipWindowHost] Message pump exception: {ex}");
+            }
+        }
+
+        Teardown();
+    }
+
+    private static void EnsureClassRegistered()
+    {
+        lock (ClassGate)
+        {
+            if (_classAtom != 0) return;
+
+            _wndProcDelegate = StaticWndProc;
+            var wcx = new NativeMethods.WNDCLASSEXW
+            {
+                CbSize = (uint)Marshal.SizeOf<NativeMethods.WNDCLASSEXW>(),
+                Style = 0,
+                LpfnWndProc = Marshal.GetFunctionPointerForDelegate(_wndProcDelegate),
+                CbClsExtra = 0,
+                CbWndExtra = 0,
+                HInstance = NativeMethods.GetModuleHandleW(null),
+                HIcon = IntPtr.Zero,
+                HCursor = NativeMethods.LoadCursorW(IntPtr.Zero, NativeMethods.IDC_ARROW),
+                HbrBackground = IntPtr.Zero,
+                LpszMenuName = null,
+                LpszClassName = WindowClassName,
+                HIconSm = IntPtr.Zero
+            };
+
+            _classAtom = NativeMethods.RegisterClassExW(ref wcx);
+            if (_classAtom == 0)
+            {
+                int err = Marshal.GetLastWin32Error();
+                Debug.WriteLine($"[GhostPipWindowHost] RegisterClassExW returned 0, error={err}");
+            }
+        }
+    }
+
+    private void CreatePipWindow()
+    {
+        _hwndHandle = GCHandle.Alloc(this);
+
+        // Core requirement styles:
+        // WS_POPUP | WS_VISIBLE
+        // WS_EX_TOPMOST (0x08)
+        // WS_EX_NOACTIVATE (0x08000000) -> Never steals focus from active game or app
+        // WS_EX_TRANSPARENT (0x20) -> Click-through passed to window underneath
+        // WS_EX_TOOLWINDOW (0x80) -> Excluded from taskbar & Alt+Tab
+        // WS_EX_LAYERED (0x80000) -> Supports opacity & alpha blending
+        uint dwStyle = NativeMethods.WS_POPUP | NativeMethods.WS_VISIBLE;
+        uint dwExStyle = (uint)(NativeMethods.WS_EX_TOPMOST |
+                                NativeMethods.WS_EX_NOACTIVATE |
+                                NativeMethods.WS_EX_TOOLWINDOW |
+                                NativeMethods.WS_EX_LAYERED);
+
+        if (_clickThrough)
+        {
+            dwExStyle |= (uint)NativeMethods.WS_EX_TRANSPARENT;
+        }
+
+        _hwnd = NativeMethods.CreateWindowExW(
+            dwExStyle,
+            WindowClassName,
+            _title,
+            dwStyle,
+            _x,
+            _y,
+            _width,
+            _height,
+            IntPtr.Zero,
+            IntPtr.Zero,
+            NativeMethods.GetModuleHandleW(null),
+            IntPtr.Zero);
+
+        if (_hwnd != IntPtr.Zero)
+        {
+            NativeMethods.SetWindowLongPtr(_hwnd, GwlpUserdata, GCHandle.ToIntPtr(_hwndHandle));
+
+            // Apply layered attributes (alpha)
+            NativeMethods.SetLayeredWindowAttributes(_hwnd, 0, _opacity, NativeMethods.LWA_ALPHA);
+
+            // Position as topmost without activation
+            uint swpFlags = NativeMethods.SWP_NOACTIVATE;
+            if (_visible)
+            {
+                swpFlags |= NativeMethods.SWP_SHOWWINDOW;
+            }
+
+            NativeMethods.SetWindowPos(_hwnd, HwndTopmost, _x, _y, _width, _height, swpFlags);
+
+            // Default: Exclude from vision captures to prevent AI feedback loops
+            NativeMethods.SetWindowDisplayAffinity(_hwnd, NativeMethods.WDA_EXCLUDEFROMCAPTURE);
+
+            WindowCreated?.Invoke(this);
+        }
+        else
+        {
+            int err = Marshal.GetLastWin32Error();
+            Debug.WriteLine($"[GhostPipWindowHost] CreateWindowExW failed, error={err}");
+        }
+    }
+
+    private void ApplyClickThrough(bool enabled)
+    {
+        _clickThrough = enabled;
+        if (_hwnd == IntPtr.Zero) return;
+
+        var curExStyle = NativeMethods.GetWindowLongPtr(_hwnd, NativeMethods.GWL_EXSTYLE).ToInt64();
+        long newExStyle = curExStyle;
+        if (enabled)
+        {
+            newExStyle |= NativeMethods.WS_EX_TRANSPARENT;
+        }
+        else
+        {
+            newExStyle &= ~NativeMethods.WS_EX_TRANSPARENT;
+        }
+
+        if (newExStyle != curExStyle)
+        {
+            NativeMethods.SetWindowLongPtr(_hwnd, NativeMethods.GWL_EXSTYLE, new IntPtr(newExStyle));
+            NativeMethods.SetWindowPos(
+                _hwnd,
+                HwndTopmost,
+                0, 0, 0, 0,
+                NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_FRAMECHANGED);
+        }
+    }
+
+    private void ApplyOpacity(byte alpha)
+    {
+        _opacity = alpha;
+        if (_hwnd != IntPtr.Zero)
+        {
+            NativeMethods.SetLayeredWindowAttributes(_hwnd, 0, alpha, NativeMethods.LWA_ALPHA);
+        }
+    }
+
+    private void ApplyPositionAndSize(int x, int y, int width, int height)
+    {
+        _x = x;
+        _y = y;
+        _width = Math.Max(1, width);
+        _height = Math.Max(1, height);
+
+        if (_hwnd != IntPtr.Zero)
+        {
+            uint flags = NativeMethods.SWP_NOACTIVATE;
+            if (_visible)
+            {
+                flags |= NativeMethods.SWP_SHOWWINDOW;
+            }
+
+            NativeMethods.SetWindowPos(
+                _hwnd,
+                HwndTopmost,
+                _x, _y, _width, _height,
+                flags);
+        }
+    }
+
+    private void ApplyVisibility(bool visible)
+    {
+        _visible = visible;
+        if (_hwnd == IntPtr.Zero) return;
+
+        if (visible)
+        {
+            NativeMethods.ShowWindow(_hwnd, SW_SHOWNA);
+            NativeMethods.SetWindowPos(
+                _hwnd,
+                HwndTopmost,
+                0, 0, 0, 0,
+                NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW);
+        }
+        else
+        {
+            NativeMethods.ShowWindow(_hwnd, SW_HIDE);
+        }
+    }
+
+    private IntPtr InstanceWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        switch (msg)
+        {
+            case NativeMethods.WM_NCHITTEST:
+                // Double-guard: When click-through is enabled, inform Windows to pass hit tests through
+                if (_clickThrough)
+                {
+                    return new IntPtr(NativeMethods.HTTRANSPARENT);
+                }
+                break;
+
+            case NativeMethods.WM_PAINT:
+                var ps = new NativeMethods.PAINTSTRUCT();
+                var hdc = NativeMethods.BeginPaint(hWnd, out ps);
+                try
+                {
+                    if (Paint != null)
+                    {
+                        Paint.Invoke(hdc, _width, _height);
+                    }
+                    else
+                    {
+                        // Default background fill: clean modern dark canvas (#18181B)
+                        var rect = ps.RcPaint;
+                        if (rect.Right > 0 && rect.Bottom > 0)
+                        {
+                            var brush = NativeMethods.CreateSolidBrush(0x001B1818); // BGR format
+                            try
+                            {
+                                NativeMethods.FillRect(hdc, ref rect, brush);
+                            }
+                            finally
+                            {
+                                NativeMethods.DeleteObject(brush);
+                            }
+                        }
+                    }
+                }
+                finally
+                {
+                    NativeMethods.EndPaint(hWnd, ref ps);
+                }
+                return IntPtr.Zero;
+
+            case WM_ERASEBKGND:
+                return new IntPtr(1);
+
+            case NativeMethods.WM_DESTROY:
+                WindowDestroyed?.Invoke(this);
+                return IntPtr.Zero;
+        }
+
+        return NativeMethods.DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+
+    private static IntPtr StaticWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
+    {
+        var ptr = NativeMethods.GetWindowLongPtr(hWnd, GwlpUserdata);
+        if (ptr != IntPtr.Zero)
+        {
+            try
+            {
+                var handle = GCHandle.FromIntPtr(ptr);
+                if (handle.IsAllocated && handle.Target is GhostPipWindowHost host)
+                {
+                    return host.InstanceWndProc(hWnd, msg, wParam, lParam);
+                }
+            }
+            catch (InvalidOperationException)
+            {
+                // Handle freed during teardown
+            }
+        }
+
+        return NativeMethods.DefWindowProcW(hWnd, msg, wParam, lParam);
+    }
+
+    private void Teardown()
+    {
+        if (_hwnd != IntPtr.Zero)
+        {
+            NativeMethods.SetWindowLongPtr(_hwnd, GwlpUserdata, IntPtr.Zero);
+            NativeMethods.DestroyWindow(_hwnd);
+            _hwnd = IntPtr.Zero;
+        }
+
+        if (_hwndHandle.IsAllocated)
+        {
+            _hwndHandle.Free();
+        }
+    }
+
+    /// <summary>
+    /// Gracefully tears down the native window and message pump thread.
+    /// </summary>
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        if (_threadId != 0)
+        {
+            NativeMethods.PostThreadMessageW(_threadId, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+            _thread?.Join(2000);
+            _threadId = 0;
+        }
+
+        _ready.Dispose();
+    }
+}
