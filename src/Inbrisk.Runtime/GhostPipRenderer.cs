@@ -241,8 +241,22 @@ public sealed class GhostPipRenderer : IDisposable
     /// <summary>Height of the top drag handle bar in pixels when interactive.</summary>
     public const int HeaderHeight = 26;
 
+    private volatile bool _isInteractive = false;
+
     /// <summary>Gets or sets whether interactive mode is active (draws drag header bar).</summary>
-    public volatile bool IsInteractive = false;
+    public bool IsInteractive
+    {
+        get => _isInteractive;
+        set
+        {
+            if (_isInteractive != value)
+            {
+                _isInteractive = value;
+                _lastFrameIndex = -1;
+                DrawStandbyFrame();
+            }
+        }
+    }
 
     /// <summary>Total number of frames successfully presented to the PiP window.</summary>
     public long TotalRenderedFrames => Volatile.Read(ref _totalRenderedFrames);
@@ -475,9 +489,15 @@ public sealed class GhostPipRenderer : IDisposable
 
                 EnsureSharedMemoryConnected();
 
+                bool frameRendered = false;
                 if (_mappedView != IntPtr.Zero)
                 {
-                    TryRenderFrameFromSharedMemory();
+                    frameRendered = TryRenderFrameFromSharedMemory();
+                }
+
+                if (!frameRendered && _totalRenderedFrames == 0)
+                {
+                    DrawStandbyFrame();
                 }
             }
             catch (ThreadInterruptedException)
@@ -855,6 +875,66 @@ public sealed class GhostPipRenderer : IDisposable
         if (_hFrameEvent == IntPtr.Zero && eventName == DefaultEventName)
         {
             _hFrameEvent = Native.OpenEventW(SYNCHRONIZE, false, FallbackEventName);
+        }
+    }
+
+    private void DrawStandbyFrame()
+    {
+        if (_targetHwnd == IntPtr.Zero || !Native.IsWindow(_targetHwnd)) return;
+
+        if (!Native.GetClientRect(_targetHwnd, out var rc)) return;
+        int destWidth = rc.Right - rc.Left;
+        int destHeight = rc.Bottom - rc.Top;
+        if (destWidth <= 2 || destHeight <= 2) return;
+
+        IntPtr hdcWin = Native.GetDC(_targetHwnd);
+        if (hdcWin == IntPtr.Zero) return;
+
+        try
+        {
+            EnsureOffscreenBuffer(hdcWin, destWidth, destHeight);
+
+            // Clean dark acrylic background (#13131A)
+            RECT rcFull = new RECT { Left = 0, Top = 0, Right = destWidth, Bottom = destHeight };
+            IntPtr hBgBrush = Native.CreateSolidBrush(RGB(19, 19, 26));
+            Native.FillRect(_cachedHdcMem, ref rcFull, hBgBrush);
+            Native.DeleteObject(hBgBrush);
+
+            int headerOffset = IsInteractive ? HeaderHeight : 0;
+
+            // Draw center graphic / standby text
+            IntPtr hFontTitle = Native.CreateFontW(14, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
+            IntPtr hFontSub = Native.CreateFontW(11, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI");
+            IntPtr hOldFont = Native.SelectObject(_cachedHdcMem, hFontTitle);
+            Native.SetBkMode(_cachedHdcMem, 1); // TRANSPARENT
+
+            int centerY = headerOffset + (destHeight - headerOffset) / 2;
+
+            // Title
+            Native.SetTextColor(_cachedHdcMem, RGB(6, 182, 212)); // Cyan
+            string title = "INBRISK GHOST OS";
+            Native.TextOutW(_cachedHdcMem, Math.Max(12, (destWidth - title.Length * 8) / 2), Math.Max(headerOffset + 10, centerY - 24), title, title.Length);
+
+            // Subtitle
+            Native.SelectObject(_cachedHdcMem, hFontSub);
+            Native.SetTextColor(_cachedHdcMem, RGB(148, 163, 184)); // Slate 400
+            string sub = "Masaustu goruntusu baslatiliyor...";
+            Native.TextOutW(_cachedHdcMem, Math.Max(10, (destWidth - sub.Length * 6) / 2), Math.Max(headerOffset + 32, centerY + 2), sub, sub.Length);
+
+            Native.SelectObject(_cachedHdcMem, hOldFont);
+            Native.DeleteObject(hFontTitle);
+            Native.DeleteObject(hFontSub);
+
+            // Modern UI Overlay (Header + Border)
+            DrawModernUiOverlay(_cachedHdcMem, destWidth, destHeight);
+
+            // Blit to window
+            Native.BitBlt(hdcWin, 0, 0, destWidth, destHeight, _cachedHdcMem, 0, 0, SRCCOPY);
+        }
+        catch { }
+        finally
+        {
+            Native.ReleaseDC(_targetHwnd, hdcWin);
         }
     }
 

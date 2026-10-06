@@ -599,6 +599,7 @@ public static class GhostControlCommand
         GhostTrayApp? trayApp = null;
         GhostKeyboardForwarder? keyboardForwarder = null;
         GhostIpcServer? controlServer = null;
+        GhostWorkerDaemon? localWorker = null;
 
         try
         {
@@ -673,6 +674,25 @@ public static class GhostControlCommand
             pipManager.StartPip(pipConfig);
 
             LogSuccess($"Ghost PiP window started ({pipManager.Width}x{pipManager.Height} at {pipManager.CurrentPosition}, HWND: 0x{pipManager.WindowHandle:X8})", options);
+
+            // 2b. Start desktop capture producer so PiP receives real-time screen frames!
+            if (sessionManager == null)
+            {
+                try
+                {
+                    localWorker = new GhostWorkerDaemon(new GhostWorkerDaemonConfig
+                    {
+                        TargetFps = options.TargetFps,
+                        AutoStartCapture = true
+                    });
+                    await localWorker.StartAsync(linkedCts.Token).ConfigureAwait(false);
+                    LogSuccess("Desktop screen capture engine active. Streaming to PiP overlay.", options);
+                }
+                catch (Exception ex)
+                {
+                    LogWarning($"Could not start screen capture engine: {ex.Message}", options);
+                }
+            }
 
             // 3. Initialize Full-Screen Expander (Shadow Mode)
             expander = new GhostPipExpander(pipManager.Renderer);
@@ -770,6 +790,16 @@ public static class GhostControlCommand
             if (pipManager != null)
             {
                 try { pipManager.Dispose(); } catch { }
+            }
+
+            if (localWorker != null)
+            {
+                try
+                {
+                    await localWorker.StopAsync().ConfigureAwait(false);
+                    localWorker.Dispose();
+                }
+                catch { }
             }
 
             if (sessionManager != null)
