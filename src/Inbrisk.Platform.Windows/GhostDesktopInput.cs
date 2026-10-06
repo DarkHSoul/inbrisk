@@ -314,6 +314,9 @@ public sealed class GhostDesktopInput : IDisposable
 
         [DllImport("user32.dll")]
         public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern short VkKeyScanW(char ch);
     }
 
     #endregion
@@ -878,7 +881,8 @@ public sealed class GhostDesktopInput : IDisposable
     public void SendKeyUp(KeyCode key) => SendKeyUp(ToVirtualKey(key));
 
     /// <summary>
-    /// Types Unicode text into the target window on the ghost desktop via <c>WM_CHAR</c>.
+    /// Types Unicode text into the target window on the ghost desktop via <c>WM_CHAR</c>
+    /// or <c>WM_KEYDOWN</c>/<c>WM_KEYUP</c> pairs for console windows (<c>ConsoleWindowClass</c>).
     /// Properly converts newlines and tabs to their respective virtual key events.
     /// </summary>
     /// <param name="text">Text string to type.</param>
@@ -890,6 +894,8 @@ public sealed class GhostDesktopInput : IDisposable
         {
             IntPtr targetHwnd = FindKeyboardTarget();
             if (targetHwnd == IntPtr.Zero || targetHwnd == Win32.GetDesktopWindow()) return;
+
+            bool isConsole = IsConsoleWindowClass(targetHwnd);
 
             for (int i = 0; i < text.Length; i++)
             {
@@ -908,11 +914,80 @@ public sealed class GhostDesktopInput : IDisposable
                     continue;
                 }
 
-                uint scanCode = Win32.MapVirtualKeyW((uint)c, MAPVK_VK_TO_VSC);
-                uint lParam = 1 | (scanCode << 16);
-                Win32.PostMessageW(targetHwnd, WM_CHAR, (IntPtr)c, (IntPtr)lParam);
+                if (isConsole)
+                {
+                    SendConsoleChar(targetHwnd, c);
+                }
+                else
+                {
+                    uint scanCode = Win32.MapVirtualKeyW((uint)c, MAPVK_VK_TO_VSC);
+                    uint lParam = 1 | (scanCode << 16);
+                    Win32.PostMessageW(targetHwnd, WM_CHAR, (IntPtr)c, (IntPtr)lParam);
+                }
             }
         });
+    }
+
+    /// <summary>
+    /// Checks whether the specified window or its root belongs to the Windows Console Host (<c>ConsoleWindowClass</c>).
+    /// </summary>
+    public static bool IsConsoleWindowClass(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero) return false;
+        var sb = new StringBuilder(64);
+        Win32.GetClassNameW(hwnd, sb, 64);
+        if (string.Equals(sb.ToString(), "ConsoleWindowClass", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        IntPtr root = Win32.GetAncestor(hwnd, 2 /* GA_ROOT */);
+        if (root != IntPtr.Zero && root != hwnd)
+        {
+            sb.Clear();
+            Win32.GetClassNameW(root, sb, 64);
+            return string.Equals(sb.ToString(), "ConsoleWindowClass", StringComparison.OrdinalIgnoreCase);
+        }
+        return false;
+    }
+
+    private static void SendConsoleChar(IntPtr hwnd, char c)
+    {
+        short res = Win32.VkKeyScanW(c);
+        if (res == -1)
+        {
+            uint scanCode = Win32.MapVirtualKeyW((uint)c, MAPVK_VK_TO_VSC);
+            uint lParam = 1 | (scanCode << 16);
+            Win32.PostMessageW(hwnd, WM_CHAR, (IntPtr)c, (IntPtr)lParam);
+            return;
+        }
+
+        byte vk = (byte)(res & 0xFF);
+        byte shiftState = (byte)((res >> 8) & 0xFF);
+        bool shift = (shiftState & 1) != 0;
+        bool ctrl = (shiftState & 2) != 0;
+        bool alt = (shiftState & 4) != 0;
+
+        uint shiftSc = Win32.MapVirtualKeyW((uint)VirtualKey.Shift, MAPVK_VK_TO_VSC);
+        uint ctrlSc = Win32.MapVirtualKeyW((uint)VirtualKey.Control, MAPVK_VK_TO_VSC);
+        uint altSc = Win32.MapVirtualKeyW((uint)VirtualKey.Alt, MAPVK_VK_TO_VSC);
+
+        if (shift) Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)VirtualKey.Shift, (IntPtr)(1 | (shiftSc << 16)));
+        if (ctrl) Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)VirtualKey.Control, (IntPtr)(1 | (ctrlSc << 16)));
+        if (alt) Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)VirtualKey.Alt, (IntPtr)(1 | (altSc << 16)));
+
+        uint sc = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        uint downLParam = 1 | (sc << 16);
+        if (IsExtendedKey(vk)) downLParam |= (1u << 24);
+        Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)vk, (IntPtr)downLParam);
+
+        Thread.Sleep(5);
+
+        uint upLParam = 1 | (sc << 16) | (1u << 30) | (1u << 31);
+        if (IsExtendedKey(vk)) upLParam |= (1u << 24);
+        Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)vk, (IntPtr)upLParam);
+
+        if (alt) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Alt, (IntPtr)(1 | (altSc << 16) | (1u << 30) | (1u << 31)));
+        if (ctrl) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Control, (IntPtr)(1 | (ctrlSc << 16) | (1u << 30) | (1u << 31)));
+        if (shift) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Shift, (IntPtr)(1 | (shiftSc << 16) | (1u << 30) | (1u << 31)));
     }
 
     private static void SendKeyPressCore(IntPtr hwnd, VirtualKey key)

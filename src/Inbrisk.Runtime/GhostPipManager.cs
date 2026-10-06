@@ -399,8 +399,8 @@ public class GhostPipManager : IDisposable
                     {
                         _currentX = newX;
                         _currentY = newY;
-                        _currentWidth = _windowHost.Width > 0 ? _windowHost.Width : _currentWidth;
-                        _currentHeight = _windowHost.Height > 0 ? _windowHost.Height : _currentHeight;
+                        _currentWidth = (_windowHost != null && _windowHost.Width > 0) ? _windowHost.Width : _currentWidth;
+                        _currentHeight = (_windowHost != null && _windowHost.Height > 0) ? _windowHost.Height : _currentHeight;
                         _currentPosition = PipPresetPosition.Custom;
                     }
                 };

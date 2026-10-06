@@ -693,13 +693,36 @@ public static class GhostControlCommand
                 }
             }
 
-            // 4. Start lightweight initial app or terminal on the ghost desktop so it is immediately live and visible in PiP
+            // 4. Start lightweight initial app or terminal on the ghost desktop if none exists
             if (localDesktop != null && localDesktop.IsCreated)
             {
                 try
                 {
-                    var initialProc = localDesktop.StartProcess("cmd.exe", "/k title Inbrisk Ghost Desktop && echo Inbrisk Ghost OS Desktop Active.");
-                    LogSuccess($"Started initial terminal on Ghost Desktop (PID: {initialProc.Id}).", options);
+                    var (hasActiveApp, consolePids) = GhostDesktopNative.InspectActiveDesktopWindows(localDesktop.DesktopHandle);
+
+                    // If multiple duplicate console windows accumulated, clean up all but the most recent one
+                    if (consolePids.Count > 1)
+                    {
+                        for (int i = 0; i < consolePids.Count - 1; i++)
+                        {
+                            try
+                            {
+                                var p = Process.GetProcessById(consolePids[i]);
+                                p.Kill(entireProcessTree: true);
+                            }
+                            catch { }
+                        }
+                    }
+
+                    if (!hasActiveApp)
+                    {
+                        var initialProc = localDesktop.StartProcess("cmd.exe", "/k title Inbrisk Ghost Desktop && echo Inbrisk Ghost OS Desktop Active.");
+                        LogSuccess($"Started initial terminal on Ghost Desktop (PID: {initialProc.Id}).", options);
+                    }
+                    else
+                    {
+                        LogSuccess("Active terminal or application already running on Ghost Desktop. Reusing existing session canvas.", options);
+                    }
                 }
                 catch (Exception ex)
                 {

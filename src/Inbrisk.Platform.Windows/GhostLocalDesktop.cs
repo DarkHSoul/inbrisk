@@ -155,6 +155,9 @@ public static class GhostDesktopNative
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
     #endregion
 
     #region High-Level Native Wrappers
@@ -316,6 +319,46 @@ public static class GhostDesktopNative
 
         bool visible = IsWindowVisible(hWnd);
         return (titleSb.ToString(), classSb.ToString(), visible);
+    }
+
+    /// <summary>
+    /// Inspects windows on the target desktop to determine if an active application or terminal already exists,
+    /// and collects process IDs of any console windows.
+    /// </summary>
+    public static (bool HasActiveApp, List<int> ConsolePids) InspectActiveDesktopWindows(IntPtr hDesktop)
+    {
+        bool hasActiveApp = false;
+        var consolePids = new List<int>();
+        var windows = EnumerateWindows(hDesktop);
+
+        foreach (var hWnd in windows)
+        {
+            if (hWnd == IntPtr.Zero || !IsWindowVisible(hWnd)) continue;
+
+            var (_, className, _) = GetWindowDetails(hWnd);
+            if (string.Equals(className, "ConsoleWindowClass", StringComparison.OrdinalIgnoreCase))
+            {
+                hasActiveApp = true;
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (pid > 0 && !consolePids.Contains((int)pid))
+                {
+                    consolePids.Add((int)pid);
+                }
+            }
+            else if (!string.IsNullOrEmpty(className) &&
+                     !string.Equals(className, "Progman", StringComparison.OrdinalIgnoreCase) &&
+                     !string.Equals(className, "WorkerW", StringComparison.OrdinalIgnoreCase) &&
+                     !string.Equals(className, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) &&
+                     !string.Equals(className, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) &&
+                     !string.Equals(className, "tooltips_class32", StringComparison.OrdinalIgnoreCase) &&
+                     !string.Equals(className, "MSCTFIME UI", StringComparison.OrdinalIgnoreCase) &&
+                     !string.Equals(className, "Default IME", StringComparison.OrdinalIgnoreCase))
+            {
+                hasActiveApp = true;
+            }
+        }
+
+        return (hasActiveApp, consolePids);
     }
 
     #endregion
