@@ -113,3 +113,55 @@ computer_hotkey {modifiers:["alt"],key:"F4"}→ ConfirmationDenied (local consen
 
 Any result `{"error":"EmergencyStopped"}` → control is halted machine-wide.
 Only the local user resumes (Ctrl+Alt+Shift+Pause). Stop and inform them.
+
+## Silent (no-focus) input
+
+`silent:true` sends background WM messages to the target window — no focus
+theft. Unsupported kinds return `NotSupported` (never a SendInput fallback).
+
+```json
+computer_batch {"steps":[
+  {"do":"type","v":"text","role":"Edit","silent":true},
+  {"do":"hotkey","keys":"ctrl+s","silent":true}
+]}
+```
+
+Also on single tools: `computer_click {target:{name:"OK"}, silent:true}`.
+In `computer_run` steps: `{"action":"type","text":"x","silent":true}`.
+
+## OCR text targeting (UIA-less windows)
+
+```
+computer_observe {hwnd:"0x…", ocr:true}     → word list: "PLAY" "OPTIONS" …
+computer_click   {target:{ocrText:"PLAY"}}  → hits ocr:<hwnd>:<idx>
+computer_type    {target:{ocrText:"Username"}, ocr:true, text:"ahmet"}
+```
+
+OCR hits become `ocr:<hwnd>:<idx>` elementIds — use them like UIA ids.
+For windows with no UIA tree (games, canvas-drawn apps) this is the only
+semantic targeting available.
+
+## Auto-save a run as a recipe
+
+```
+computer_run {save_as_recipe:"save-notepad", steps:[…]}
+  → on success the run is saved as recipe "save-notepad";
+    dynamic values (urls/paths/typed text) become {{param}}
+computer_run_recipe {name:"save-notepad", params:{filename:"b.txt"}}
+```
+
+`save_as_recipe` also works on `computer_batch` and `computer_do`.
+
+## Session cleanup
+
+```
+computer_cleanup {}  → reaps processes this session spawned
+  (PID-reuse guarded; protected processes are skipped, not killed)
+```
+
+## Blender bridge
+
+```
+computer_adapter {adapter:"blender", action:"auto_install"}  → one-time install
+computer_launch  {app:"blender"}   → auto-injects the --python bridge
+```

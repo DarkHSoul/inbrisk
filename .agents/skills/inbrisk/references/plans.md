@@ -44,6 +44,19 @@ notepad/calculator/explorer/taskmgr/mspaint — e.g. `map:notepad.document`,
 `map:calculator.equals`. Explicit target fields override map defaults;
 entries may be `verify`-flagged, so fall back to observe if one misses.
 
+## Silent steps & `map:` in waits
+
+- Per-step `silent:true` on `click`/`type`/`invoke`/`key`/`hotkey` (and
+  `silent` on `computer_batch` steps) uses background WM messages — no
+  focus theft. Unsupported kinds return `NotSupported`, never a SendInput
+  fallback; all safety gates still apply.
+- `map:` selectors also work inside `wait_for`/`wait_for_gone` queries:
+  `{"action":"wait_for","query":{"map":"notepad.status"},"ms":5000}`.
+- `save_as_recipe:"name"` on `computer_run` (also `computer_batch`/
+  `computer_do`) auto-saves a successful run; dynamic values
+  (urls/paths/typed text) become `{{param}}` — replay via
+  `computer_run_recipe{name, params:{…}}`.
+
 ## Conditional skips
 
 `ifExists`/`ifNotExists`/`ifEnabled`/`ifValue` skip a step without failing —

@@ -112,6 +112,31 @@ Batch steps are compact — `do`/`t`/`v`/`role`/`keys` — NOT
   `EmergencyStopped` (all control halted — only the local user can resume
   with `Ctrl+Alt+Shift+Pause`; **stop working and tell the user**).
 
+## Silent execution, OCR, recipes & session hygiene (new wave)
+
+- **`silent:true`** on `computer_click`/`computer_type`/`computer_invoke`/
+  `computer_key`/`computer_hotkey` (and `silent` on `computer_run`/
+  `computer_batch` steps) drives input via background WM messages — no
+  focus theft, works on unfocused windows. Kinds that can't go silent
+  return `NotSupported` — it **never** silently falls back to SendInput.
+  All safety gates still apply to silent input.
+- **OCR text targeting** for UIA-less windows (games, canvas/custom-drawn
+  apps): `target:{ocrText:"X"}` or `ocr:true` on `computer_find`/
+  `computer_click`/`computer_type`. OCR hits become `ocr:<hwnd>:<idx>`
+  elementIds you can act on like UIA ids. `computer_observe{ocr:true}`
+  prints the word list for a window.
+- **`map:` in waits** — `wait_for`/`wait_for_gone` queries accept `map:`
+  selectors too, not just action targets.
+- **Auto-save recipes**: `save_as_recipe:"name"` on `computer_run`/
+  `computer_batch`/`computer_do` persists a successful run as a reusable
+  recipe — dynamic values (urls/paths/typed text) become `{{param}}`.
+  Replay via `computer_run_recipe{name, params:{…}}`.
+- **`computer_cleanup`** reaps processes this session spawned — PID-reuse
+  guarded, protected processes skipped (never force-killed).
+- **Blender bridge**: `computer_adapter{adapter:"blender",
+  action:"auto_install"}` is a one-time install; launching Blender
+  afterwards auto-injects the `--python` bridge.
+
 ## Safety rules (enforced server-side — don't fight them)
 
 - `computer_close_window`/`computer_app_shutdown` refuse to touch the AI
