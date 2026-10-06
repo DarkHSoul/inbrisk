@@ -3327,6 +3327,10 @@ public sealed class InbriskTools
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
         [Description("on success, generalize the executed steps and persist as task-recipes/<name>.json — replay later via computer_run_recipe")] string? saveAsRecipe = null,
         [Description("snake_case alias of saveAsRecipe")] string? save_as_recipe = null,
+        [Description("intercept unexpected modal dialogs between steps via the reflex engine (default true)")] bool? enableReflex = null,
+        [Description("snake_case alias of enableReflex")] bool? enable_reflex = null,
+        [Description("auto-dismiss policy for save-confirmation modals: off|save|discard|closeOnly (default closeOnly — cancels the prompt rather than committing or discarding work)")] string? autoDismissModals = null,
+        [Description("snake_case alias of autoDismissModals")] string? auto_dismiss_modals = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
@@ -3334,14 +3338,17 @@ public sealed class InbriskTools
         if (BadDetail(detail) is { } bd) return bd;
 
         var recipeName = saveAsRecipe ?? save_as_recipe;
-        var normArgs = $"{runId}|{detail}|{recipeName}|" + JsonSerializer.Serialize(steps, J);
+        var reflexOn = enableReflex ?? enable_reflex;
+        var dismissModals = autoDismissModals ?? auto_dismiss_modals;
+        var normArgs = $"{runId}|{detail}|{recipeName}|{reflexOn}|{dismissModals}|" + JsonSerializer.Serialize(steps, J);
 
         return await ExecuteWithIdempotencyAsync(operationId, "computer_run", normArgs, async () =>
         {
             var sw = Stopwatch.StartNew();
             try
             {
-                var res = await RunPlanCore(steps, runId, sw, ct, detail);
+                var res = await RunPlanCore(steps, runId, sw, ct, detail,
+                    enableReflex: reflexOn, autoDismissModals: dismissModals);
                 return AttachSavedRecipe(res, recipeName, steps,
                     steps.FirstOrDefault(s => string.Equals(s.Action, "launch",
                         StringComparison.OrdinalIgnoreCase))?.App,
@@ -3381,11 +3388,17 @@ public sealed class InbriskTools
         [Description("auto-inject the adapter bridge script when a supported app is detected (default true for Blender); false launches plain")] bool? bridge = null,
         [Description("on success, generalize the executed steps and persist as task-recipes/<name>.json — replay later via computer_run_recipe")] string? saveAsRecipe = null,
         [Description("snake_case alias of saveAsRecipe")] string? save_as_recipe = null,
+        [Description("intercept unexpected modal dialogs between steps via the reflex engine (default true)")] bool? enableReflex = null,
+        [Description("snake_case alias of enableReflex")] bool? enable_reflex = null,
+        [Description("auto-dismiss policy for save-confirmation modals: off|save|discard|closeOnly (default closeOnly)")] string? autoDismissModals = null,
+        [Description("snake_case alias of autoDismissModals")] string? auto_dismiss_modals = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.ResetSequentialSingleAction();
         var recipeName = saveAsRecipe ?? save_as_recipe;
-        var normArgs = $"{app}|{click}|{type}|{hotkey}|{submit}|{target?.Name}|{target?.Role}|{waitMs}|{cleanup}|{adapter}|{bridge}|{recipeName}";
+        var reflexOn = enableReflex ?? enable_reflex;
+        var dismissModals = autoDismissModals ?? auto_dismiss_modals;
+        var normArgs = $"{app}|{click}|{type}|{hotkey}|{submit}|{target?.Name}|{target?.Role}|{waitMs}|{cleanup}|{adapter}|{bridge}|{recipeName}|{reflexOn}|{dismissModals}";
 
         return await ExecuteWithIdempotencyAsync(operationId, "computer_do", normArgs, async () =>
         {
@@ -3432,7 +3445,9 @@ public sealed class InbriskTools
             try
             {
                 var planSteps = steps.ToArray();
-                var res = await RunPlanCore(planSteps, null, sw, ct, detail: "slim");
+                var res = await RunPlanCore(planSteps, null, sw, ct,
+                    detail: "slim", enableReflex: reflexOn,
+                    autoDismissModals: dismissModals);
                 res = AttachSavedRecipe(res, recipeName, planSteps, app, "computer_do");
                 return cleanup ? WithCleanupReap(res) : res;
             }
@@ -3476,10 +3491,16 @@ public sealed class InbriskTools
         [Description("snake_case alias of failFast")] bool? fail_fast = null,
         [Description("on success, generalize the executed steps and persist as task-recipes/<name>.json — replay later via computer_run_recipe")] string? saveAsRecipe = null,
         [Description("snake_case alias of saveAsRecipe")] string? save_as_recipe = null,
+        [Description("intercept unexpected modal dialogs between steps via the reflex engine (default true)")] bool? enableReflex = null,
+        [Description("snake_case alias of enableReflex")] bool? enable_reflex = null,
+        [Description("auto-dismiss policy for save-confirmation modals: off|save|discard|closeOnly (default closeOnly)")] string? autoDismissModals = null,
+        [Description("snake_case alias of autoDismissModals")] string? auto_dismiss_modals = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         CancellationToken ct = default)
     {
         _s.Telemetry.ResetSequentialSingleAction();
+        var reflexOn = enableReflex ?? enable_reflex;
+        var dismissModals = autoDismissModals ?? auto_dismiss_modals;
         if (steps is { Length: > 0 } && set is { Length: > 0 })
             return Error(OutcomeKind.Malformed, "Ambiguous execution order: specify either 'set' (for compact form fill) or 'steps' (for sequenced actions including set_value), not both simultaneously.");
 
@@ -3753,7 +3774,9 @@ public sealed class InbriskTools
             }),
             detail,
             failFast = failFastE,
-            saveAsRecipe = saveAsRecipe ?? save_as_recipe
+            saveAsRecipe = saveAsRecipe ?? save_as_recipe,
+            enableReflex = reflexOn,
+            autoDismissModals = dismissModals
         }, J);
         if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_batch", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
             return deduped;
@@ -3782,7 +3805,9 @@ public sealed class InbriskTools
 
             try
             {
-                var raw = await RunPlanCore(runSteps.ToArray(), null, sw, ct, detail: detail ?? "slim");
+                var raw = await RunPlanCore(runSteps.ToArray(), null, sw, ct,
+                    detail: detail ?? "slim", enableReflex: reflexOn,
+                    autoDismissModals: dismissModals);
                 (long EventWakes, long PollWakes)? waitDelta = wt != null
                     ? (wt.EventWakeCount - ev0, wt.FallbackPollCount - poll0)
                     : null;
@@ -3893,6 +3918,7 @@ public sealed class InbriskTools
         var results = new List<Dictionary<string, object?>>();
         var status = "Failed";
         string? runId = null, pauseStatus = null, pauseError = null;
+        string? reflexJson = null, modalJson = null;
         int? failedStep = null;
         try
         {
@@ -3960,6 +3986,18 @@ public sealed class InbriskTools
                     pauseError ??= root.TryGetProperty("detail", out var d2)
                         ? d2.GetString() : null;
                 }
+                // reflex abort payloads surface their modal + interception
+                // log on the compact result too — raw text so the parsed
+                // doc can die with this scope.
+                if (root.TryGetProperty("reflex", out var rfx) &&
+                    rfx.ValueKind == JsonValueKind.Object)
+                    reflexJson = rfx.GetRawText();
+                if (root.TryGetProperty("modal", out var mdl) &&
+                    mdl.ValueKind == JsonValueKind.Object)
+                    modalJson = mdl.GetRawText();
+                if (root.TryGetProperty("failedStep", out var fse) &&
+                    fse.ValueKind == JsonValueKind.Number)
+                    failedStep ??= fse.GetInt32();
             }
         }
         catch { /* emit whatever parsed — compact must never throw */ }
@@ -3981,6 +4019,10 @@ public sealed class InbriskTools
             ["provenance"] = Provenance("uia"),
         };
         if (runId != null) outDoc["runId"] = runId;
+        if (reflexJson != null)
+            try { outDoc["reflex"] = JsonSerializer.Deserialize<JsonElement>(reflexJson, J); } catch { }
+        if (modalJson != null)
+            try { outDoc["modal"] = JsonSerializer.Deserialize<JsonElement>(modalJson, J); } catch { }
         if (!failFast) outDoc["failFast"] = false;
         if (!success)
         {
@@ -5402,10 +5444,41 @@ public sealed class InbriskTools
 
     private async Task<CallToolResult> RunPlanCore(RunStep[] steps,
         string? runId, Stopwatch sw, CancellationToken ct,
-        string? detail = null)
+        string? detail = null, bool? enableReflex = null,
+        string? autoDismissModals = null)
     {
         if (steps is not { Length: > 0 })
             return Error(OutcomeKind.Malformed, "steps required", sw);
+
+        // ---- reflex (modal interception) params — validated before the
+        // run exists. enableReflex defaults true; autoDismissModals
+        // defaults to closeOnly — cancel a save prompt rather than
+        // committing or discarding the user's work.
+        var reflexOn = enableReflex ?? true;
+        var reflexDismiss = ReflexDismissMode.CloseOnly;
+        if (autoDismissModals != null)
+        {
+            switch (autoDismissModals.Trim().ToLowerInvariant())
+            {
+                case "off": reflexDismiss = ReflexDismissMode.Off; break;
+                case "save": reflexDismiss = ReflexDismissMode.Save; break;
+                case "discard": reflexDismiss = ReflexDismissMode.Discard; break;
+                case "closeonly" or "close_only" or "close-only":
+                    reflexDismiss = ReflexDismissMode.CloseOnly; break;
+                default:
+                    return Error(OutcomeKind.Malformed,
+                        "autoDismissModals must be off|save|discard|closeOnly, " +
+                        $"got '{autoDismissModals}'", sw);
+            }
+        }
+        var reflexModeName = reflexDismiss switch
+        {
+            ReflexDismissMode.Off => "off",
+            ReflexDismissMode.Save => "save",
+            ReflexDismissMode.Discard => "discard",
+            _ => "closeOnly",
+        };
+        var reflexEng = reflexOn ? _s.Reflex : null;
 
         using var trace = PerfTrace.Begin("computer_run",
             runId ?? "run.pending");
@@ -5440,6 +5513,9 @@ public sealed class InbriskTools
                 else
                     PerfTrace.Count("plan.baselineDeferred");
             }
+            // reflex modals are reported per-run: slice the session-wide
+            // engine log from this offset on every leg (incl. resumes).
+            state.ReflexLogBaseline = _s.Reflex?.Log?.Count ?? 0;
             _s.Runs[state.RunId] = state;
         }
         else if (explicitHwnd != null)
@@ -5447,6 +5523,9 @@ public sealed class InbriskTools
             state.ScopeHwnd = explicitHwnd;
         }
         state.Slim = Slim(detail);
+        state.ReflexEnabled = reflexEng != null;
+        state.ReflexMode = reflexModeName;
+        state.ReflexAborted = false; // per-leg flag — reset on resume
         trace.Id = state.RunId;
 
         var epoch = _s.Control.ActionToken();
@@ -5496,6 +5575,27 @@ public sealed class InbriskTools
             }
         }
 
+        // Reflex engine: armed lazily once a real target window is known —
+        // the run's scope hwnd when present, else the first step's resolved
+        // window. Multi-window runs re-arm per step when the step's target
+        // window changes. A faulting engine is best-effort: once broken it
+        // stays off for the rest of the leg instead of retrying per step.
+        long reflexArmedHwnd = 0;
+        var reflexBroken = false;
+        void EnsureReflexArmed(long hwnd)
+        {
+            if (reflexEng == null || reflexBroken || hwnd <= 0 ||
+                hwnd == reflexArmedHwnd) return;
+            try
+            {
+                var pid = _s?.Rt?.Window(hwnd)?.Pid ?? 0;
+                reflexEng.Arm(hwnd, pid, reflexDismiss);
+                reflexArmedHwnd = hwnd;
+            }
+            catch { reflexBroken = true; }
+        }
+        EnsureReflexArmed(scope ?? 0);
+
         try
         {
         for (var i = 0; i < steps.Length; i++)
@@ -5505,6 +5605,7 @@ public sealed class InbriskTools
                 ?? (s.ElementId != null ? _s?.Rt?.Parts.Registry.Get(s.ElementId)?.Hwnd : null)
                 ?? state.ScopeHwnd ?? _s?.ScopeHwnd ?? _s?.Rt?.ForegroundWindow()?.Hwnd ?? 0;
             if (stepTargetHwnd > 0) UpdateHighlight(stepTargetHwnd);
+            EnsureReflexArmed(stepTargetHwnd);
             var action = (s.Action ?? "").ToLowerInvariant();
 
             // 1. Safe-point pause requested (e.g. via computer_pause_run)
@@ -5575,6 +5676,82 @@ public sealed class InbriskTools
                     internalActions, executed, skipped,
                     pauseStep: i, pauseStatus: "Cancelled",
                     pauseError: "execution cancelled");
+            }
+
+            // ---- reflex gate: a modal between steps aborts or parks the
+            // run. Runs AFTER the cancellation check above so panic can
+            // never be masked by a dialog interception.
+            if (reflexEng != null && reflexArmedHwnd != 0)
+            {
+                var abort = reflexEng.Abort;
+                if (abort == null && reflexEng.Paused)
+                {
+                    // a modal is parked for human handling — bounded wait
+                    // on the pause gate (~30s); linked.Token keeps panic /
+                    // request-cancel able to interrupt the wait.
+                    using var gateCts = CancellationTokenSource
+                        .CreateLinkedTokenSource(linked.Token);
+                    gateCts.CancelAfter(TimeSpan.FromSeconds(30));
+                    var gateWaitCancelled = false;
+                    try
+                    {
+                        await reflexEng.WaitPausedAsync(gateCts.Token)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { gateWaitCancelled = true; }
+                    catch { /* gate faults degrade to the abort path below */ }
+                    // panic/cancel during the wait outranks any modal state
+                    if (_s.Control.State == ComputerControlState.EmergencyStopped
+                        || epoch.Value.IsCancellationRequested)
+                    {
+                        _s.Rt.PurgePendingWork();
+                        return RunReport(state, "EmergencyStopped", sw, report,
+                            internalActions, executed, skipped,
+                            pauseStep: i, pauseStatus: "EmergencyStopped",
+                            pauseError: StoppedDetail);
+                    }
+                    if (linked.Token.IsCancellationRequested)
+                        return RunReport(state, "Cancelled", sw, report,
+                            internalActions, executed, skipped,
+                            pauseStep: i, pauseStatus: "Cancelled",
+                            pauseError: "execution cancelled");
+                    abort = reflexEng.Abort;
+                    if (abort == null && reflexEng.Paused && gateWaitCancelled)
+                    {
+                        // pause gate actually timed out unresolved → abort
+                        var last = reflexEng.Log?.Count > 0
+                            ? reflexEng.Log[^1] : null;
+                        abort = new ReflexAbort(last?.Title,
+                            last?.Disposition,
+                            "modal pause gate timed out after 30s without " +
+                            "resolution — treating as abort",
+                            last?.ButtonsSeen);
+                    }
+                }
+                if (abort != null)
+                {
+                    // EmergencyStopped outranks a modal abort — never let
+                    // the engine swallow panic.
+                    if (_s.Control.State == ComputerControlState.EmergencyStopped
+                        || epoch.Value.IsCancellationRequested)
+                    {
+                        _s.Rt.PurgePendingWork();
+                        return RunReport(state, "EmergencyStopped", sw, report,
+                            internalActions, executed, skipped,
+                            pauseStep: i, pauseStatus: "EmergencyStopped",
+                            pauseError: StoppedDetail);
+                    }
+                    state.ReflexAborted = true;
+                    state.PausedStepIndex = i;
+                    state.PausedAt = DateTimeOffset.UtcNow;
+                    state.PauseStatus = OutcomeKind.InterruptedByDialog.ToString();
+                    state.PauseReason = abort.Reason;
+                    var fgA = _s.Rt.ForegroundWindow();
+                    state.PrePauseForegroundHwnd = fgA?.Hwnd;
+                    state.PrePauseForegroundTitle = fgA?.Title;
+                    return ReflexAbortResult(state, steps, i, abort, report,
+                        internalActions, executed, skipped, sw);
+                }
             }
 
             if (state.Bindings.Count > 0)
@@ -6018,6 +6195,41 @@ public sealed class InbriskTools
                         built?.LastOrDefault(b => b.Kind == AgentActionKind.FocusWindow)?.Hwnd,
                         eventGenBefore,
                         StepTargetPids(built, state.ScopeHwnd ?? fgBefore));
+            if (newWin is { dialogLikely: true } nw0)
+            {
+                // Reflex grace window: when the engine is armed it may have
+                // already intercepted this very modal and be mid-dismiss
+                // (BM_CLICK → the window is dying but still enumerable).
+                // Give it a short bounded window before pausing the plan:
+                //   window dies     → reflex dismissed it → keep running
+                //   abort latched   → structured InterruptedByDialog abort
+                //   still pending   → legacy UnexpectedModalOpened pause
+                if (reflexEng != null && reflexArmedHwnd != 0)
+                {
+                    var grace = Stopwatch.StartNew();
+                    while (grace.ElapsedMilliseconds < 1500)
+                    {
+                        if (reflexEng.Abort is { } graceAbort)
+                        {
+                            state.ReflexAborted = true;
+                            state.PausedStepIndex = i;
+                            state.PausedAt = DateTimeOffset.UtcNow;
+                            state.PauseStatus =
+                                OutcomeKind.InterruptedByDialog.ToString();
+                            state.PauseReason = graceAbort.Reason;
+                            return ReflexAbortResult(state, steps, i, graceAbort,
+                                report, internalActions, executed, skipped, sw);
+                        }
+                        if (_s.Rt.Window(nw0.hwnd) == null)
+                        {
+                            newWin = null; // reflex dismissed it — no pause
+                            break;
+                        }
+                        if (!reflexEng.Paused) break; // engine drained, window persists
+                        await Task.Delay(50, linked.Token).ConfigureAwait(false);
+                    }
+                }
+            }
             if (newWin is { dialogLikely: true } nw)
             {
                 state.PausedStepIndex = i;
@@ -6038,6 +6250,26 @@ public sealed class InbriskTools
             eventGenBefore = _s.Rt.EventBuffer.CurrentGeneration;
         }
 
+        // a modal surfaced by the final step still aborts the run — the
+        // plan must not report Completed over an open dialog. Emergency
+        // check first: panic outranks a reflex abort.
+        if (_s.Control.State == ComputerControlState.EmergencyStopped)
+            return RunReport(state, "EmergencyStopped", sw, report,
+                internalActions, executed, skipped,
+                pauseStep: steps.Length, pauseStatus: "EmergencyStopped",
+                pauseError: StoppedDetail);
+        if (reflexEng != null && reflexArmedHwnd != 0 &&
+            reflexEng.Abort is { } postAbort)
+        {
+            state.ReflexAborted = true;
+            state.PausedStepIndex = steps.Length;
+            state.PausedAt = DateTimeOffset.UtcNow;
+            state.PauseStatus = OutcomeKind.InterruptedByDialog.ToString();
+            state.PauseReason = postAbort.Reason;
+            return ReflexAbortResult(state, steps, steps.Length, postAbort,
+                report, internalActions, executed, skipped, sw);
+        }
+
         UiElement? post;
         using (PerfTrace.Stage("verify.targeted"))
             post = state.LastElementId != null
@@ -6049,6 +6281,7 @@ public sealed class InbriskTools
         }
         finally
         {
+            try { if (reflexArmedHwnd != 0) reflexEng?.Disarm(); } catch { }
             planHighlightLease?.Dispose();
         }
     }
@@ -7582,6 +7815,91 @@ public sealed class InbriskTools
         return d;
     }
 
+    /// <summary>reflex block shared by run/batch/do results — additive:
+    /// {enabled, mode, modals:[{title,disposition,actionTaken,ms}],
+    /// aborted}. Modals are sliced from the session engine's cumulative
+    /// log at this run's baseline so resumed legs keep the full history.</summary>
+    private Dictionary<string, object?> ReflexBlock(RunState state)
+    {
+        var modals = new List<Dictionary<string, object?>>();
+        if (_s?.Reflex?.Log is { } log)
+        {
+            foreach (var m in log.Skip(Math.Max(0, state.ReflexLogBaseline)))
+            {
+                modals.Add(new Dictionary<string, object?>
+                {
+                    ["hwnd"] = m.Hwnd > 0 ? $"0x{m.Hwnd:X}" : null,
+                    ["title"] = m.Title,
+                    ["disposition"] = m.Disposition,
+                    ["actionTaken"] = m.ActionTaken,
+                    ["reason"] = m.Reason,
+                    ["ms"] = m.Ms,
+                });
+            }
+        }
+        return new Dictionary<string, object?>
+        {
+            ["enabled"] = state.ReflexEnabled,
+            ["mode"] = state.ReflexMode,
+            ["modals"] = modals,
+            ["aborted"] = state.ReflexAborted,
+        };
+    }
+
+    /// <summary>Structured abort result when the reflex engine stops a run:
+    /// {error:"InterruptedByDialog", modal:{title,disposition,reason,
+    /// buttons}, runId, resume, resumeSteps[]}. state.PausedStepIndex
+    /// points at the step that never ran, so computer_resume_run re-runs
+    /// the remaining steps without re-submission.</summary>
+    private CallToolResult ReflexAbortResult(RunState state, RunStep[] steps,
+        int stepIndex, ReflexAbort abort,
+        List<Dictionary<string, object?>> report,
+        int internalActions, int executed, int skipped, Stopwatch sw)
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["error"] = OutcomeKind.InterruptedByDialog.ToString(),
+            ["status"] = OutcomeKind.InterruptedByDialog.ToString(),
+            ["detail"] = abort.Reason,
+            ["runId"] = state.RunId,
+            ["modal"] = new Dictionary<string, object?>
+            {
+                ["hwnd"] = abort.ModalHwnd > 0 ? $"0x{abort.ModalHwnd:X}" : null,
+                ["title"] = abort.Title,
+                ["disposition"] = abort.Disposition,
+                ["reason"] = abort.Reason,
+                ["buttons"] = abort.ButtonsSeen,
+            },
+            ["steps"] = report,
+            ["executed"] = executed,
+            ["skipped"] = skipped,
+            ["internalActions"] = internalActions,
+            ["durationMs"] = sw.ElapsedMilliseconds,
+            ["failedStep"] = stepIndex,
+            ["remainingSteps"] = Math.Max(0, steps.Length - stepIndex),
+            ["resume"] = $"computer_resume_run({{runId:\"{state.RunId}\"}})",
+            ["resumeSteps"] = steps.Skip(Math.Min(stepIndex, steps.Length))
+                .Select(DescribeStep).ToList(),
+            ["reflex"] = ReflexBlock(state),
+            ["provenance"] = Provenance("uia"),
+        };
+        UiaPerf.Write(new
+        {
+            kind = "run.reflexAbort",
+            runId = state.RunId,
+            step = stepIndex,
+            modalTitle = abort.Title,
+            disposition = abort.Disposition,
+            ms = sw.ElapsedMilliseconds,
+        });
+        return new CallToolResult
+        {
+            IsError = true,
+            Content = [new TextContentBlock
+                { Text = JsonSerializer.Serialize(payload, J) }],
+        };
+    }
+
     private CallToolResult RunReport(RunState state, string status,
         Stopwatch sw, List<Dictionary<string, object?>> steps,
         int internalActions = 0, int executed = 0, int skipped = 0,
@@ -7641,6 +7959,7 @@ public sealed class InbriskTools
         if (state.Bindings.Count > 0) payload["bindings"] = state.Bindings;
         if (state.Collected.Count > 0) payload["collected"] = state.Collected;
         if (state.HumanChanges != null) payload["humanChanges"] = state.HumanChanges;
+        if (_s?.Reflex != null) payload["reflex"] = ReflexBlock(state);
         if (state.IsPausedForHuman)
         {
             payload["isPausedForHuman"] = true;

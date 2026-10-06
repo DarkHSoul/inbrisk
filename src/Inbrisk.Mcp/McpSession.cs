@@ -61,6 +61,13 @@ public sealed class McpSession : IDisposable
     public RequestDeduplicator Deduplicator { get; } = new();
     public DynamicToolset.DynamicToolsetManager DynamicToolset { get; } = new();
 
+    /// <summary>Session-shared modal-reflex engine — one interception
+    /// watcher per session, armed/disarmed per plan run by RunPlanCore.
+    /// RuntimeReflexEngine over Inbrisk.Runtime.ReflexEngine; degrades to
+    /// NullReflexEngine if construction fails (see
+    /// ReflexEngines.CreateDefault).</summary>
+    public IReflexEngine Reflex { get; }
+
     public List<SessionWindowProvenance> TrackedWindows { get; } = new();
     public DateTimeOffset LastAppsQueryTimestamp { get; set; } = DateTimeOffset.MinValue;
     public string? LastAppsQueryName { get; set; }
@@ -251,6 +258,11 @@ public sealed class McpSession : IDisposable
         // Stamp every process this session spawns with our id — Dispose then
         // reaps only this session's launches.
         Rt.ProcessTracker.SessionId = SessionId;
+        // Modal-reflex engine: session-scoped, built from the runtime's
+        // window + silent-input + event-stream services
+        // (ReflexEngines.CreateDefault — falls back to the Null engine on
+        // any construction fault).
+        Reflex = ReflexEngines.CreateDefault(Rt);
         var p = Rt.Parts;
         _inputRegistration = control.RegisterInput(p.Input);
         // screen-control indicator: the session refcounted-lease pattern
@@ -631,6 +643,7 @@ public sealed class McpSession : IDisposable
         try { MonitorCache.Dispose(); } catch { }
         try { VdmHolder.Dispose(); } catch { }
         try { Rt.PurgePendingWork(); } catch { }
+        try { Reflex?.Dispose(); } catch { }
         try { _monitor?.Dispose(); } catch { }
         try { Rt.TargetHighlight.OnSessionDisconnected(SessionId); } catch { }
         try { Rt.Activity.ClearSessionActivity(SessionId); } catch { }
@@ -695,6 +708,19 @@ public sealed class RunState
     public DateTimeOffset? PausedAt { get; set; }
     /// <summary>Report of what changed while human had control (populated upon resume).</summary>
     public Dictionary<string, object?>? HumanChanges { get; set; }
+
+    // --- reflex (modal interception) run state ---
+    /// <summary>Whether the reflex engine was armed for this run's current leg.</summary>
+    public bool ReflexEnabled { get; set; }
+    /// <summary>Auto-dismiss policy name resolved for this run (off|save|discard|closeOnly).</summary>
+    public string? ReflexMode { get; set; }
+    /// <summary>Engine-log offset captured when the run was created — the
+    /// run's modal report is Log.Skip(this), so resumed legs keep the
+    /// run's full interception history.</summary>
+    public int ReflexLogBaseline { get; set; }
+    /// <summary>Set when the run's current leg ended via a reflex abort
+    /// (InterruptedByDialog). Reset at the start of each RunPlanCore leg.</summary>
+    public bool ReflexAborted { get; set; }
 }
 
 /// <summary>Process-wide frame id counter — shared with ObservationBuilder's
