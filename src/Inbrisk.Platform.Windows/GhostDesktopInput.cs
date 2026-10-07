@@ -367,6 +367,9 @@ public sealed class GhostDesktopInput : IDisposable
             uint fuFlags,
             uint uTimeout,
             out IntPtr lpdwResult);
+
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetLastActivePopup(IntPtr hWnd);
     }
 
     #endregion
@@ -1471,13 +1474,7 @@ public sealed class GhostDesktopInput : IDisposable
                 Win32.GetClassNameW(hWnd, sbClass, 256);
                 string cls = sbClass.ToString();
 
-                if (string.Equals(cls, "Progman", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "WorkerW", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "tooltips_class32", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "Default IME", StringComparison.OrdinalIgnoreCase))
+                if (IsIgnoredSystemWindowClass(cls))
                 {
                     return true;
                 }
@@ -1585,19 +1582,80 @@ public sealed class GhostDesktopInput : IDisposable
     /// <summary>
     /// Dynamically locates the active keyboard input target window on the ghost desktop.
     /// Strictly restricts targets to windows belonging to the isolated desktop (_hDesktop).
+    private static bool IsIgnoredSystemWindowClass(string cls)
+    {
+        return string.Equals(cls, "Progman", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "WorkerW", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "tooltips_class32", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "Default IME", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "UAC_InputIndicatorOverlayWnd", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "UAC Input Indicator", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(cls, "EdgeUiInputTopWndClass", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Dynamically locates the active keyboard input target window on the ghost desktop.
+    /// Strictly restricts targets to windows belonging to the isolated desktop (_hDesktop).
+    /// Automatically routes input to modal dialogs / active popups (GetLastActivePopup).
     /// </summary>
     private IntPtr FindKeyboardTarget()
     {
+        IntPtr target = IntPtr.Zero;
+
         // 1. Explicit target override
         if (TargetHwnd.HasValue && TargetHwnd.Value != IntPtr.Zero && Win32.IsWindow(TargetHwnd.Value))
         {
-            return TargetHwnd.Value;
+            target = TargetHwnd.Value;
+        }
+        // 2. Last target window touched by mouse actions on the ghost desktop (if still valid and visible)
+        else if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd) && Win32.IsWindowVisible(_lastTargetHwnd) && !Win32.IsIconic(_lastTargetHwnd))
+        {
+            target = _lastTargetHwnd;
         }
 
-        // 2. Last target window touched by mouse actions on the ghost desktop
-        if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd))
+        // 3. Fallback: Topmost visible window on _hDesktop
+        if (target == IntPtr.Zero)
         {
-            uint threadId = Win32.GetWindowThreadProcessId(_lastTargetHwnd, out _);
+            EnsureDesktopAttached();
+            if (_hDesktop != IntPtr.Zero)
+            {
+                Win32.EnumDesktopWindows(_hDesktop, (hWnd, lParam) =>
+                {
+                    if (hWnd == IntPtr.Zero || !Win32.IsWindow(hWnd) || !Win32.IsWindowVisible(hWnd) || Win32.IsIconic(hWnd))
+                    {
+                        return true;
+                    }
+
+                    var sbClass = new StringBuilder(256);
+                    Win32.GetClassNameW(hWnd, sbClass, 256);
+                    string cls = sbClass.ToString();
+
+                    if (IsIgnoredSystemWindowClass(cls))
+                    {
+                        return true;
+                    }
+
+                    target = hWnd;
+                    return false; // Found topmost valid window
+                }, IntPtr.Zero);
+            }
+        }
+
+        if (target != IntPtr.Zero)
+        {
+            // If the target window has an active modal dialog or popup, route to the popup!
+            IntPtr popup = Win32.GetLastActivePopup(target);
+            if (popup != IntPtr.Zero && popup != target && Win32.IsWindow(popup) && Win32.IsWindowVisible(popup))
+            {
+                target = popup;
+            }
+
+            _lastTargetHwnd = target;
+
+            uint threadId = Win32.GetWindowThreadProcessId(target, out _);
             if (threadId != 0)
             {
                 var gui = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
@@ -1609,57 +1667,7 @@ public sealed class GhostDesktopInput : IDisposable
                         return gui.hwndActive;
                 }
             }
-            return _lastTargetHwnd;
-        }
-
-        // 3. Topmost visible window on _hDesktop
-        EnsureDesktopAttached();
-        IntPtr topWin = IntPtr.Zero;
-        if (_hDesktop != IntPtr.Zero)
-        {
-            Win32.EnumDesktopWindows(_hDesktop, (hWnd, lParam) =>
-            {
-                if (hWnd == IntPtr.Zero || !Win32.IsWindow(hWnd) || !Win32.IsWindowVisible(hWnd) || Win32.IsIconic(hWnd))
-                {
-                    return true;
-                }
-
-                var sbClass = new StringBuilder(256);
-                Win32.GetClassNameW(hWnd, sbClass, 256);
-                string cls = sbClass.ToString();
-
-                if (string.Equals(cls, "Progman", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "WorkerW", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "Shell_TrayWnd", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "Shell_SecondaryTrayWnd", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "tooltips_class32", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "MSCTFIME UI", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(cls, "Default IME", StringComparison.OrdinalIgnoreCase))
-                {
-                    return true;
-                }
-
-                topWin = hWnd;
-                return false; // Found topmost
-            }, IntPtr.Zero);
-        }
-
-        if (topWin != IntPtr.Zero)
-        {
-            _lastTargetHwnd = topWin;
-            uint threadId = Win32.GetWindowThreadProcessId(topWin, out _);
-            if (threadId != 0)
-            {
-                var gui = new GUITHREADINFO { cbSize = Marshal.SizeOf<GUITHREADINFO>() };
-                if (Win32.GetGUIThreadInfo(threadId, ref gui))
-                {
-                    if (gui.hwndFocus != IntPtr.Zero && Win32.IsWindow(gui.hwndFocus))
-                        return gui.hwndFocus;
-                    if (gui.hwndActive != IntPtr.Zero && Win32.IsWindow(gui.hwndActive))
-                        return gui.hwndActive;
-                }
-            }
-            return topWin;
+            return target;
         }
 
         // 4. Fallback to desktop window
