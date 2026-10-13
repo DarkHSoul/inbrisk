@@ -3,8 +3,10 @@ import json
 import os
 import shutil
 
-src_trx = r'C:\Users\Ahmet\Documents\inbrisk-baseline\tests\Inbrisk.Tests\TestResults\baseline_clean_4271b3f.trx'
-dst_dir = r'C:\Users\Ahmet\Documents\inbrisk\artifacts'
+from inbrisk_paths import ARTIFACTS, BASELINE_ROOT, TESTS_DIR
+
+src_trx = str(BASELINE_ROOT / 'tests' / 'Inbrisk.Tests' / 'TestResults' / 'baseline_clean_4271b3f.trx')
+dst_dir = str(ARTIFACTS)
 os.makedirs(dst_dir, exist_ok=True)
 dst_trx = os.path.join(dst_dir, 'baseline_clean_4271b3f.trx')
 shutil.copyfile(src_trx, dst_trx)

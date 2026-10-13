@@ -473,6 +473,7 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
         }
         finally
         {
+            _isRunning = false;
             CleanupLoopResources();
         }
     }
@@ -516,21 +517,18 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
             }
         }
 
-        if (hDesk == IntPtr.Zero)
-        {
-            // Fallback to current thread desktop
-            hDesk = GetThreadDesktop(GetCurrentThreadId());
-        }
-
         if (hDesk != IntPtr.Zero)
         {
-            bool ok = SetThreadDesktop(hDesk);
-            if (!ok)
-            {
-                int err = Marshal.GetLastWin32Error();
-                _lastError = $"SetThreadDesktop failed with Win32 error {err}";
-            }
             _hDesktop = hDesk;
+            if (Thread.CurrentThread == _captureThread)
+            {
+                bool ok = SetThreadDesktop(hDesk);
+                if (!ok)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    _lastError = $"SetThreadDesktop failed with Win32 error {err}";
+                }
+            }
         }
 
         return hDesk;
@@ -1055,6 +1053,7 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
             {
                 CloseDesktop(_hDesktop);
                 _hDesktop = IntPtr.Zero;
+                _ownsDesktop = false;
             }
         }
         catch { }
@@ -1066,6 +1065,8 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
         _isDisposed = true;
 
         Stop();
+
+        CleanupLoopResources();
 
         _logoImage?.Dispose();
         _logoImage = null;

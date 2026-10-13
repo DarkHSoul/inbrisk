@@ -193,26 +193,38 @@ public sealed class Executor
                     sw, ErrorCode.PolicyDenied, "action denied by safety policy");
             if (cls == SafetyClass.Confirm)
             {
-                // F04: dangerous classes (shell/terminal input, destructive
-                // close chords) are never satisfiable by AutoConfirm — a
-                // boolean the model supplies inside its own tool call is
-                // self-approval, not consent. Only a consent hook installed
-                // by local code may approve: LocalConsent (the reserved
-                // trusted-UI hook) or the run/policy Confirmer, neither of
-                // which is reachable through the MCP JSON-RPC request path.
-                if (_policy.IsDangerous(intent, element, window))
+                // F04: a client tool call can never confirm itself — an
+                // approval flag inside the request is self-approval, not
+                // consent. A consumed server-issued grant for this exact
+                // action+target always satisfies the gate: only in-process
+                // code can mint the approval it carries.
+                var approvalId = intent.Args?.TryGetValue("approvalId", out var apv) == true
+                    ? apv?.ToString() : null;
+                if (approvalId != null &&
+                    _policy.TryConsumeConfirmation(intent, element, window, approvalId))
                 {
+                    attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
+                        $"approved by server grant {approvalId}", TimeSpan.Zero));
+                }
+                else if (_policy.IsDangerous(intent, element, window))
+                {
+                    // F04: dangerous classes (shell/terminal input, destructive
+                    // close chords) are never satisfiable by AutoConfirm — a
+                    // boolean the model supplies inside its own tool call is
+                    // self-approval, not consent. Only a consent hook installed
+                    // by local code may approve: LocalConsent (the reserved
+                    // trusted-UI hook) or the run/policy Confirmer, neither of
+                    // which is reachable through the MCP JSON-RPC request path.
                     var consent = _policy.LocalConsent ?? ctx?.Confirmer ?? _policy.Confirmer;
                     bool localOk;
                     try { localOk = consent?.Invoke(intent, element, window) == true; }
                     catch { localOk = false; }
                     if (!localOk)
-                        return Finish(false, null, "policy", attempts, VerifyResult.NotRequested,
-                            sw, ErrorCode.ConfirmationRequired,
-                            "dangerous action requires a LOCAL confirmation the " +
-                            "client cannot supply — approve on this machine via the " +
-                            "Inbrisk control UI (AutoConfirm/tool-call flags are " +
-                            "ignored for dangerous classes)");
+                        return DenyConfirm("dangerous action requires a LOCAL " +
+                            "confirmation the client cannot supply — approve " +
+                            "on this machine via the Inbrisk control UI, then " +
+                            "retry with args.approvalId (AutoConfirm/tool-call " +
+                            "flags are ignored for dangerous classes)");
                     attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
                         "approved by local consent", TimeSpan.Zero));
                 }
@@ -224,18 +236,32 @@ public sealed class Executor
                     if (confirmer == null)
                     {
                         if (!_policy.AutoConfirm)
-                            return Finish(false, null, "policy", attempts, VerifyResult.NotRequested,
-                                sw, ErrorCode.ConfirmationRequired,
-                                "action requires confirmation (AutoConfirm=false)");
+                            return DenyConfirm("action requires confirmation — " +
+                                "approve via the local Inbrisk control " +
+                                "surface, then retry with args.approvalId " +
+                                "(AutoConfirm=false)");
                     }
                     else if (confirmer(intent, element, window))
                         attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
                             "approved by confirmer", TimeSpan.Zero));
                     else
-                        return Finish(false, null, "policy", attempts, VerifyResult.NotRequested,
-                            sw, ErrorCode.ConfirmationRequired,
-                            "action denied by run confirmer");
+                        return DenyConfirm("action denied by run confirmer — " +
+                            "issued approvalId for local override");
                 }
+            }
+
+            // A CONFIRM action that reached no approver still gets a
+            // server-issued challenge so the local control surface can
+            // decide it — the denial carries the id the retry must echo.
+            ActionResult DenyConfirm(string why)
+            {
+                var ch = _policy.IssueConfirmation(intent, element, window);
+                attempts.Add(new Attempt(BackendId.Win32, "confirm-challenge",
+                    false, $"approvalId={ch.ApprovalId} " +
+                    $"expires {ch.ExpiresAt:HH:mm:ss}Z", TimeSpan.Zero));
+                return Finish(false, null, "policy", attempts,
+                    VerifyResult.NotRequested, sw, ErrorCode.ConfirmationRequired,
+                    $"{why} (approvalId={ch.ApprovalId})");
             }
 
             ct.ThrowIfCancellationRequested();
@@ -367,8 +393,7 @@ public sealed class Executor
                 or ActionKind.Collapse or ActionKind.FocusElement or ActionKind.ScrollIntoView
                 when element != null:
             {
-                if (intent.Kind != ActionKind.FocusElement &&
-                    GuardElementTargetable(intent, element, attempts, sw) is { } denied)
+                if (GuardElementTargetable(intent, element, attempts, sw) is { } denied)
                     return denied;
                 var backend = _backends.First(b => b.Id == element.Handle.Backend);
                 var native = backend.PerformNative(element, intent, ct);
@@ -418,9 +443,34 @@ public sealed class Executor
                     : intent.Kind == ActionKind.MiddleClick ? MouseButton.Middle
                     : MouseButton.Left;
                 var count = intent.Kind == ActionKind.DoubleClick ? 2 : 1;
-                attempts.Add(Do(() => _input.Click(p.X, p.Y, button, count),
-                    BackendId.Win32, $"SendInput.{intent.Kind.ToString().ToLower()}"));
-                return Ok(BackendId.Win32, $"SendInput.{intent.Kind.ToString().ToLower()}", attempts, sw);
+                // no resolved window to guard-focus — the click itself
+                // raises whatever sits under the point. Record where the
+                // foreground actually landed so a wrong-window hit is
+                // visible in the outcome instead of silently ignored.
+                long? fgBefore = null;
+                try { fgBefore = _windows.GetForegroundWindow()?.Hwnd; }
+                catch { }
+                var method = $"SendInput.{intent.Kind.ToString().ToLower()}";
+                var click = Do(() => _input.Click(p.X, p.Y, button, count),
+                    BackendId.Win32, method);
+                attempts.Add(click);
+                if (click.Success)
+                    try
+                    {
+                        var fgAfter = _windows.GetForegroundWindow();
+                        attempts.Add(new Attempt(BackendId.Win32,
+                            "foreground-report", true,
+                            fgAfter?.Hwnd != fgBefore
+                                ? $"foreground moved to '{fgAfter?.Title ?? "?"}' " +
+                                  $"0x{fgAfter?.Hwnd ?? 0:X}"
+                                : $"foreground unchanged " +
+                                  $"('{fgAfter?.Title ?? "none"}')",
+                            TimeSpan.Zero));
+                    }
+                    catch { }
+                return new ActionResult(click.Success, BackendId.Win32, method,
+                    attempts, VerifyResult.NotRequested, sw.Elapsed,
+                    click.Success ? ErrorCode.None : ErrorCode.Internal, click.Error);
             }
 
             case ActionKind.Drag when element != null || point != null:
@@ -428,6 +478,7 @@ public sealed class Executor
                 var from = element?.Center ?? point!.Value;
                 var to = ParsePoint(intent.Args, "to") ?? throw new InbriskException(
                     ErrorCode.Unsupported, "drag requires args.to={x,y}");
+                if (window != null) GuardFocus(window, attempts);
                 attempts.Add(Do(() => _input.Drag(from.X, from.Y, to.X, to.Y, ct: ct),
                     BackendId.Win32, "SendInput.drag"));
                 return Ok(BackendId.Win32, "SendInput.drag", attempts, sw);
@@ -865,7 +916,21 @@ public sealed class Executor
         var backend = _backends.First(b => b.Id == element.Handle.Backend);
         var r = backend.PerformNative(element,
             new ActionIntent(ActionKind.FocusElement, TargetRef.Element(element.Id)), ct);
-        if (r != null) attempts.AddRange(r.Attempts);
+        if (r == null)
+        {
+            attempts.Add(new Attempt(element.Handle.Backend, "focus-element",
+                true, "no native focus path — input goes to the focused control",
+                TimeSpan.Zero));
+            return;
+        }
+        attempts.AddRange(r.Attempts);
+        // a failed focus move must abort the action — typing into an
+        // unfocused element lands the keystrokes on whatever holds focus
+        if (!r.Success)
+            throw new InbriskException(ErrorCode.Internal,
+                $"focus move to element {element.Id} failed " +
+                $"({r.ErrorMessage ?? "backend declined"}) — refusing to send " +
+                "input to an unfocused target");
     }
 
     private void GuardFocus(WindowInfo window, List<Attempt> attempts)

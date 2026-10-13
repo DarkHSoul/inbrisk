@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -390,6 +391,7 @@ public sealed class GhostDesktopInput : IDisposable
     private int _lastMouseY;
     private IntPtr _lastTargetHwnd = IntPtr.Zero;
     private IntPtr _capturedMouseHwnd = IntPtr.Zero;
+    private readonly Dictionary<uint, IntPtr> _heldKeysHwnd = new();
 
     // Interactive Ghost Window Dragging & Resizing State
     private bool _isDraggingWindow;
@@ -491,39 +493,40 @@ public sealed class GhostDesktopInput : IDisposable
 
     private void EnsureDesktopAttached()
     {
-        if (_hDesktop != IntPtr.Zero) return;
-
-        try
+        if (_hDesktop == IntPtr.Zero)
         {
-            _hDesktop = Win32.OpenDesktopW(_desktopName, 0, false, DESKTOP_ALL_ACCESS);
-            if (_hDesktop == IntPtr.Zero)
+            try
             {
-                _hDesktop = Win32.OpenDesktopW(
-                    _desktopName,
-                    0,
-                    false,
-                    0x0001 | 0x0040 | 0x0080 | 0x0002);
-            }
+                _hDesktop = Win32.OpenDesktopW(_desktopName, 0, false, DESKTOP_ALL_ACCESS);
+                if (_hDesktop == IntPtr.Zero)
+                {
+                    _hDesktop = Win32.OpenDesktopW(
+                        _desktopName,
+                        0,
+                        false,
+                        0x0001 | 0x0040 | 0x0080 | 0x0002);
+                }
 
-            if (_hDesktop == IntPtr.Zero)
-            {
-                _hDesktop = Win32.CreateDesktopW(
-                    _desktopName,
-                    IntPtr.Zero,
-                    IntPtr.Zero,
-                    0,
-                    DESKTOP_ALL_ACCESS,
-                    IntPtr.Zero);
+                if (_hDesktop == IntPtr.Zero)
+                {
+                    _hDesktop = Win32.CreateDesktopW(
+                        _desktopName,
+                        IntPtr.Zero,
+                        IntPtr.Zero,
+                        0,
+                        DESKTOP_ALL_ACCESS,
+                        IntPtr.Zero);
+                }
             }
-
-            if (_hDesktop != IntPtr.Zero)
+            catch (Exception ex)
             {
-                _isDesktopBound = Win32.SetThreadDesktop(_hDesktop);
+                Debug.WriteLine($"[GhostDesktopInput] EnsureDesktopAttached error: {ex.Message}");
             }
         }
-        catch (Exception ex)
+
+        if (_hDesktop != IntPtr.Zero && !_isDesktopBound && Thread.CurrentThread == _workerThread)
         {
-            Debug.WriteLine($"[GhostDesktopInput] EnsureDesktopAttached error: {ex.Message}");
+            _isDesktopBound = Win32.SetThreadDesktop(_hDesktop);
         }
     }
 
@@ -560,7 +563,7 @@ public sealed class GhostDesktopInput : IDisposable
         catch (InvalidOperationException) { }
         finally
         {
-            if (_hDesktop != IntPtr.Zero)
+            if (Thread.CurrentThread == _workerThread && _hDesktop != IntPtr.Zero)
             {
                 Win32.CloseDesktop(_hDesktop);
                 _hDesktop = IntPtr.Zero;
@@ -632,7 +635,7 @@ public sealed class GhostDesktopInput : IDisposable
             _lastMouseX = desktopX;
             _lastMouseY = desktopY;
 
-            if (_isDraggingWindow && _dragHwnd != IntPtr.Zero && Win32.IsWindow(_dragHwnd))
+            if (_isDraggingWindow && _dragHwnd != IntPtr.Zero && IsWindowOnGhostDesktop(_dragHwnd))
             {
                 int deltaX = desktopX - _dragStartMouseX;
                 int deltaY = desktopY - _dragStartMouseY;
@@ -701,7 +704,7 @@ public sealed class GhostDesktopInput : IDisposable
             IntPtr hwnd;
             POINT clientPt;
 
-            if (_heldMouseKeys != 0 && _capturedMouseHwnd != IntPtr.Zero && Win32.IsWindow(_capturedMouseHwnd))
+            if (_heldMouseKeys != 0 && _capturedMouseHwnd != IntPtr.Zero && IsWindowOnGhostDesktop(_capturedMouseHwnd))
             {
                 hwnd = _capturedMouseHwnd;
                 clientPt = new POINT { X = desktopX, Y = desktopY };
@@ -716,12 +719,14 @@ public sealed class GhostDesktopInput : IDisposable
                 }
             }
 
+            if (hwnd == IntPtr.Zero) return;
+
             IntPtr lParam = MakeLParam(clientPt.X, clientPt.Y);
             Win32.PostMessageW(hwnd, WM_MOUSEMOVE, (IntPtr)_heldMouseKeys, lParam);
 
             if (_heldMouseKeys != 0)
             {
-                IntPtr pointerWParam = (IntPtr)((1 /* POINTER_ID 1 */) | (1 << 18 /* INCONTACT */) | (1 << 19 /* FIRSTBUTTON */) | (1 << 20 /* PRIMARY */));
+                IntPtr pointerWParam = (IntPtr)(1 /* POINTER_ID 1 */ | (0x0004 << 16 /* INCONTACT */) | (0x0010 << 16 /* FIRSTBUTTON */) | (0x2000 << 16 /* PRIMARY */));
                 Win32.PostMessageW(hwnd, WM_POINTERUPDATE, pointerWParam, lParam);
             }
         });
@@ -784,6 +789,8 @@ public sealed class GhostDesktopInput : IDisposable
                 }
             }
 
+            if (hwnd == IntPtr.Zero) return;
+
             uint msg;
             switch (button)
             {
@@ -825,7 +832,7 @@ public sealed class GhostDesktopInput : IDisposable
             Win32.PostMessageW(hwnd, WM_MOUSEMOVE, (IntPtr)_heldMouseKeys, lParam);
             Win32.PostMessageW(hwnd, msg, (IntPtr)_heldMouseKeys, lParam);
 
-            IntPtr pointerWParam = (IntPtr)((1 /* POINTER_ID 1 */) | (1 << 16 /* NEW */) | (1 << 18 /* INCONTACT */) | (1 << 19 /* FIRSTBUTTON */) | (1 << 20 /* PRIMARY */));
+            IntPtr pointerWParam = (IntPtr)(1 /* POINTER_ID 1 */ | (0x0001 << 16 /* NEW */) | (0x0002 << 16 /* INRANGE */) | (0x0004 << 16 /* INCONTACT */) | (0x0010 << 16 /* FIRSTBUTTON */) | (0x2000 << 16 /* PRIMARY */));
             Win32.PostMessageW(hwnd, WM_POINTERDOWN, pointerWParam, lParam);
         });
     }
@@ -852,13 +859,12 @@ public sealed class GhostDesktopInput : IDisposable
             IntPtr hwnd;
             POINT clientPt;
 
-            if (_capturedMouseHwnd != IntPtr.Zero && Win32.IsWindow(_capturedMouseHwnd))
+            if (_capturedMouseHwnd != IntPtr.Zero && IsWindowOnGhostDesktop(_capturedMouseHwnd))
             {
                 hwnd = _capturedMouseHwnd;
                 POINT pt = new POINT { X = desktopX, Y = desktopY };
                 Win32.ScreenToClient(hwnd, ref pt);
                 clientPt = pt;
-                _capturedMouseHwnd = IntPtr.Zero;
             }
             else
             {
@@ -867,7 +873,7 @@ public sealed class GhostDesktopInput : IDisposable
                 {
                     _lastTargetHwnd = hwnd;
                 }
-                else if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd))
+                else if (_lastTargetHwnd != IntPtr.Zero && IsWindowOnGhostDesktop(_lastTargetHwnd))
                 {
                     hwnd = _lastTargetHwnd;
                     POINT pt = new POINT { X = desktopX, Y = desktopY };
@@ -894,10 +900,17 @@ public sealed class GhostDesktopInput : IDisposable
                     break;
             }
 
+            if (_heldMouseKeys == 0)
+            {
+                _capturedMouseHwnd = IntPtr.Zero;
+            }
+
+            if (hwnd == IntPtr.Zero) return;
+
             IntPtr lParam = MakeLParam(clientPt.X, clientPt.Y);
             Win32.PostMessageW(hwnd, msg, (IntPtr)_heldMouseKeys, lParam);
 
-            IntPtr pointerWParam = (IntPtr)((1 /* POINTER_ID 1 */) | (1 << 20 /* PRIMARY */));
+            IntPtr pointerWParam = (IntPtr)(1 /* POINTER_ID 1 */ | (0x2000 << 16 /* PRIMARY */));
             Win32.PostMessageW(hwnd, WM_POINTERUP, pointerWParam, lParam);
         });
     }
@@ -913,7 +926,8 @@ public sealed class GhostDesktopInput : IDisposable
     {
         if (doubleClick && button == MouseButton.Left)
         {
-            IntPtr hwndHit = GetWindowAtPoint(desktopX, desktopY, out _, out var hitTopHwnd);
+            IntPtr hitTopHwnd = IntPtr.Zero;
+            RunOnGhostThread(() => GetWindowAtPoint(desktopX, desktopY, out _, out hitTopHwnd));
             if (hitTopHwnd != IntPtr.Zero && hitTopHwnd != Win32.GetDesktopWindow())
             {
                 int hitTest = GetHitTest(hitTopHwnd, desktopX, desktopY);
@@ -927,8 +941,14 @@ public sealed class GhostDesktopInput : IDisposable
 
         SendMouseMove(desktopX, desktopY);
         SendMouseDown(desktopX, desktopY, button);
-        Thread.Sleep(15);
-        SendMouseUp(desktopX, desktopY, button);
+        try
+        {
+            Thread.Sleep(15);
+        }
+        finally
+        {
+            SendMouseUp(desktopX, desktopY, button);
+        }
 
         if (doubleClick)
         {
@@ -936,7 +956,9 @@ public sealed class GhostDesktopInput : IDisposable
             RunOnGhostThread(() =>
             {
                 IntPtr hwnd = GetWindowAtPoint(desktopX, desktopY, out var clientPt);
-                if (hwnd != IntPtr.Zero && hwnd != Win32.GetDesktopWindow())
+                if (hwnd == IntPtr.Zero) return;
+
+                if (hwnd != Win32.GetDesktopWindow())
                 {
                     _lastTargetHwnd = hwnd;
                 }
@@ -966,10 +988,15 @@ public sealed class GhostDesktopInput : IDisposable
                 IntPtr lParam = MakeLParam(clientPt.X, clientPt.Y);
                 Win32.PostMessageW(hwnd, dblMsg, (IntPtr)_heldMouseKeys, lParam);
 
-                Thread.Sleep(15);
-
-                _heldMouseKeys &= ~btnFlag;
-                Win32.PostMessageW(hwnd, upMsg, (IntPtr)_heldMouseKeys, lParam);
+                try
+                {
+                    Thread.Sleep(15);
+                }
+                finally
+                {
+                    _heldMouseKeys &= ~btnFlag;
+                    Win32.PostMessageW(hwnd, upMsg, (IntPtr)_heldMouseKeys, lParam);
+                }
             });
         }
     }
@@ -989,6 +1016,8 @@ public sealed class GhostDesktopInput : IDisposable
             {
                 hwnd = FindKeyboardTarget();
             }
+
+            if (hwnd == IntPtr.Zero) return;
 
             // WM_MOUSEWHEEL: wParam high word is delta, low word is keys
             IntPtr wParam = unchecked((IntPtr)((((uint)delta & 0xFFFF) << 16) | ((uint)_heldMouseKeys & 0xFFFF)));
@@ -1011,23 +1040,30 @@ public sealed class GhostDesktopInput : IDisposable
         SendMouseMove(startX, startY);
         Thread.Sleep(10);
         SendMouseDown(startX, startY, button);
-        Thread.Sleep(15);
 
-        steps = Math.Max(1, steps);
-        for (int i = 1; i <= steps; i++)
+        try
         {
-            double t = (double)i / steps;
-            int currX = (int)Math.Round(startX + (endX - startX) * t);
-            int currY = (int)Math.Round(startY + (endY - startY) * t);
-            SendMouseMove(currX, currY);
-            if (stepDelayMs > 0 && i < steps)
-            {
-                Thread.Sleep(stepDelayMs);
-            }
-        }
+            Thread.Sleep(15);
 
-        Thread.Sleep(15);
-        SendMouseUp(endX, endY, button);
+            steps = Math.Max(1, steps);
+            for (int i = 1; i <= steps; i++)
+            {
+                double t = (double)i / steps;
+                int currX = (int)Math.Round(startX + (endX - startX) * t);
+                int currY = (int)Math.Round(startY + (endY - startY) * t);
+                SendMouseMove(currX, currY);
+                if (stepDelayMs > 0 && i < steps)
+                {
+                    Thread.Sleep(stepDelayMs);
+                }
+            }
+
+            Thread.Sleep(15);
+        }
+        finally
+        {
+            SendMouseUp(endX, endY, button);
+        }
     }
 
     #endregion
@@ -1042,8 +1078,14 @@ public sealed class GhostDesktopInput : IDisposable
     public void SendKeyPress(VirtualKey key)
     {
         SendKeyDown(key);
-        Thread.Sleep(20);
-        SendKeyUp(key);
+        try
+        {
+            Thread.Sleep(20);
+        }
+        finally
+        {
+            SendKeyUp(key);
+        }
     }
 
     /// <summary>
@@ -1080,6 +1122,7 @@ public sealed class GhostDesktopInput : IDisposable
             }
 
             Win32.PostMessageW(targetHwnd, WM_KEYDOWN, (IntPtr)vk, (IntPtr)lParam);
+            _heldKeysHwnd[vk] = targetHwnd;
         });
     }
 
@@ -1095,10 +1138,13 @@ public sealed class GhostDesktopInput : IDisposable
     {
         RunOnGhostThread(() =>
         {
-            IntPtr targetHwnd = FindKeyboardTarget();
+            uint vk = (uint)key;
+
+            IntPtr targetHwnd = _heldKeysHwnd.TryGetValue(vk, out IntPtr tracked) && IsWindowOnGhostDesktop(tracked)
+                ? tracked
+                : FindKeyboardTarget();
             if (targetHwnd == IntPtr.Zero) return;
 
-            uint vk = (uint)key;
             uint scanCode = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
             uint lParam = 1 | (scanCode << 16) | (1u << 30) | (1u << 31);
             if (IsExtendedKey(vk))
@@ -1107,6 +1153,7 @@ public sealed class GhostDesktopInput : IDisposable
             }
 
             Win32.PostMessageW(targetHwnd, WM_KEYUP, (IntPtr)vk, (IntPtr)lParam);
+            _heldKeysHwnd.Remove(vk);
         });
     }
 
@@ -1210,19 +1257,24 @@ public sealed class GhostDesktopInput : IDisposable
         if (alt) Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)VirtualKey.Alt, (IntPtr)(1 | (altSc << 16)));
 
         uint sc = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-        uint downLParam = 1 | (sc << 16);
-        if (IsExtendedKey(vk)) downLParam |= (1u << 24);
-        Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)vk, (IntPtr)downLParam);
+        try
+        {
+            uint downLParam = 1 | (sc << 16);
+            if (IsExtendedKey(vk)) downLParam |= (1u << 24);
+            Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)vk, (IntPtr)downLParam);
 
-        Thread.Sleep(5);
+            Thread.Sleep(5);
 
-        uint upLParam = 1 | (sc << 16) | (1u << 30) | (1u << 31);
-        if (IsExtendedKey(vk)) upLParam |= (1u << 24);
-        Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)vk, (IntPtr)upLParam);
-
-        if (alt) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Alt, (IntPtr)(1 | (altSc << 16) | (1u << 30) | (1u << 31)));
-        if (ctrl) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Control, (IntPtr)(1 | (ctrlSc << 16) | (1u << 30) | (1u << 31)));
-        if (shift) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Shift, (IntPtr)(1 | (shiftSc << 16) | (1u << 30) | (1u << 31)));
+            uint upLParam = 1 | (sc << 16) | (1u << 30) | (1u << 31);
+            if (IsExtendedKey(vk)) upLParam |= (1u << 24);
+            Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)vk, (IntPtr)upLParam);
+        }
+        finally
+        {
+            if (alt) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Alt, (IntPtr)(1 | (altSc << 16) | (1u << 30) | (1u << 31)));
+            if (ctrl) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Control, (IntPtr)(1 | (ctrlSc << 16) | (1u << 30) | (1u << 31)));
+            if (shift) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Shift, (IntPtr)(1 | (shiftSc << 16) | (1u << 30) | (1u << 31)));
+        }
     }
 
     private static void SendKeyPressCore(IntPtr hwnd, VirtualKey key)
@@ -1233,11 +1285,16 @@ public sealed class GhostDesktopInput : IDisposable
         if (IsExtendedKey(vk)) downLParam |= (1u << 24);
         Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)vk, (IntPtr)downLParam);
 
-        Thread.Sleep(15);
-
-        uint upLParam = 1 | (scanCode << 16) | (1u << 30) | (1u << 31);
-        if (IsExtendedKey(vk)) upLParam |= (1u << 24);
-        Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)vk, (IntPtr)upLParam);
+        try
+        {
+            Thread.Sleep(15);
+        }
+        finally
+        {
+            uint upLParam = 1 | (scanCode << 16) | (1u << 30) | (1u << 31);
+            if (IsExtendedKey(vk)) upLParam |= (1u << 24);
+            Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)vk, (IntPtr)upLParam);
+        }
     }
 
     #endregion
@@ -1322,7 +1379,6 @@ public sealed class GhostDesktopInput : IDisposable
     /// </summary>
     public void SendPipMouseUp(int pipX, int pipY, MouseButton button)
     {
-        if (!IsPipInteractive) return;
         var (dx, dy) = MapPipToDesktop(pipX, pipY);
         SendMouseUp(dx, dy, button);
     }
@@ -1345,7 +1401,7 @@ public sealed class GhostDesktopInput : IDisposable
     public void ForwardPipInput(PipInputEventArgs e)
     {
         ArgumentNullException.ThrowIfNull(e);
-        if (!IsPipInteractive) return;
+        if (!IsPipInteractive && e.EventType is not (PipInputEventType.MouseUp or PipInputEventType.KeyUp)) return;
 
         if (e.EventType == PipInputEventType.KeyDown)
         {
@@ -1395,6 +1451,8 @@ public sealed class GhostDesktopInput : IDisposable
     /// </summary>
     public void ForwardKeyInput(PipInputEventType eventType, int keyCode, char character)
     {
+        if (!IsPipInteractive && eventType != PipInputEventType.KeyUp) return;
+
         if (eventType == PipInputEventType.KeyDown)
         {
             SendKeyDown((VirtualKey)keyCode);
@@ -1494,7 +1552,7 @@ public sealed class GhostDesktopInput : IDisposable
         if (hitTopHwnd == IntPtr.Zero)
         {
             clientPt = new POINT { X = desktopX, Y = desktopY };
-            return Win32.GetDesktopWindow();
+            return IntPtr.Zero;
         }
 
         // Drill down into visible child controls
@@ -1597,6 +1655,41 @@ public sealed class GhostDesktopInput : IDisposable
     }
 
     /// <summary>
+    /// Verifies that the given window actually resides on the isolated ghost desktop by
+    /// resolving its owning thread's desktop name. Every input path must only ever post
+    /// messages to windows that pass this check, preventing leaks to the user's real desktop.
+    /// </summary>
+    private bool IsWindowOnGhostDesktop(IntPtr hwnd)
+    {
+        if (hwnd == IntPtr.Zero || !Win32.IsWindow(hwnd))
+        {
+            return false;
+        }
+
+        uint threadId = Win32.GetWindowThreadProcessId(hwnd, out _);
+        if (threadId == 0)
+        {
+            return false;
+        }
+
+        IntPtr hThreadDesktop = Win32.GetThreadDesktop(threadId);
+        if (hThreadDesktop == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        var nameBuf = new byte[512];
+        if (!NativeMethods.GetUserObjectInformationW(hThreadDesktop, NativeMethods.UOI_NAME, nameBuf, nameBuf.Length, out _))
+        {
+            return false;
+        }
+
+        string deskName = Encoding.Unicode.GetString(nameBuf).TrimEnd('\0');
+        return string.Equals(deskName, _desktopName, StringComparison.OrdinalIgnoreCase) ||
+               deskName.EndsWith("\\" + _desktopName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// Dynamically locates the active keyboard input target window on the ghost desktop.
     /// Strictly restricts targets to windows belonging to the isolated desktop (_hDesktop).
     /// Automatically routes input to modal dialogs / active popups (GetLastActivePopup).
@@ -1605,13 +1698,13 @@ public sealed class GhostDesktopInput : IDisposable
     {
         IntPtr target = IntPtr.Zero;
 
-        // 1. Explicit target override
-        if (TargetHwnd.HasValue && TargetHwnd.Value != IntPtr.Zero && Win32.IsWindow(TargetHwnd.Value))
+        // 1. Explicit target override (must reside on the ghost desktop)
+        if (TargetHwnd.HasValue && IsWindowOnGhostDesktop(TargetHwnd.Value))
         {
             target = TargetHwnd.Value;
         }
         // 2. Last target window touched by mouse actions on the ghost desktop (if still valid and visible)
-        else if (_lastTargetHwnd != IntPtr.Zero && Win32.IsWindow(_lastTargetHwnd) && Win32.IsWindowVisible(_lastTargetHwnd) && !Win32.IsIconic(_lastTargetHwnd))
+        else if (_lastTargetHwnd != IntPtr.Zero && IsWindowOnGhostDesktop(_lastTargetHwnd) && Win32.IsWindowVisible(_lastTargetHwnd) && !Win32.IsIconic(_lastTargetHwnd))
         {
             target = _lastTargetHwnd;
         }
@@ -1670,8 +1763,8 @@ public sealed class GhostDesktopInput : IDisposable
             return target;
         }
 
-        // 4. Fallback to desktop window
-        return Win32.GetDesktopWindow();
+        // 4. Fallback to the ghost desktop window only when this thread is bound to it
+        return _isDesktopBound ? Win32.GetDesktopWindow() : IntPtr.Zero;
     }
 
     private static IntPtr MakeLParam(int x, int y)
@@ -1705,7 +1798,6 @@ public sealed class GhostDesktopInput : IDisposable
         {
             _isDraggingWindow = false;
             _dragHwnd = IntPtr.Zero;
-            _capturedMouseHwnd = IntPtr.Zero;
 
             if (_heldMouseKeys != 0)
             {
@@ -1721,6 +1813,28 @@ public sealed class GhostDesktopInput : IDisposable
 
                 _heldMouseKeys = 0;
             }
+
+            _capturedMouseHwnd = IntPtr.Zero;
+
+            foreach (var kv in _heldKeysHwnd)
+            {
+                IntPtr hwnd = kv.Value;
+                if (!IsWindowOnGhostDesktop(hwnd))
+                {
+                    continue;
+                }
+
+                uint vk = kv.Key;
+                uint scanCode = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+                uint lParam = 1 | (scanCode << 16) | (1u << 30) | (1u << 31);
+                if (IsExtendedKey(vk))
+                {
+                    lParam |= (1u << 24);
+                }
+
+                Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)vk, (IntPtr)lParam);
+            }
+            _heldKeysHwnd.Clear();
         });
     }
 
@@ -1809,13 +1923,14 @@ public sealed class GhostDesktopInput : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
 
         try
         {
             ReleaseAll();
         }
         catch { }
+
+        _disposed = true;
 
         _queue.CompleteAdding();
 

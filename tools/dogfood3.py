@@ -1,6 +1,7 @@
 import json, subprocess, sys, threading, queue, time
 
-EXE = r"C:\Users\Ahmet\AppData\Local\Programs\Inbrisk\inbrisk.exe"
+from inbrisk_paths import CLI_EXE
+EXE = str(CLI_EXE)
 proc = subprocess.Popen([EXE, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, bufsize=0)
 q = queue.Queue()

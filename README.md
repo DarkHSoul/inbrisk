@@ -37,6 +37,7 @@ inbrisk hosts          # which MCP hosts are detected/configured
 inbrisk connect cursor
 inbrisk disconnect cursor
 inbrisk repair         # fix stale/missing registrations
+inbrisk ghost tray     # Ghost OS: isolated agent desktop + PiP overlay
 inbrisk uninstall      # removes Inbrisk entries, then the binaries
 ```
 
@@ -72,14 +73,44 @@ Note: VS Code uses `servers` (not `mcpServers`) in `%APPDATA%\Code\User\mcp.json
 - **Desktop Memory & Recipes:** Record proven flows with `computer_save_recipe` and replay them instantly with `computer_run_recipe`.
 - **Actionable Diagnosis:** Zero guessing — unresolvable targets report root causes (`TargetOffscreen`, `BudgetExhausted`, `CloseMatchesFound`) with concrete fixes.
 - **Desktop Concurrency:** Multi-client arbiter guarantees exclusive physical input leases while allowing concurrent read-only observations.
+- **Ghost OS (isolated agent desktop):** Run the agent's work inside an isolated Windows session instead of your interactive desktop.
+
+## Ghost OS
+
+Ghost OS hosts a second, unattended desktop so automation doesn't share or
+disturb the interactive session. It runs under a dedicated local user
+(`InbriskAgent`, auto-provisioned) via a headless loopback RDP session and/or
+an isolated Win32 desktop; a worker inside that session drives its own
+mouse/keyboard over the `inbrisk_ghost_bus` named pipe, and a live
+Picture-in-Picture window shows what the agent sees.
+
+```
+inbrisk ghost tray      # background ghost session + PiP overlay + tray icon
+inbrisk ghost pip       # control the PiP viewer (position, opacity, fps, interactive)
+inbrisk ghost status    # live session + overlay status
+inbrisk ghost stop      # stop session; wipe ghost credentials and temp files
+inbrisk ghost logs      # tail %LOCALAPPDATA%\inbrisk\logs\ghost-os.log
+```
+
+MCP hosts get the matching tools `computer_ghost_start`, `computer_ghost_status`,
+`computer_ghost_batch`, `computer_ghost_control`, and `computer_ghost_stop`.
 
 ## For developers
 
+The canonical implementation is **C# / .NET 8** (`src/Inbrisk.*`,
+`inbrisk.sln`). An experimental Rust workspace was explored earlier and
+archived to `../inbrisk-rust` as a frozen experiment — it is not part of
+this repository and is not built or shipped.
+
 ```
 dotnet build inbrisk.sln            # build
-dotnet test tests/Inbrisk.Tests     # regression suite
+dotnet test tests/Inbrisk.Tests     # regression suite (xunit; desktop tests need an interactive session)
 tools\publish.ps1 -Version 1.0.0    # release artifacts → artifacts\release\
 ```
+
+`tests/Inbrisk.TestApp` is a deterministic WPF fixture app used by the
+end-to-end driver tests. The MCP entry point is `inbrisk.exe mcp`
+(`src/Inbrisk.Cli` → `src/Inbrisk.Mcp`).
 
 See ARCHITECTURE.md for the computer-control design.
 
@@ -87,4 +118,4 @@ See ARCHITECTURE.md for the computer-control design.
 
 Copyright (c) 2026 DarkHSoul. All rights reserved.
 
-This project is licensed under a proprietary / source-available license. See the [LICENSE](LICENSE) file for detailed restrictions and terms. Unauthorized copying, modification, commercial use, or distribution is prohibited.
+This project is licensed under a proprietary / source-available license. See the [LICENSE](LICENSE) file for detailed restrictions and terms. Source is view/review only; distributed binaries (InbriskSetup.exe / inbrisk.exe) may be installed and run for your own internal business or personal use. Unauthorized copying, modification, or redistribution is prohibited. Third-party components are listed in [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

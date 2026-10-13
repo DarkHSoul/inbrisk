@@ -30,31 +30,44 @@ public static class GhostIpcDefaults
     public const int MaxPayloadBytes = 64 * 1024 * 1024;
 
     /// <summary>
+    /// Dedicated local account allowed to connect to the cross-session bus pipe
+    /// (the Session 2 Ghost Worker identity). Must match the provisioned ghost username.
+    /// </summary>
+    public const string DefaultClientAccountName = "InbriskAgent";
+
+    /// <summary>
     /// Default request timeout for IPC operations.
     /// </summary>
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(15);
 
     /// <summary>
-    /// Creates a PipeSecurity instance granting Read/Write access to Everyone (World),
-    /// Authenticated Users, Administrators, and SYSTEM. This allows Session 2 (InbriskAgent)
-    /// running under another user account to connect to Session 1 without permission errors.
+    /// Resolves an account name to its SID; returns null when unresolvable (fail closed).
     /// </summary>
     [SupportedOSPlatform("windows")]
-    public static PipeSecurity CreateCrossSessionPipeSecurity()
+    public static SecurityIdentifier? ResolveAccountSid(string? accountName)
+    {
+        if (string.IsNullOrWhiteSpace(accountName)) return null;
+        try
+        {
+            return new NTAccount(accountName.Trim()).Translate(typeof(SecurityIdentifier)) as SecurityIdentifier;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Creates a hardened PipeSecurity instance granting FullControl only to Administrators and
+    /// SYSTEM, plus ReadWrite to the dedicated ghost worker account (when resolvable).
+    /// No World, Authenticated Users, or ambient current-user access: arbitrary same-user
+    /// processes cannot attach to or drive the ghost session. Unresolvable accounts are
+    /// simply omitted, which fails closed (connection denied) rather than opening access.
+    /// </summary>
+    [SupportedOSPlatform("windows")]
+    public static PipeSecurity CreateCrossSessionPipeSecurity(string? clientAccount = DefaultClientAccountName)
     {
         var ps = new PipeSecurity();
-
-        // Everyone / World SID (S-1-1-0)
-        ps.AddAccessRule(new PipeAccessRule(
-            new SecurityIdentifier(WellKnownSidType.WorldSid, null),
-            PipeAccessRights.ReadWrite,
-            AccessControlType.Allow));
-
-        // Authenticated Users SID (S-1-5-11)
-        ps.AddAccessRule(new PipeAccessRule(
-            new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
-            PipeAccessRights.ReadWrite,
-            AccessControlType.Allow));
 
         // Built-in Administrators SID (S-1-5-32-544)
         ps.AddAccessRule(new PipeAccessRule(
@@ -68,21 +81,14 @@ public static class GhostIpcDefaults
             PipeAccessRights.FullControl,
             AccessControlType.Allow));
 
-        // Current User identity
-        try
+        // Dedicated ghost worker account (e.g. InbriskAgent running in Session 2)
+        var clientSid = ResolveAccountSid(clientAccount);
+        if (clientSid != null)
         {
-            var currentUser = WindowsIdentity.GetCurrent().User;
-            if (currentUser != null)
-            {
-                ps.AddAccessRule(new PipeAccessRule(
-                    currentUser,
-                    PipeAccessRights.FullControl,
-                    AccessControlType.Allow));
-            }
-        }
-        catch
-        {
-            // Fallback if token inspection is restricted
+            ps.AddAccessRule(new PipeAccessRule(
+                clientSid,
+                PipeAccessRights.ReadWrite,
+                AccessControlType.Allow));
         }
 
         return ps;
@@ -94,17 +100,20 @@ public static class GhostIpcDefaults
     public static NamedPipeServerStream CreateServerStream(
         string pipeName = PipeName,
         int maxInstances = NamedPipeServerStream.MaxAllowedServerInstances,
-        int bufferSize = 65536)
+        int bufferSize = 65536,
+        string? clientAccount = null)
     {
         if (OperatingSystem.IsWindows())
         {
-            var security = CreateCrossSessionPipeSecurity();
+            string? effectiveAccount = clientAccount ??
+                (string.Equals(pipeName, PipeName, StringComparison.Ordinal) ? DefaultClientAccountName : null);
+            var security = CreateCrossSessionPipeSecurity(effectiveAccount);
             return NamedPipeServerStreamAcl.Create(
                 pipeName,
                 PipeDirection.InOut,
                 maxInstances,
                 PipeTransmissionMode.Byte,
-                PipeOptions.Asynchronous,
+                PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance,
                 inBufferSize: bufferSize,
                 outBufferSize: bufferSize,
                 pipeSecurity: security);
@@ -122,6 +131,8 @@ public static class GhostIpcDefaults
 
     /// <summary>
     /// Creates a NamedPipeClientStream connecting to the specified pipe.
+    /// Uses Identification-level impersonation so the server can authenticate the client
+    /// identity without being able to impersonate it.
     /// </summary>
     public static NamedPipeClientStream CreateClientStream(
         string pipeName = PipeName,
@@ -131,7 +142,8 @@ public static class GhostIpcDefaults
             serverName,
             pipeName,
             PipeDirection.InOut,
-            PipeOptions.Asynchronous);
+            PipeOptions.Asynchronous,
+            TokenImpersonationLevel.Identification);
     }
 }
 
@@ -301,7 +313,16 @@ public sealed class GhostIpcConnection : IGhostIpcBus
             }
         });
 
-        await SendEnvelopeAsync(envelope, linkedCts.Token).ConfigureAwait(false);
+        try
+        {
+            await SendEnvelopeAsync(envelope, linkedCts.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            _pendingRequests.TryRemove(envelope.Id, out _);
+            throw;
+        }
+
         return await tcs.Task.ConfigureAwait(false);
     }
 
@@ -348,7 +369,16 @@ public sealed class GhostIpcConnection : IGhostIpcBus
                 GhostTelemetry.RecordIpcReceived();
 
                 string json = Encoding.UTF8.GetString(bodyBuf);
-                var envelope = JsonSerializer.Deserialize<GhostIpcEnvelope>(json, JsonOptions);
+                GhostIpcEnvelope? envelope;
+                try
+                {
+                    envelope = JsonSerializer.Deserialize<GhostIpcEnvelope>(json, JsonOptions);
+                }
+                catch (JsonException jex)
+                {
+                    GhostLogger.Warn($"[GhostIpc] Dropping malformed IPC frame ({bodyBuf.Length} bytes): {jex.Message}");
+                    continue;
+                }
                 if (envelope == null) continue;
 
                 DispatchEnvelope(envelope);
@@ -367,6 +397,36 @@ public sealed class GhostIpcConnection : IGhostIpcBus
 
     private void DispatchEnvelope(GhostIpcEnvelope envelope)
     {
+        // 0. Schema validation: malformed inbound messages must error, never crash the dispatch.
+        if (!GhostIpcMessageValidator.TryValidate(
+                envelope.Id, envelope.Type, envelope.Action, envelope.CorrelationId, out var validationError))
+        {
+            GhostLogger.Warn($"[GhostIpc] Dropping invalid IPC message: {validationError}");
+
+            // Best-effort error response so a well-formed caller does not hang until timeout.
+            if (string.Equals(envelope.Type, "request", StringComparison.Ordinal) &&
+                !string.IsNullOrEmpty(envelope.Id) &&
+                envelope.Id.Length <= GhostIpcMessageValidator.MaxIdLength)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        var err = new GhostIpcEnvelope
+                        {
+                            Type = "response",
+                            CorrelationId = envelope.Id,
+                            Action = envelope.Action ?? string.Empty,
+                            Error = $"Invalid IPC message: {validationError}"
+                        };
+                        await SendEnvelopeAsync(err, CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch { }
+                });
+            }
+            return;
+        }
+
         // 1. Response or Pong
         if (envelope.Type == "response" || envelope.Type == "pong" || envelope.Action == "__pong")
         {
@@ -500,6 +560,7 @@ public sealed class GhostIpcConnection : IGhostIpcBus
 public sealed class GhostIpcServer : IGhostIpcBus
 {
     private readonly string _pipeName;
+    private readonly string? _clientAccount;
     private readonly ConcurrentDictionary<string, Func<string, Task<string>>> _handlers = new(StringComparer.OrdinalIgnoreCase);
 
     private CancellationTokenSource? _cts;
@@ -514,9 +575,13 @@ public sealed class GhostIpcServer : IGhostIpcBus
 
     public bool IsConnected => _activeConnection?.IsConnected == true;
 
-    public GhostIpcServer(string pipeName = GhostIpcDefaults.PipeName)
+    public GhostIpcServer(string pipeName = GhostIpcDefaults.PipeName, string? clientAccount = null)
     {
         _pipeName = pipeName;
+        _clientAccount = clientAccount ??
+            (string.Equals(pipeName, GhostIpcDefaults.PipeName, StringComparison.Ordinal)
+                ? GhostIpcDefaults.DefaultClientAccountName
+                : null);
     }
 
     /// <summary>
@@ -575,8 +640,15 @@ public sealed class GhostIpcServer : IGhostIpcBus
             NamedPipeServerStream? serverStream = null;
             try
             {
-                serverStream = GhostIpcDefaults.CreateServerStream(_pipeName);
+                serverStream = GhostIpcDefaults.CreateServerStream(_pipeName, clientAccount: _clientAccount);
                 await serverStream.WaitForConnectionAsync(ct).ConfigureAwait(false);
+
+                if (!IsClientAuthorized(serverStream))
+                {
+                    GhostLogger.Warn($"[GhostIpc] Rejected unauthorized client connection on pipe '{_pipeName}'.");
+                    try { serverStream.Disconnect(); } catch { }
+                    continue;
+                }
 
                 var connection = new GhostIpcConnection(serverStream);
                 foreach (var kvp in _handlers)
@@ -618,6 +690,46 @@ public sealed class GhostIpcServer : IGhostIpcBus
                     try { serverStream.Dispose(); } catch { }
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Authenticates the connected pipe client by inspecting its token under impersonation.
+    /// Only SYSTEM, well-known service SIDs, Administrators, and the designated ghost worker
+    /// account are allowed; anything else is rejected (fail closed).
+    /// </summary>
+    private bool IsClientAuthorized(NamedPipeServerStream stream)
+    {
+        if (!OperatingSystem.IsWindows()) return true;
+
+        try
+        {
+            SecurityIdentifier? clientSid = null;
+            bool privileged = false;
+
+            stream.RunAsClient(() =>
+            {
+                using var identity = WindowsIdentity.GetCurrent();
+                var user = identity.User;
+                clientSid = user;
+                if (user != null)
+                {
+                    privileged =
+                        user.IsWellKnown(WellKnownSidType.LocalSystemSid) ||
+                        user.IsWellKnown(WellKnownSidType.LocalServiceSid) ||
+                        user.IsWellKnown(WellKnownSidType.NetworkServiceSid) ||
+                        new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+                }
+            });
+
+            if (privileged) return true;
+
+            var allowedSid = GhostIpcDefaults.ResolveAccountSid(_clientAccount);
+            return allowedSid != null && clientSid != null && clientSid.Equals(allowedSid);
+        }
+        catch
+        {
+            return false;
         }
     }
 

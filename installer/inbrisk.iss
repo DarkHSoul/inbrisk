@@ -18,7 +18,13 @@ AppUpdatesURL={#MyAppURL}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
-; Per-user install by default (no UAC prompt required), with option to elevate to all users
+; Per-user install by default (no UAC prompt required), with option to elevate to all users.
+; requestedExecutionLevel coverage (F31): Inno derives the setup/uninstall
+; manifest from PrivilegesRequired — "lowest" emits asInvoker, and the
+; overrides below relaunch elevated on demand rather than embedding
+; requireAdministrator. The SendInput binary's own manifest lives at
+; src\Inbrisk.Cli\app.manifest (no uiAccess — SendInput/UIA does not need it
+; from a non-accessibility, unsigned-or-user-signed binary).
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog commandline
 OutputDir=..\artifacts\release
@@ -32,14 +38,30 @@ ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=no
 RestartApplications=no
 DisableProgramGroupPage=yes
+#ifdef SignCert
+SignTool=inbrisk
+SignedUninstaller=yes
+#endif
 
 ; --- opt-in Authenticode signing (F31) --------------------------------------
-; No code-signing certificate exists yet. When one is provisioned, sign the
-; compiler output AND the uninstaller by defining a sign tool on the ISCC
-; command line and uncommenting the two directives below:
-;   iscc /Sinbrisk="signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /sha1 $q%INBRISK_SIGN_SHA1%$q $f" inbrisk.iss
-;SignTool=inbrisk
-;SignedUninstaller=yes
+; Dev/source builds stay unsigned. A release build signs the payload exe,
+; the setup binary and the uninstaller once a cert is configured — either
+; pass /DSignCert plus the sign-tool definition:
+;   iscc /DSignCert /Sinbrisk="signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /sha1 $q<THUMBPRINT>$q $f" inbrisk.iss
+; or just set INBRISK_SIGN_SHA1 in the environment (the cert thumbprint the
+; release pipeline's signtool /S line already consumes).
+#ifndef SignCert
+  #if GetEnv("INBRISK_SIGN_SHA1") != ""
+    #define SignCert
+  #endif
+#endif
+#ifdef SignCert
+  #pragma message "inbrisk: Authenticode signing ENABLED (SignCert / INBRISK_SIGN_SHA1)"
+  #define ExeFlags "ignoreversion signonce"
+#else
+  #pragma message "inbrisk: unsigned build — set INBRISK_SIGN_SHA1 or pass /DSignCert to sign"
+  #define ExeFlags "ignoreversion"
+#endif
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -51,9 +73,13 @@ Name: "startup"; Description: "Windows başladığında sistem tepsisinde (Tray)
 Name: "addtopath"; Description: "Inbrisk komutunu sistem PATH ortam değişkenine ekle (Terminal erişimi için)"; GroupDescription: "Geliştirici Seçenekleri:"; Flags: checkedonce
 
 [Files]
-Source: "..\artifacts\publish\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\artifacts\publish\{#MyAppExeName}"; DestDir: "{app}"; Flags: {#ExeFlags}
 Source: "inbrisk.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\src\Inbrisk.Platform.Windows\Assets\inbrisk_logo.png"; DestDir: "{app}\Assets"; Flags: ignoreversion
+; Legal payload — license + attribution notices must ship inside the install dir.
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "tray"; IconFilename: "{app}\inbrisk.ico"; WorkingDir: "{app}"

@@ -680,8 +680,21 @@ public sealed class SendInputService : IInputService
     {
         SendInputService[] instances;
         lock (Live) instances = Live.ToArray();
+        // watchdog must never die — but a fault must not be silent either
         foreach (var svc in instances)
-            try { svc.WatchdogScan(); } catch { /* watchdog must never die */ }
+            try { svc.WatchdogScan(); }
+            catch (Exception e)
+            {
+                try
+                {
+                    InputTelemetry.Record(new InputEventRecord
+                    {
+                        Kind = InputTxnKind.Other, Phase = "watchdog",
+                        Note = $"watchdog scan fault: {e.GetType().Name}: {e.Message}",
+                    });
+                }
+                catch { /* telemetry must not kill the watchdog either */ }
+            }
     }
 
     private void WatchdogScan()

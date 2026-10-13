@@ -61,6 +61,13 @@ public sealed class McpSession : IDisposable
     public RequestDeduplicator Deduplicator { get; } = new();
     public DynamicToolset.DynamicToolsetManager DynamicToolset { get; } = new();
 
+    /// <summary>F04: session confirmation channel — the server-side
+    /// approval gate wired to SafetyPolicy.Confirmer (CONFIRM classes) and
+    /// SafetyPolicy.LocalConsent (dangerous classes). Approvals exist only
+    /// when a LOCAL consent surface grants a pending request; tool-call
+    /// arguments can never satisfy it.</summary>
+    public ConfirmChannel Confirm { get; }
+
     /// <summary>Session-shared modal-reflex engine — one interception
     /// watcher per session, armed/disarmed per plan run by RunPlanCore.
     /// RuntimeReflexEngine over Inbrisk.Runtime.ReflexEngine; degrades to
@@ -237,15 +244,17 @@ public sealed class McpSession : IDisposable
         MonitorCache = new MonitorTopologyCache(telemetry: Telemetry.MonitorTopology);
         VdmHolder = new VirtualDesktopManagerHolder();
 
-        // AutoConfirm: the MCP client's explicit tool call IS the
-        // confirmation — the client is the brain. Deny-classified actions
-        // (elevated targets, password fields, deny-listed processes,
-        // kill-switch) still refuse regardless. F04: AutoConfirm never
-        // satisfies DANGEROUS classes (input into shell/terminal hosts,
-        // destructive close chords) — Executor routes those through
-        // SafetyPolicy.LocalConsent / a local Confirmer only, so the model
-        // cannot self-approve them.
-        Rt = new InbriskRuntime(new InbriskOptions(AutoConfirm: true,
+        // F04: AutoConfirm stays OFF for the MCP host — a CONFIRM-class
+        // action must not be satisfied by the tool call that requested it:
+        // the model supplies the call, so accepting it as consent is
+        // self-approval, not a human checkpoint. The gate is Confirm —
+        // Executor consults SafetyPolicy.Confirmer (CONFIRM classes) and
+        // SafetyPolicy.LocalConsent (dangerous classes), which approve
+        // only a pending request a LOCAL consent surface granted. Deny-
+        // classified actions (elevated targets, password fields, deny-
+        // listed processes, kill-switch) still refuse regardless.
+        Confirm = new ConfirmChannel(SessionId);
+        Rt = new InbriskRuntime(new InbriskOptions(AutoConfirm: false,
             StartEvents: startEvents,
             // F32: audit trail lives under %ProgramData%\Inbrisk\audit
             // (ACL'd, hash-chained); the data-dir copy is a readable mirror.
@@ -254,6 +263,10 @@ public sealed class McpSession : IDisposable
             HwndMetadataCache: HwndMetadata,
             MonitorTopologyCache: MonitorCache,
             VdmHolder: VdmHolder));
+        // F04: wire the policy's consent hooks to the session channel —
+        // Confirmer for CONFIRM classes, LocalConsent for dangerous ones.
+        Rt.Policy.Confirmer = Confirm.Confirmer;
+        Rt.Policy.LocalConsent = Confirm.LocalConsent;
         Rt.Event += OnEvent;
         // Stamp every process this session spawns with our id — Dispose then
         // reaps only this session's launches.
@@ -581,6 +594,9 @@ public sealed class McpSession : IDisposable
         {
             kind = e.Kind.ToString(),
             hwnd = e.Hwnd is { } hh ? $"0x{hh:X}" : null,
+            // F03: title/process are observed screen text — flag them so
+            // the client treats them as data, never as instructions
+            untrusted = true,
             title = win?.Title,
             pid = e.Pid ?? win?.Pid,
             process = win?.ProcessName,

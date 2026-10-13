@@ -17,6 +17,12 @@ public class ApplicationAdapterTests
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(session, "test-adapter-session");
         typeof(McpSession).GetField("<Adapters>k__BackingField",
             System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(session, registry ?? new ApplicationAdapterRegistry());
+        // Emergency-gate wiring (F11): adapter actions consult Control.ActionToken
+        // and SessionCts — an uninitialized session has neither.
+        typeof(McpSession).GetField("<Control>k__BackingField",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(session, EmergencyControl.ForTests());
+        typeof(McpSession).GetField("<SessionCts>k__BackingField",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)?.SetValue(session, new CancellationTokenSource());
 
         var tools = (InbriskTools)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(InbriskTools));
         typeof(InbriskTools).GetField("_s",

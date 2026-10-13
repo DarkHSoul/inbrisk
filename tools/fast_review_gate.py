@@ -4,6 +4,8 @@ import subprocess
 import sys
 import xml.etree.ElementTree as ET
 
+from inbrisk_paths import ARTIFACTS, TESTS_DIR
+
 INTERACTIVE_DESKTOP_CLASSES = {
     "ActionTests",
     "AgentTests",
@@ -26,7 +28,7 @@ INTERACTIVE_DESKTOP_CLASSES = {
 }
 
 def main():
-    manifest_path = r"C:\Users\Ahmet\Documents\inbrisk\artifacts\baseline_manifest_4271b3f.json"
+    manifest_path = str(ARTIFACTS / "baseline_manifest_4271b3f.json")
     if not os.path.exists(manifest_path):
         print(f"Error: Manifest not found at {manifest_path}")
         sys.exit(1)
@@ -40,7 +42,7 @@ def main():
     # Step 1: Discover all current tests in the workspace
     print("[1/4] Discovering test suite...")
     list_cmd = ["dotnet", "test", "--list-tests", "--configuration", "Release", "--no-build", "--no-restore"]
-    proc = subprocess.run(list_cmd, cwd=r"C:\Users\Ahmet\Documents\inbrisk\tests\Inbrisk.Tests", capture_output=True, text=True)
+    proc = subprocess.run(list_cmd, cwd=str(TESTS_DIR), capture_output=True, text=True)
     if proc.returncode != 0:
         print("Failed to list tests:", proc.stderr)
         sys.exit(1)
@@ -77,7 +79,7 @@ def main():
     filter_expr = "|".join([f"FullyQualifiedName~Inbrisk.Tests.{cls}." for cls in safe_classes])
 
     trx_filename = "fast_gate_safe_results.trx"
-    trx_dir = r"C:\Users\Ahmet\Documents\inbrisk\tests\Inbrisk.Tests\TestResults"
+    trx_dir = str(TESTS_DIR / "TestResults")
     trx_path = os.path.join(trx_dir, trx_filename)
     if os.path.exists(trx_path):
         try: os.remove(trx_path)
@@ -93,7 +95,7 @@ def main():
         "--filter", filter_expr,
         "--logger", f"trx;LogFileName={trx_filename}"
     ]
-    res = subprocess.run(test_cmd, cwd=r"C:\Users\Ahmet\Documents\inbrisk\tests\Inbrisk.Tests")
+    res = subprocess.run(test_cmd, cwd=str(TESTS_DIR))
 
     # Step 4: Parse Results
     print("\n[3/4] Parsing execution results...")
@@ -169,7 +171,8 @@ def main():
         "newSafeTestsExecuted": len(new_safe_executed),
         "newSafeTestsFailing": sorted(list(new_safe_failing))
     }
-    with open(r"C:\Users\Ahmet\Documents\inbrisk\artifacts\fast_gate_summary.json", "w", encoding="utf-8") as f:
+    os.makedirs(ARTIFACTS, exist_ok=True)
+    with open(ARTIFACTS / "fast_gate_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     sys.exit(0 if gate_passed else 1)

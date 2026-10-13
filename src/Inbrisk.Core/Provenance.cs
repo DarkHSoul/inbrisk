@@ -390,6 +390,25 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
 
     public bool CanAgentCloseProcess(int pid, out string? reason)
     {
+        if (_windowService != null)
+        {
+            try
+            {
+                foreach (var w in _windowService.ListWindows())
+                {
+                    if (w.Pid == pid && _windowService.IsWindowProtected(w.Hwnd, out var protReason))
+                    {
+                        reason = $"Process is protected by safety policy: {protReason}";
+                        return false;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"CanAgentCloseProcess protection probe pid={pid} failed: {ex.Message}");
+            }
+        }
+
         var prov = GetProvenance(pid);
         if (prov == null)
         {

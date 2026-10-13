@@ -25,7 +25,14 @@ public class GhostDesktopInput : IDisposable
     private IInputService? _inputService;
     private object? _platformInjector;
     private MethodInfo? _platformForwardMethod;
+    private MethodInfo? _platformReleaseMethod;
     private bool _disposed;
+    // Real-desktop input (IInputService/SendInput) can NEVER reach the ghost
+    // desktop — it only ever lands on the caller's own input desktop. It is
+    // therefore opt-in only: enabled when a caller explicitly supplies a
+    // service (session-2 worker context). Any silent fallback to local input
+    // would be a ghost→real-desktop input leak.
+    private bool _allowLocalInput;
 
     /// <summary>
     /// Gets or sets the IPC bus used to forward input to Session 2.
@@ -38,11 +45,17 @@ public class GhostDesktopInput : IDisposable
 
     /// <summary>
     /// Gets or sets the local input service used when IPC is disconnected.
+    /// Assigning a service opts this instance into real-desktop input
+    /// (session-2 worker); reading never opts in by itself.
     /// </summary>
     public IInputService InputService
     {
         get => _inputService ??= ResolveInputService();
-        set => _inputService = value;
+        set
+        {
+            _inputService = value;
+            _allowLocalInput = value != null;
+        }
     }
 
     /// <summary>
@@ -70,6 +83,7 @@ public class GhostDesktopInput : IDisposable
     {
         _ipcBus = ipcBus;
         _inputService = inputService;
+        _allowLocalInput = inputService != null;
 
         if (_inputService == null && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
@@ -83,6 +97,7 @@ public class GhostDesktopInput : IDisposable
                     {
                         _platformInjector = ctor.Invoke(new object[] { "InbriskGhostDesktop", 1920, 1080, true });
                         _platformForwardMethod = pType.GetMethod("ForwardPipInput", new[] { typeof(PipInputEventArgs) });
+                        _platformReleaseMethod = pType.GetMethod("ReleaseAll", Type.EmptyTypes);
                     }
                 }
             }
@@ -109,7 +124,7 @@ public class GhostDesktopInput : IDisposable
         MouseButton button = MouseButton.Left,
         int delta = 0)
     {
-        if (_disposed) return;
+        if (_disposed || EmergencyGate.IsStopped) return;
 
         try
         {
@@ -118,21 +133,23 @@ public class GhostDesktopInput : IDisposable
                 // Route via IPC packet to Session 2 worker daemon
                 _ = DispatchIpcAsync(eventType, targetX, targetY, button, delta);
             }
-            else if (_inputService != null)
-            {
-                // Route directly via supplied local input service
-                DispatchLocal(eventType, targetX, targetY, button, delta);
-            }
             else if (_platformInjector != null && _platformForwardMethod != null)
             {
                 // Route directly to isolated desktop via Windows platform injector
                 var args = new PipInputEventArgs(eventType, targetX, targetY, button, delta, isMapped: true);
                 _platformForwardMethod.Invoke(_platformInjector, new object[] { args });
             }
+            else if (_allowLocalInput)
+            {
+                // Explicit opt-in (session-2 worker): inject into the desktop
+                // this process actually runs on.
+                DispatchLocal(eventType, targetX, targetY, button, delta);
+            }
             else
             {
-                // Route directly via default local input service
-                DispatchLocal(eventType, targetX, targetY, button, delta);
+                // No ghost route and no opt-in: dropping is the only safe
+                // outcome — local injection would hit the user's real desktop.
+                Debug.WriteLine($"[GhostDesktopInput] Dropped {eventType}: no IPC bus, no platform injector, local input not enabled");
             }
 
             InputDispatched?.Invoke(eventType, targetX, targetY, button, delta);
@@ -149,7 +166,7 @@ public class GhostDesktopInput : IDisposable
     /// </summary>
     public void ForwardKeyInput(PipInputEventType eventType, int keyCode, char character)
     {
-        if (_disposed) return;
+        if (_disposed || EmergencyGate.IsStopped) return;
 
         try
         {
@@ -169,7 +186,7 @@ public class GhostDesktopInput : IDisposable
                 var args = new PipInputEventArgs(eventType, 0, 0, keyCode: keyCode, character: character, isMapped: true);
                 _platformForwardMethod.Invoke(_platformInjector, new object[] { args });
             }
-            else
+            else if (_allowLocalInput)
             {
                 if (eventType == PipInputEventType.Char && character != '\0')
                 {
@@ -182,6 +199,10 @@ public class GhostDesktopInput : IDisposable
                     else if (eventType == PipInputEventType.KeyUp)
                         InputService.KeyUp((KeyCode)keyCode);
                 }
+            }
+            else
+            {
+                Debug.WriteLine($"[GhostDesktopInput] Dropped key {eventType} vk={keyCode}: no ghost route available");
             }
         }
         catch (Exception ex)
@@ -227,56 +248,30 @@ public class GhostDesktopInput : IDisposable
         ForwardInput(PipInputEventType.MouseWheel, targetX, targetY, MouseButton.Left, delta);
 
     /// <summary>Presses a key down on the ghost desktop.</summary>
-    public void SendKeyDown(KeyCode key)
-    {
-        if (IsIpcActive)
-        {
-            _ = SendKeyIpcAsync("keydown", (int)key);
-        }
-        else
-        {
-            InputService.KeyDown(key);
-        }
-    }
+    public void SendKeyDown(KeyCode key) =>
+        ForwardKeyInput(PipInputEventType.KeyDown, (int)key, '\0');
 
     /// <summary>Releases a key up on the ghost desktop.</summary>
-    public void SendKeyUp(KeyCode key)
-    {
-        if (IsIpcActive)
-        {
-            _ = SendKeyIpcAsync("keyup", (int)key);
-        }
-        else
-        {
-            InputService.KeyUp(key);
-        }
-    }
+    public void SendKeyUp(KeyCode key) =>
+        ForwardKeyInput(PipInputEventType.KeyUp, (int)key, '\0');
 
     /// <summary>Types a Unicode character into the active application in the ghost desktop.</summary>
-    public void SendChar(char c)
-    {
-        if (IsIpcActive)
-        {
-            _ = SendCharIpcAsync(c);
-        }
-        else
-        {
-            InputService.TypeText(c.ToString());
-        }
-    }
+    public void SendChar(char c) =>
+        ForwardKeyInput(PipInputEventType.Char, 0, c);
 
     /// <summary>Types text string into the active application in the ghost desktop.</summary>
     public void SendText(string text)
     {
-        if (string.IsNullOrEmpty(text)) return;
+        if (string.IsNullOrEmpty(text) || EmergencyGate.IsStopped || _disposed) return;
 
         if (IsIpcActive)
         {
             _ = SendTextIpcAsync(text);
+            return;
         }
-        else
+        foreach (var c in text)
         {
-            InputService.TypeText(text);
+            ForwardKeyInput(PipInputEventType.Char, 0, c);
         }
     }
 
@@ -295,7 +290,15 @@ public class GhostDesktopInput : IDisposable
                 _ = _ipcBus?.SendRequestAsync("forward_input", packet.ToJson(), TimeSpan.FromSeconds(1));
             }
 
-            _inputService?.ReleaseAll();
+            if (_platformInjector != null && _platformReleaseMethod != null)
+            {
+                try { _platformReleaseMethod.Invoke(_platformInjector, null); } catch { }
+            }
+
+            if (_allowLocalInput)
+            {
+                _inputService?.ReleaseAll();
+            }
         }
         catch { }
     }

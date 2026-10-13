@@ -49,6 +49,7 @@ public sealed class GhostTrayApp : IDisposable
     private static GhostTrayApp? _current;
 
     private IntPtr _hIcon = IntPtr.Zero;
+    private Bitmap? _hIconBitmap;
     private bool _iconAdded;
     private volatile bool _disposed;
 
@@ -284,7 +285,7 @@ public sealed class GhostTrayApp : IDisposable
         }
         finally
         {
-            _ready.Set();
+            try { _ready.Set(); } catch { }
         }
     }
 
@@ -324,7 +325,7 @@ public sealed class GhostTrayApp : IDisposable
         }
         finally
         {
-            _ready.Set();
+            try { _ready.Set(); } catch { }
         }
 
         while (NativeMethods.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -433,8 +434,8 @@ public sealed class GhostTrayApp : IDisposable
         {
             try
             {
-                var bmp = AppIconExtractor.GetInbriskLogo(32);
-                _hIcon = bmp.GetHicon();
+                _hIconBitmap = AppIconExtractor.GetInbriskLogo(32);
+                _hIcon = _hIconBitmap.GetHicon();
             }
             catch
             {
@@ -536,6 +537,9 @@ public sealed class GhostTrayApp : IDisposable
             NativeMethods.DestroyIcon(_hIcon);
             _hIcon = IntPtr.Zero;
         }
+
+        _hIconBitmap?.Dispose();
+        _hIconBitmap = null;
     }
 
     #endregion
@@ -710,10 +714,18 @@ public sealed class GhostTrayApp : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        if (ReferenceEquals(_current, this))
+        {
+            _current = null;
+        }
+
         if (_threadId != 0)
         {
             NativeMethods.PostThreadMessageW(_threadId, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-            _thread?.Join(2000);
+            if (_threadId != NativeMethods.GetCurrentThreadId())
+            {
+                _thread?.Join(2000);
+            }
             _threadId = 0;
         }
 

@@ -7,7 +7,12 @@ namespace Inbrisk.Platform.Windows.Uia;
 /// <summary>
 /// Single authoritative mutation and input lane for all UI state alterations (click, invoke,
 /// set value, type, key, focus, close, etc.).
-/// 
+///
+/// TEST-ONLY: retained for the Inbrisk.Tests concurrency suite. The production runtime
+/// does not instantiate this type — mutation ordering is enforced by DesktopArbiter plus
+/// UiaReadScheduler. The constructor is internal so only friend assemblies
+/// (Inbrisk.Tests / Inbrisk.Cli) can build one.
+///
 /// Design Rationale & Invariants:
 /// 1. Single Authoritative Lane (Max Concurrency = 1): Concurrent UI mutations in Windows desktop
 ///    cause focus stealing, race conditions in control pattern invocation, and corrupted control states.
@@ -52,9 +57,6 @@ public sealed class SerialMutationLane : IDisposable, IAsyncDisposable
         }
     }
 
-    private static readonly Lazy<SerialMutationLane> _shared = new(() => new SerialMutationLane());
-    public static SerialMutationLane Shared => _shared.Value;
-
     private readonly IDesktopArbiter? _arbiter;
     private readonly BlockingCollection<MutationWorkItem> _queue = new();
     private readonly Thread _workerThread;
@@ -88,7 +90,7 @@ public sealed class SerialMutationLane : IDisposable, IAsyncDisposable
         }
     }
 
-    public SerialMutationLane(
+    internal SerialMutationLane(
         IDesktopArbiter? arbiter = null,
         UiaReadPool? readPool = null,
         int maxConsecutiveMutationsBeforeYield = 3)
@@ -153,7 +155,11 @@ public sealed class SerialMutationLane : IDisposable, IAsyncDisposable
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
         catch (InvalidOperationException) { }
-        catch (Exception) { }
+        catch (Exception e)
+        {
+            // Boundary: a bare worker thread must never take the process down.
+            Debug.WriteLine($"inbrisk mutation-lane worker exited: {e}");
+        }
     }
 
     private async Task ExecuteItemAsync(MutationWorkItem item)
@@ -191,7 +197,11 @@ public sealed class SerialMutationLane : IDisposable, IAsyncDisposable
             {
                 await pool.WaitForActiveReadsDrainedAsync(TimeSpan.FromSeconds(5), item.CancellationToken).ConfigureAwait(false);
             }
-            catch (TimeoutException) { }
+            catch (TimeoutException)
+            {
+                // Drain budget exhausted — proceed with the mutation anyway; the
+                // lane's single-consumer invariant still keeps mutations serialized.
+            }
         }
 
         // 3. Acquire DesktopArbiter lease if arbiter is configured (shared across logical sessions)
@@ -382,7 +392,10 @@ public sealed class SerialMutationLane : IDisposable, IAsyncDisposable
             _readCompletedSignal.Dispose();
             _queue.Dispose();
         }
-        catch { }
+        catch (Exception e)
+        {
+            Debug.WriteLine($"inbrisk mutation-lane dispose fault (best effort): {e}");
+        }
     }
 
     public ValueTask DisposeAsync()

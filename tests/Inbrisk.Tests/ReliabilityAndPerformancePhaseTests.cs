@@ -442,10 +442,10 @@ public class ReliabilityAndPerformancePhaseTests
     // =========================================================================
 
     [Fact]
-    public void CoreToolNames_ContainsExactly16Tools()
+    public void CoreToolNames_ContainsExactly25Tools()
     {
         var coreTools = McpHost.CoreTools;
-        Assert.Equal(16, coreTools.Count);
+        Assert.Equal(25, coreTools.Count);
 
         var expected = new[]
         {
@@ -465,6 +465,18 @@ public class ReliabilityAndPerformancePhaseTests
             "computer_screenshot",
             "computer_reset_input",
             "computer_capabilities",
+            // escape-hatch + run-lifecycle tools (without them a core session
+            // can never reach the wider toolset or reuse recorded plans)
+            "computer_toolset",
+            "computer_save_recipe",
+            "computer_run_recipe",
+            "computer_list_recipes",
+            "computer_pause_run",
+            "computer_resume_run",
+            "computer_wait_for",
+            // ghost desktop control entry points
+            "ghost_control_open",
+            "computer_ghost_control",
         };
 
         foreach (var tool in expected)
@@ -797,7 +809,10 @@ public class ReliabilityAndPerformancePhaseTests
         var result = exec.Perform(intent, new ActionContext(CancellationToken.None, null, "test", null, null));
 
         Assert.True(result.Success);
-        Assert.Equal(0, reresolveCalls); // Zero redundant ReResolves performed!
+        // Exactly one ReResolve: the ActionDeltaCollector's target re-read that
+        // produces the per-action element delta. The verification path itself
+        // performs zero redundant ReResolves (Click/Invoke skip PostVerify).
+        Assert.Equal(1, reresolveCalls);
     }
 
     // =========================================================================
@@ -1062,16 +1077,17 @@ public class ReliabilityAndPerformancePhaseTests
 
         var res = await tools.Batch(steps);
         var text = string.Join("\n", res.Content.OfType<TextContentBlock>().Select(t => t.Text));
-        Assert.Contains("Paused", text);
 
         var doc = JsonDocument.Parse(text).RootElement;
-        Assert.Equal("Paused", doc.GetProperty("status").GetString());
-        var pause = doc.GetProperty("pause");
-        Assert.Equal(1, pause.GetProperty("step").GetInt32());
-        Assert.False(string.IsNullOrWhiteSpace(pause.GetProperty("error").GetString()));
+        // compact batch contract: fail-fast halt reports the failing step's
+        // outcome kind as status plus a failedStep index and error text
+        Assert.False(doc.GetProperty("success").GetBoolean());
+        Assert.Equal("TargetNotFound", doc.GetProperty("status").GetString());
+        Assert.Equal(1, doc.GetProperty("failedStep").GetInt32());
+        Assert.False(string.IsNullOrWhiteSpace(doc.GetProperty("error").GetString()));
 
-        // Verify later steps executed=false: report steps array only has 2 entries (step 0 and 1)
-        var reportedSteps = doc.GetProperty("steps");
+        // Verify later steps never ran: results only has 2 entries (0 and 1)
+        var reportedSteps = doc.GetProperty("results");
         Assert.Equal(2, reportedSteps.GetArrayLength());
     }
 
@@ -2200,18 +2216,23 @@ public class ReliabilityAndPerformancePhaseTests
     }
 
     [Fact]
-    public async Task ClosePolicy_ExplicitUserHwnd_GracefulClosePermitted_WithoutForce()
+    public async Task ClosePolicy_ExplicitUserHwnd_DeniedWithoutForce_PermittedWithForce()
     {
         using var session = new McpSession(EmergencyControl.ForTests(), startEvents: false);
         var tools = new InbriskTools(session);
 
         session.RecordWindowLaunch(601, 6001, "notepad", title: "User Document", agentOwned: false);
 
-        var res = await tools.CloseWindow(hwnd: "0x259", force: false);
+        // F13 contract: a pre-existing user window cannot be closed by bare
+        // hwnd — force:true is the documented explicit override.
+        var resDenied = await tools.CloseWindow(hwnd: "0x259", force: false);
+        var textDenied = string.Join("\n", resDenied.Content.OfType<TextContentBlock>().Select(t => t.Text));
+        Assert.Contains("PolicyDenied", textDenied);
+        Assert.False(session.TrackedWindows.First(w => w.Hwnd == 601).ClosedOrStale);
+
+        var res = await tools.CloseWindow(hwnd: "0x259", force: true);
         using var doc = JsonDocument.Parse(string.Join("\n", res.Content.OfType<TextContentBlock>().Select(t => t.Text)));
 
-        Assert.False(doc.RootElement.TryGetProperty("error", out var err) && err.GetString() == "PolicyDenied",
-            "Explicit user-owned HWND must NOT be rejected with PolicyDenied when policy permits graceful close");
         Assert.True(doc.RootElement.GetProperty("success").GetBoolean());
     }
 
@@ -2394,11 +2415,13 @@ public class ReliabilityAndPerformancePhaseTests
         using var doc2 = JsonDocument.Parse(string.Join("\n", res2.Content.OfType<TextContentBlock>().Select(t => t.Text)));
         Assert.True((doc2.RootElement.TryGetProperty("error", out var err2) && err2.GetString() == "TargetNotFound") || (doc2.RootElement.TryGetProperty("closed", out var c2) && !c2.GetBoolean()));
 
-        // 3. explicit user HWND graceful close is permitted without force
+        // 3. explicit user HWND close is refused without force (F13 —
+        // bare-handle closes of pre-existing user windows are denied;
+        // force:true is the explicit override)
         session.RecordWindowLaunch(503, 5003, "explicit_user_app", agentOwned: false);
         var res3 = await tools.CloseWindow(hwnd: "0x1F7"); // 503
         var text3 = string.Join("\n", res3.Content.OfType<TextContentBlock>().Select(t => t.Text));
-        Assert.DoesNotContain("PolicyDenied", text3);
+        Assert.Contains("PolicyDenied", text3);
 
         // 4. force:true does NOT bypass protected-window policy
         session.RecordWindowLaunch(504, 5004, "code.exe", agentOwned: false);

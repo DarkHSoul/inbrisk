@@ -5,6 +5,14 @@ questions in §30 and is the working foundation for the codebase. It is
 deliberately opinionated: where the spec and this document disagree, this
 document wins until revised.
 
+**Status note (post-review):** C# / .NET 8 (`src/Inbrisk.*`, `inbrisk.sln`)
+is the canonical and only shipping implementation. An experimental Rust
+workspace built during development was archived to `../inbrisk-rust` as a
+frozen experiment — it is not in this repository and is not built or
+shipped. Items marked "(later)" below were the design plan; several are
+now implemented (`Inbrisk.Mcp`, `Inbrisk.Setup`, the named-pipe runtime
+daemon, and the Ghost OS subsystem — see §18).
+
 ---
 
 ## 0. Verdict
@@ -59,10 +67,15 @@ Rationale:
 - **MCP later:** official C# MCP SDK exists; the wrapper will be thin.
 
 Honest alternative: **Rust** (`windows-rs`) — smaller binary, embeddable
-as a dylib for future SDKs. Rejected for now because iteration velocity
-on UIA/COM matters more than binary minimalism at this stage. If the core
-is later needed as an embeddable native library for other languages,
-revisit.
+as a dylib for future SDKs. A full Rust workspace (~35k LOC: shared-memory
+IPC runtime, thin MCP proxy, desktop broker, ConPTY terminals, FFI
+bindings) was subsequently explored in parallel. It was then **archived to
+`../inbrisk-rust` as a frozen experiment** — it is not part of this
+repository and is not built or shipped. C# / .NET 8 remains the canonical
+implementation: iteration velocity on UIA/COM proved decisive, and the C#
+tree is the superset (OCR, vision grounding, recipes, hotkeys, dynamic
+toolsets, installer). If the core is later needed as an embeddable native
+library for other languages, revisit.
 
 Rejected: **Python** for the core (fragile UIA stack, packaging,
 distribution, perf for capture) and **C++** (velocity).
@@ -74,11 +87,14 @@ distribution, perf for capture) and **C++** (velocity).
   events, coordinate mapping, element registry, action resolution,
   verification, safety policy, telemetry.
 - **Core is a library + thin hosts.** `Inbrisk.Sdk` is the public API;
-  `Inbrisk.Cli` hosts it for humans; later `Inbrisk.Mcp` and a JSON-RPC
-  server host it for agents. The core must never assume who its caller is.
+  `Inbrisk.Cli` hosts it for humans and `Inbrisk.Mcp` hosts it for agents;
+  a JSON-RPC server may follow. The core must never assume who its caller is.
 - **Agent layer (later, any language):** model adapters and the
   observe→act loop may live in Python/TypeScript and drive the core over
   JSON-RPC. Milestone 1 keeps everything in one C# process — no IPC yet.
+  *(Current state: MCP sessions now connect through a named-pipe daemon
+  transport, `\\.\pipe\inbrisk-runtime-<user>`, behind `ThinStdioProxy`;
+  the Ghost worker uses a second pipe, `inbrisk_ghost_bus` — see §18.)*
 
 ## 3. Critical corrections to the spec
 
@@ -145,9 +161,16 @@ inbrisk.sln
 │   ├── Inbrisk.Sdk/                Public facade — the "Unified Computer API"
 │   │
 │   ├── Inbrisk.Cli/                inbrisk.exe — human-facing commands
+│   │                             (incl. `ghost` subcommands, §18)
+│   │
+│   ├── Inbrisk.Mcp/                MCP host + tool surface over Sdk;
+│   │                             named-pipe runtime daemon + ThinStdioProxy;
+│   │                             GhostMcpBridge (§18); emergency control
+│   │
+│   ├── Inbrisk.Setup/              installer/manager: setup, doctor,
+│   │                             host (un)registration, self-update
 │   │
 │   ├── (later) Inbrisk.Agent/      observe→act loop + model adapters
-│   ├── (later) Inbrisk.Mcp/        thin MCP wrapper over Sdk
 │   └── (later) Inbrisk.Server/     JSON-RPC host for external agents
 │
 └── tests/
@@ -554,4 +577,60 @@ Inbrisk has evolved from an atomic screenshot-clicking API into a unified, auton
 | **Memory & Recipes** | `computer_screen_memory`, `computer_save_recipe`, `computer_run_recipe`, `computer_list_recipes` | Persistent desktop knowledge, macro parametrization, and replay |
 | **Specialist Adapters** | `computer_execute_adapter`, `computer_list_adapters` | Direct media and specialized app integrations |
 | **Safety & Control** | `computer_reset_input`, `computer_app_status`, `computer_app_restart` | Input recovery, overlay click-through fix, emergency telemetry |
+| **Ghost OS** | `computer_ghost_start`, `computer_ghost_status`, `computer_ghost_batch`, `computer_ghost_control`, `computer_ghost_stop` | Isolated agent desktop session (§18) |
+
+---
+
+## 18. Ghost OS — isolated agent desktop
+
+Ghost OS runs the agent's desktop work inside an isolated Windows session
+so automation neither shares nor disturbs the interactive user's desktop.
+The agent sees a live Picture-in-Picture (PiP) view of the ghost session
+and drives it with the ghost agent's own mouse and keyboard.
+
+### Components
+
+- **Control CLI** — `inbrisk ghost <subcommand>`
+  (`src/Inbrisk.Cli/GhostControlCommand.cs`):
+  - `tray` — start the full experience: background ghost session, PiP
+    overlay, system-tray icon, hotkeys, and the local control server.
+  - `pip` — control/view the PiP window: `--interactive on|off`
+    (click-through vs. pass-through), `--fullscreen` (Shadow Mode),
+    `--position`, `--opacity`, `--scale`, `--fps`.
+  - `status` — live operational status of the session and overlay
+    (`--json` for machine-readable output).
+  - `stop` — disconnect and stop the session; wipes ghost credentials
+    and temp files.
+  - `logs` — tail `%LOCALAPPDATA%\inbrisk\logs\ghost-os.log`.
+- **Session hosting** — `GhostRdpConnector` (`src/Inbrisk.Runtime/`)
+  spawns a headless loopback RDP session (`127.0.0.1:3389`) under a
+  dedicated local user (`InbriskAgent` by default; provisioned and
+  permissioned by `GhostUserProvisioner` in
+  `src/Inbrisk.Platform.Windows/`). `GhostLocalDesktop` /
+  `GhostDesktopNative` (same project) provide the alternate isolation
+  primitive: a separate Win32 desktop named `InbriskGhostDesktop`.
+- **Worker daemon** — `GhostWorkerDaemon` (`src/Inbrisk.Runtime/`) runs
+  inside the ghost session (launched via `inbrisk ghost-worker`,
+  `src/Inbrisk.Cli/GhostWorkerCommand.cs`) and connects back to the host
+  session over the cross-session named pipe `inbrisk_ghost_bus`
+  (`GhostIpcBus`, `src/Inbrisk.Core/`).
+- **Frame + input transport** — frames stream from the ghost session to
+  the local PiP overlay via a shared-memory buffer
+  (`Global\InbriskGhostFrameBuffer`, `GhostSharedFrameBuffer` in
+  `src/Inbrisk.Platform.Windows/`) plus a ready event;
+  `GhostDxgiCapture`/`GhostDesktopCapture` produce frames in-session.
+  `GhostKeyboardForwarder` (`src/Inbrisk.Runtime/`) forwards keystrokes
+  typed into the focused PiP window across the ghost bus and owns ghost
+  hotkeys (`Ctrl+Alt+I` interactive toggle, `Ctrl+Shift+P` PiP
+  visibility, `Esc` exits fullscreen); `GhostDesktopInput` /
+  `GhostInputExecutor` (`src/Inbrisk.Platform.Windows/`, with a companion
+  in `src/Inbrisk.Runtime/`) inject input inside the isolated session;
+  `GhostPipManager`/`GhostPipRenderer` (`src/Inbrisk.Runtime/`) and
+  `GhostPipWindowHost`/`GhostTrayApp` (`src/Inbrisk.Platform.Windows/`)
+  own the overlay and tray lifecycle.
+- **MCP bridge** — `GhostMcpBridge` (`src/Inbrisk.Mcp/`) exposes
+  `computer_ghost_start`, `computer_ghost_status`, `computer_ghost_batch`
+  (multi-step plans executed inside the ghost session),
+  `computer_ghost_control`, and `computer_ghost_stop`. Ghost actions never
+  touch the interactive user's physical input.
 

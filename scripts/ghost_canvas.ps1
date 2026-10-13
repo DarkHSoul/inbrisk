@@ -104,3 +104,7 @@ $btnClear.Add_Click({
 [void]$form.Controls.Add($canvas)
 
 [System.Windows.Forms.Application]::Run($form)
+
+$gfx.Dispose()
+$bmp.Dispose()
+$form.Dispose()

@@ -348,6 +348,11 @@ public sealed class GhostMcpBridge : IDisposable
     {
         PerfTrace.Count("ghostStart");
 
+        if (EmergencyGate.IsStopped)
+        {
+            return EmergencyResult();
+        }
+
         // 1. Ensure cross-session IPC server is listening
         try
         {
@@ -513,6 +518,11 @@ public sealed class GhostMcpBridge : IDisposable
     {
         PerfTrace.Count("ghostBatch");
 
+        if (EmergencyGate.IsStopped)
+        {
+            return EmergencyResult();
+        }
+
         if ((steps == null || steps.Length == 0) && (set == null || set.Length == 0))
         {
             return ErrorResult("Malformed", "computer_ghost_batch requires non-empty 'steps' or 'set'.");
@@ -521,6 +531,16 @@ public sealed class GhostMcpBridge : IDisposable
         if (steps is { Length: > 0 } && set is { Length: > 0 })
         {
             return ErrorResult("Malformed", "Ambiguous execution order: specify either 'set' or 'steps', not both simultaneously.");
+        }
+
+        if (steps is { Length: > GhostBatchDispatcher.MaxBatchSteps })
+        {
+            return ErrorResult("Malformed", $"computer_ghost_batch accepts at most {GhostBatchDispatcher.MaxBatchSteps} steps.");
+        }
+
+        if (set is { Length: > 100 })
+        {
+            return ErrorResult("Malformed", "computer_ghost_batch accepts at most 100 'set' fields.");
         }
 
         // Verify active ghost session
@@ -557,11 +577,11 @@ public sealed class GhostMcpBridge : IDisposable
             operationId
         };
         string payloadJson = JsonSerializer.Serialize(payload, SerializerOptions);
-        var timeout = TimeSpan.FromMilliseconds(timeoutMs ?? 30000);
+        var timeout = TimeSpan.FromMilliseconds(Math.Clamp(timeoutMs ?? 30000, 1000, 300_000));
 
         try
         {
-            string responseJson = await _ipcServer.SendRequestAsync("batch", payloadJson, timeout, ct).ConfigureAwait(false);
+            string responseJson = await _ipcServer.SendRequestAsync(GhostBatchDispatcher.ExecuteBatchAction, payloadJson, timeout, ct).ConfigureAwait(false);
 
             bool isErr = false;
             try
@@ -753,7 +773,16 @@ public sealed class GhostMcpBridge : IDisposable
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopLaunch");
-        ArgumentException.ThrowIfNullOrWhiteSpace(program);
+
+        if (EmergencyGate.IsStopped)
+        {
+            return EmergencyResult();
+        }
+
+        if (string.IsNullOrWhiteSpace(program))
+        {
+            return ErrorResult("Malformed", "'program' must not be null or empty.");
+        }
 
         try
         {
@@ -794,6 +823,23 @@ public sealed class GhostMcpBridge : IDisposable
     {
         PerfTrace.Count("ghostDesktopClick");
         await Task.CompletedTask;
+
+        if (EmergencyGate.IsStopped)
+        {
+            return EmergencyResult();
+        }
+
+        int maxX = 1920, maxY = 1080;
+        if (_sessionManager is GhostSessionManager gsmBounds)
+        {
+            maxX = gsmBounds.CurrentConfig.Width;
+            maxY = gsmBounds.CurrentConfig.Height;
+        }
+        if (x < 0 || y < 0 || x >= maxX || y >= maxY)
+        {
+            return ErrorResult("Malformed", $"Coordinates ({x}, {y}) are outside the ghost desktop bounds 0..{maxX - 1} x 0..{maxY - 1}.");
+        }
+
         try
         {
             var input = GetOrCreateInput();
@@ -837,7 +883,20 @@ public sealed class GhostMcpBridge : IDisposable
     {
         PerfTrace.Count("ghostDesktopType");
         await Task.CompletedTask;
-        ArgumentNullException.ThrowIfNull(text);
+
+        if (EmergencyGate.IsStopped)
+        {
+            return EmergencyResult();
+        }
+
+        if (text == null)
+        {
+            return ErrorResult("Malformed", "'text' must not be null.");
+        }
+        if (text.Length > 8192)
+        {
+            return ErrorResult("Malformed", "'text' exceeds the 8192-character limit.");
+        }
 
         try
         {
@@ -950,11 +1009,25 @@ public sealed class GhostMcpBridge : IDisposable
         PerfTrace.Count("ghostControlOpen");
         string act = (action ?? "open").Trim().ToLowerInvariant();
 
+        if (EmergencyGate.IsStopped && act is not ("stop" or "status"))
+        {
+            return EmergencyResult();
+        }
+
+        if (!string.IsNullOrWhiteSpace(position) &&
+            !Enum.TryParse<PipPresetPosition>(position, ignoreCase: true, out _))
+        {
+            return ErrorResult("Malformed", $"Unknown PiP position preset: '{position}'.");
+        }
+
+        string? controlToken = GhostControlToken();
+
         // 1. Check if the daemon is already running via the named pipe "inbrisk_ghost_control"
         bool isDaemonRunning = false;
+        GhostIpcClient? testClient = null;
         try
         {
-            var testClient = new GhostIpcClient("inbrisk_ghost_control");
+            testClient = new GhostIpcClient("inbrisk_ghost_control");
             await testClient.ConnectAsync(TimeSpan.FromMilliseconds(400), ct).ConfigureAwait(false);
             isDaemonRunning = testClient.IsConnected;
             if (isDaemonRunning)
@@ -963,7 +1036,7 @@ public sealed class GhostMcpBridge : IDisposable
                 {
                     if (act == "stop")
                     {
-                        var stopResp = await testClient.SendRequestAsync("stop", "{}", TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
+                        var stopResp = await testClient.SendRequestAsync("stop", JsonSerializer.Serialize(new { token = controlToken }), TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
                         return SuccessResult(new { success = true, action = "stop", state = "stopped", message = "Ghost Control daemon stopped.", response = stopResp });
                     }
 
@@ -971,35 +1044,35 @@ public sealed class GhostMcpBridge : IDisposable
 
                     if (interactive.HasValue)
                     {
-                        var p = JsonSerializer.Serialize(new { interactive = interactive.Value });
+                        var p = JsonSerializer.Serialize(new { interactive = interactive.Value, token = controlToken });
                         await testClient.SendRequestAsync("pip_interactive", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
                         actionsTaken.Add($"interactive={(interactive.Value ? "on" : "off")}");
                     }
 
                     if (fullScreen.HasValue)
                     {
-                        var p = JsonSerializer.Serialize(new { fullscreen = fullScreen.Value });
+                        var p = JsonSerializer.Serialize(new { fullscreen = fullScreen.Value, token = controlToken });
                         await testClient.SendRequestAsync("pip_fullscreen", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
                         actionsTaken.Add($"fullscreen={fullScreen.Value}");
                     }
 
                     if (!string.IsNullOrWhiteSpace(position))
                     {
-                        var p = JsonSerializer.Serialize(new { position });
+                        var p = JsonSerializer.Serialize(new { position, token = controlToken });
                         await testClient.SendRequestAsync("pip_position", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
                         actionsTaken.Add($"position={position}");
                     }
 
                     if (opacity.HasValue)
                     {
-                        var p = JsonSerializer.Serialize(new { opacity = opacity.Value });
+                        var p = JsonSerializer.Serialize(new { opacity = opacity.Value, token = controlToken });
                         await testClient.SendRequestAsync("pip_opacity", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
                         actionsTaken.Add($"opacity={opacity.Value}");
                     }
 
                     if (scale.HasValue)
                     {
-                        var p = JsonSerializer.Serialize(new { scale = scale.Value });
+                        var p = JsonSerializer.Serialize(new { scale = scale.Value, token = controlToken });
                         await testClient.SendRequestAsync("pip_scale", p, TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
                         actionsTaken.Add($"scale={scale.Value}");
                     }
@@ -1022,10 +1095,19 @@ public sealed class GhostMcpBridge : IDisposable
             }
         }
         catch { }
+        finally
+        {
+            try { testClient?.Dispose(); } catch { }
+        }
 
         if (act == "stop")
         {
             return SuccessResult(new { success = true, action = "stop", state = "stopped", message = "Ghost Control daemon is not running." });
+        }
+
+        if (act == "status")
+        {
+            return SuccessResult(new { success = true, daemonRunning = false, state = "stopped", message = "Ghost Control daemon is not running." });
         }
 
         // 2. Daemon not running -> Start in background via Process.Start("inbrisk.exe", "ghost tray")
@@ -1044,7 +1126,7 @@ public sealed class GhostMcpBridge : IDisposable
             if (fullScreen == true) argsList.Add("--fullscreen");
             if (!string.IsNullOrWhiteSpace(position)) argsList.Add($"--position {position}");
             if (opacity.HasValue) argsList.Add($"--opacity {opacity.Value}");
-            if (scale.HasValue) argsList.Add($"--scale {scale.Value}");
+            if (scale.HasValue) argsList.Add(FormattableString.Invariant($"--scale {Math.Clamp(scale.Value, 0.25f, 5.0f)}"));
 
             string startArgs = string.Join(" ", argsList);
 
@@ -1065,9 +1147,10 @@ public sealed class GhostMcpBridge : IDisposable
             while (sw.ElapsedMilliseconds < 3500 && !ct.IsCancellationRequested)
             {
                 await Task.Delay(250, ct).ConfigureAwait(false);
+                GhostIpcClient? check = null;
                 try
                 {
-                    var check = new GhostIpcClient("inbrisk_ghost_control");
+                    check = new GhostIpcClient("inbrisk_ghost_control");
                     await check.ConnectAsync(TimeSpan.FromMilliseconds(200), ct).ConfigureAwait(false);
                     if (check.IsConnected)
                     {
@@ -1076,6 +1159,10 @@ public sealed class GhostMcpBridge : IDisposable
                     }
                 }
                 catch { }
+                finally
+                {
+                    try { check?.Dispose(); } catch { }
+                }
             }
 
             return SuccessResult(new
@@ -1150,6 +1237,26 @@ public sealed class GhostMcpBridge : IDisposable
         using var ms = new MemoryStream();
         bmp.Save(ms, ImageFormat.Png);
         return ms.ToArray();
+    }
+
+    private static CallToolResult EmergencyResult() =>
+        ErrorResult("EmergencyStopped", "Computer control is stopped by the local emergency hotkey; only the local user can resume.");
+
+    private static string? GhostControlToken()
+    {
+        try
+        {
+            var path = Path.Combine(UserSettings.DataDir, "ghost-control.json");
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+            using var doc = JsonDocument.Parse(File.ReadAllText(path));
+            return doc.RootElement.TryGetProperty("token", out var t) && t.ValueKind == JsonValueKind.String
+                ? t.GetString()
+                : null;
+        }
+        catch { return null; }
     }
 
     private static CallToolResult SuccessResult(object data) => new()

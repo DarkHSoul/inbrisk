@@ -660,13 +660,21 @@ public sealed class PhaseGRound1CacheTests
         var cache = new HwndMetadataCache();
         int resolverCalls = 0;
         var realHwnd = NativeMethods.GetDesktopWindow().ToInt64();
-        var currentPid = Environment.ProcessId;
-        var startTime = Process.GetCurrentProcess().StartTime;
+        // Identity validation compares the cached pid against the LIVE owner
+        // of the hwnd — the resolver must return the desktop window's real
+        // owning pid/start-time or every hit is (correctly) evicted as reused.
+        NativeMethods.GetWindowThreadProcessId(new IntPtr(realHwnd), out var ownerPidU);
+        var ownerPid = unchecked((int)ownerPidU);
+        // Desktop window may belong to a protected process — StartTime can be
+        // unreadable; a null generation token is still a valid cache entry.
+        DateTimeOffset? startTime = null;
+        try { startTime = Process.GetProcessById(ownerPid).StartTime; }
+        catch (Exception) { }
 
         HwndMetadata? Resolver(long h)
         {
             resolverCalls++;
-            return new HwndMetadata(h, currentPid, "notepad.exe", startTime, false);
+            return new HwndMetadata(h, ownerPid, "notepad.exe", startTime, false);
         }
 
         // Query 1: Miss

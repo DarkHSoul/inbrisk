@@ -29,3 +29,18 @@ following conditions:
    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
    SOFTWARE.
+
+3. SCOPE AND DISTRIBUTED BINARIES:
+   - The restrictions in Section 1 govern the source code and associated
+     documentation of the Software.
+   - Compiled binaries of the Software distributed by the copyright holder
+     (such as InbriskSetup.exe or the portable inbrisk.exe) may be downloaded,
+     installed, and executed for the recipient's own internal business or
+     personal purposes. This limited use permission applies to the binaries
+     only and does not grant any right to copy, modify, redistribute,
+     reverse engineer (except where such restriction is prohibited by
+     applicable law), or create derivative works of the Software.
+   - The distributed binaries contain third-party components licensed under
+     their own terms (including MIT and Apache-2.0). Those components remain
+     governed by their respective licenses, which are listed in NOTICE and
+     THIRD_PARTY_NOTICES.md.

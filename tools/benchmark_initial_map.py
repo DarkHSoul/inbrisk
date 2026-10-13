@@ -6,10 +6,12 @@ import time
 import os
 import numpy as np
 
+from inbrisk_paths import MCP_DLL, MCP_DLL_RELEASE, ARTIFACTS
+
 def run_initial_map_benchmark():
-    dll_path = r"C:\Users\Ahmet\Documents\inbrisk\src\Inbrisk.Mcp\bin\Release\net8.0-windows10.0.19041.0\inbrisk-mcp.dll"
+    dll_path = str(MCP_DLL_RELEASE)
     if not os.path.exists(dll_path):
-        dll_path = r"C:\Users\Ahmet\Documents\inbrisk\src\Inbrisk.Mcp\bin\Debug\net8.0-windows10.0.19041.0\inbrisk-mcp.dll"
+        dll_path = str(MCP_DLL)
 
     print("=======================================================")
     print("Initial Map Cost & Budget Benchmark")
@@ -103,7 +105,7 @@ def run_initial_map_benchmark():
         "modal_detected_count": has_modal_counts
     }
 
-    out_path = r"C:\Users\Ahmet\Documents\inbrisk\artifacts\initial_map_benchmark.json"
+    out_path = str(ARTIFACTS / "initial_map_benchmark.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 

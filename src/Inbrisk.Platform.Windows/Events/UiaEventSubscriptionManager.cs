@@ -171,7 +171,7 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
             {
                 UninstallNative(record);
             }
-            catch { /* best effort cleanup */ }
+            catch (Exception e) { Debug.WriteLine($"inbrisk UIA uninstall fault (best effort): {e}"); }
             finally
             {
                 Telemetry.IncScopedSubscriptionRemove();
@@ -182,7 +182,10 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
 
     private void InstallNative(NativeSubscriptionRecord record, int[]? customProps)
     {
-        _uia.Run(uia =>
+        // Abandon-aware dispatch: if the caller's wait timed out while this
+        // work was still in-flight on the abandoned lane, the token is already
+        // cancelled and we must not mutate the record or attach native handlers.
+        _uia.Run((uia, aband) =>
         {
             IUIAutomationElement? root = null;
             if (record.Key.Hwnd != 0)
@@ -214,6 +217,7 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
                 return false;
             }
 
+            aband.ThrowIfCancellationRequested();
             record.TargetElement = root;
             var treeScope = (TreeScope)record.Key.Scope;
 
@@ -419,7 +423,11 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
         {
             autoId = sender.CachedAutomationId;
         }
-        catch { }
+        catch
+        {
+            Telemetry.IncCallbackExtraComRead();
+            try { autoId = sender.CurrentAutomationId; } catch { }
+        }
 
         RouteCallbackCore(record, epoch, kind, hwnd, pid, name, autoId, detail, notificationData, propertyId);
     }
@@ -585,17 +593,28 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
         }
     }
 
+    // Boundary: every Handle* below runs on a UIA COM callback thread — a
+    // managed exception escaping into the native caller can kill the process.
+    // RouteCallback guards its own body; these wraps cover argument evaluation
+    // and the call itself.
     private sealed class ScopedNotificationHandler(UiaEventSubscriptionManager mgr, NativeSubscriptionRecord rec, long epoch)
         : IUIAutomationNotificationEventHandler
     {
         public void HandleNotificationEvent(IUIAutomationElement sender, NotificationKind notificationKind, NotificationProcessing notificationProcessing, string displayString, string activityId)
         {
-            var data = new UiaNotificationData(
-                (int)notificationKind,
-                (int)notificationProcessing,
-                displayString,
-                activityId);
-            mgr.RouteCallback(rec, epoch, EventKind.Notification, sender, displayString, data);
+            try
+            {
+                var data = new UiaNotificationData(
+                    (int)notificationKind,
+                    (int)notificationProcessing,
+                    displayString,
+                    activityId);
+                mgr.RouteCallback(rec, epoch, EventKind.Notification, sender, displayString, data);
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine($"inbrisk UIA notification-callback fault: {e}");
+            }
         }
     }
 
@@ -604,7 +623,14 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
     {
         public void HandleStructureChangedEvent(IUIAutomationElement sender, StructureChangeType changeType, int[] runtimeId)
         {
-            mgr.RouteCallback(rec, epoch, EventKind.StructureChanged, sender, changeType.ToString());
+            try
+            {
+                mgr.RouteCallback(rec, epoch, EventKind.StructureChanged, sender, changeType.ToString());
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine($"inbrisk UIA structure-callback fault: {e}");
+            }
         }
     }
 
@@ -613,10 +639,17 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
     {
         public void HandlePropertyChangedEvent(IUIAutomationElement sender, int propertyId, object newValue)
         {
-            var kind = propertyId == UiaIds.NameProperty ? EventKind.NameChanged
-                : propertyId == UiaIds.ValueValueProperty ? EventKind.ValueChanged
-                : EventKind.StateChanged;
-            mgr.RouteCallback(rec, epoch, kind, sender, $"prop={propertyId} -> {newValue}", propertyId: propertyId);
+            try
+            {
+                var kind = propertyId == UiaIds.NameProperty ? EventKind.NameChanged
+                    : propertyId == UiaIds.ValueValueProperty ? EventKind.ValueChanged
+                    : EventKind.StateChanged;
+                mgr.RouteCallback(rec, epoch, kind, sender, $"prop={propertyId} -> {newValue}", propertyId: propertyId);
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine($"inbrisk UIA property-callback fault: {e}");
+            }
         }
     }
 
@@ -625,8 +658,15 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
     {
         public void HandleAutomationEvent(IUIAutomationElement sender, int id)
         {
-            if (id != eventId) return;
-            mgr.RouteCallback(rec, epoch, kind, sender);
+            try
+            {
+                if (id != eventId) return;
+                mgr.RouteCallback(rec, epoch, kind, sender);
+            }
+            catch (Exception e)
+            {
+                Debug.WriteLine($"inbrisk UIA automation-callback fault: {e}");
+            }
         }
     }
 
@@ -650,7 +690,8 @@ public sealed class UiaEventSubscriptionManager : IScopedSubscriptionManager, IE
         {
             rec.IsActive = false;
             rec.Epoch++;
-            try { UninstallNative(rec); } catch { }
+            try { UninstallNative(rec); }
+            catch (Exception e) { Debug.WriteLine($"inbrisk UIA dispose-uninstall fault (best effort): {e}"); }
             Telemetry.IncScopedSubscriptionRemove();
             Telemetry.DecActiveScopedSubscriptions();
         }

@@ -228,10 +228,21 @@ public sealed class UiaBackend : IElementBackend
         for (var i = 0; i < len && results.Count < opt.MaxElements; i++)
         {
             var child = kids!.GetElement(i);
-            var step = StepFor(child, siblingCounts, kidsCached);
+            var childCached = kidsCached;
+            if (!childCached && childrenCache != null)
+            {
+                try
+                {
+                    UiaPerf.ComCall();
+                    if (child.BuildUpdatedCache(childrenCache) is { } cc)
+                    { child = cc; childCached = true; }
+                }
+                catch { }
+            }
+            var step = StepFor(child, siblingCounts, childCached);
             path.Add(step);
             Walk(uia, child, opt, results, path, depth + 1, isRoot: false,
-                ownerHwnd, ownerTitle, childrenCache, kidsCached);
+                ownerHwnd, ownerTitle, childrenCache, childCached);
             path.RemoveAt(path.Count - 1);
         }
     }
@@ -306,7 +317,7 @@ public sealed class UiaBackend : IElementBackend
             var total = Stopwatch.StartNew();
             UiaPerf.TakeReads();
             var t = Stopwatch.StartNew();
-            var (roots, scopeType, globalScan) = ResolveRoots(uia, spec);
+            var (roots, scopeType, globalScan, rootsCached) = ResolveRoots(uia, spec);
             var rootsMs = t.ElapsedMilliseconds;
 
             var results = new List<UiElement>();
@@ -322,8 +333,20 @@ public sealed class UiaBackend : IElementBackend
             {
                 // per-root owner identity — read once, not per candidate
                 long? ownerHwnd = null; string? ownerTitle = null;
-                try { UiaPerf.LiveRead(); var h = root.CurrentNativeWindowHandle; if (h != IntPtr.Zero) ownerHwnd = h.ToInt64(); } catch { }
-                try { UiaPerf.LiveRead(); ownerTitle = root.CurrentName; } catch { }
+                try
+                {
+                    IntPtr h;
+                    if (rootsCached) { UiaPerf.CachedRead(); h = root.CachedNativeWindowHandle; }
+                    else { UiaPerf.LiveRead(); h = root.CurrentNativeWindowHandle; }
+                    if (h != IntPtr.Zero) ownerHwnd = h.ToInt64();
+                }
+                catch { }
+                try
+                {
+                    if (rootsCached) { UiaPerf.CachedRead(); ownerTitle = root.CachedName; }
+                    else { UiaPerf.LiveRead(); ownerTitle = root.CurrentName; }
+                }
+                catch { }
                 // existence-only fast path: FindFirst stops the provider
                 // enumeration at the first native match. If that element is
                 // rejected by client-side checks (offscreen/empty bounds),
@@ -376,7 +399,7 @@ public sealed class UiaBackend : IElementBackend
 
                 // empty result under a virtualized container → realize its
                 // targeted item or first item and re-enumerate
-                if (arr.Length == 0 && TryRealize(root, spec))
+                if (arr.Length == 0 && TryRealize(root, spec, rootsCached))
                 {
                     realized++;
                     t.Restart();
@@ -493,13 +516,12 @@ public sealed class UiaBackend : IElementBackend
 
     /// <summary>Container supports ItemContainerPattern → realize its targeted
     /// or first virtualized item so descendants materialize for re-enumeration.</summary>
-    private static bool TryRealize(IUIAutomationElement root, FindSpec? spec = null)
+    private static bool TryRealize(IUIAutomationElement root, FindSpec? spec = null, bool rootCached = false)
     {
         try
         {
-            UiaPerf.LiveRead();
-            if (root.GetCurrentPattern(UiaIds.ItemContainerPattern)
-                    is not IUIAutomationItemContainerPattern icp) return false;
+            if (Pattern<IUIAutomationItemContainerPattern>(root, UiaIds.ItemContainerPattern, rootCached)
+                    is not { } icp) return false;
             UiaPerf.LiveRead();
             IUIAutomationElement? item = null;
             if (!string.IsNullOrEmpty(spec?.Name))
@@ -530,8 +552,9 @@ public sealed class UiaBackend : IElementBackend
 
     /// <returns>Roots + scope name + whether a desktop-global Descendants
     /// enumeration happened during resolution (the audit treats that as a
-    /// bug whenever a narrower root was available).</returns>
-    private (List<IUIAutomationElement> Roots, string Scope, bool GlobalScan) ResolveRoots(
+    /// bug whenever a narrower root was available) + whether the roots
+    /// arrived prefetched.</returns>
+    private (List<IUIAutomationElement> Roots, string Scope, bool GlobalScan, bool RootsCached) ResolveRoots(
         IUIAutomation uia, FindSpec spec)
     {
         // within:$element → search that element's subtree only. The live
@@ -544,7 +567,7 @@ public sealed class UiaBackend : IElementBackend
             {
                 UiaPerf.LiveRead();
                 _ = scoped.GetRuntimeId(); // alive probe
-                return (new List<IUIAutomationElement> { scoped }, "element", false);
+                return (new List<IUIAutomationElement> { scoped }, "element", false, false);
             }
             catch
             {
@@ -558,7 +581,7 @@ public sealed class UiaBackend : IElementBackend
         {
             UiaPerf.ComCall();
             var el = uia.ElementFromHandle(new IntPtr(h));
-            return (el != null ? new List<IUIAutomationElement> { el } : new(), "hwnd", false);
+            return (el != null ? new List<IUIAutomationElement> { el } : new(), "hwnd", false, false);
         }
 
         // pid/title scope → Win32 window list first (EnumWindows is local,
@@ -582,7 +605,7 @@ public sealed class UiaBackend : IElementBackend
                 catch { }
             }
             if (r.Count > 0)
-                return (r, spec.Pid != null ? "process" : "windowTitle", false);
+                return (r, spec.Pid != null ? "process" : "windowTitle", false, false);
             // empty → fall through to the UIA-wide scan
         }
 
@@ -621,7 +644,7 @@ public sealed class UiaBackend : IElementBackend
             catch (System.Runtime.InteropServices.COMException) { }
         }
         return (roots, spec.Pid != null ? "process" :
-            spec.WindowTitle != null ? "windowTitle" : "desktop", true);
+            spec.WindowTitle != null ? "windowTitle" : "desktop", true, winsCached);
     }
 
     /// <summary>Batch the property/pattern reads a conversion needs into one
@@ -923,9 +946,10 @@ public sealed class UiaBackend : IElementBackend
     }
 
     /// <summary>All top-level Window-typed elements under root with
-    /// name/pid/hwnd prefetched — one FindAllBuildCache round trip
-    /// replaces two live property reads per window. Falls back to plain
-    /// FindAll for providers that reject the cache request.</summary>
+    /// name/pid/hwnd (+ItemContainerPattern for TryRealize) prefetched —
+    /// one FindAllBuildCache round trip replaces two live property reads
+    /// per window. Falls back to plain FindAll for providers that reject
+    /// the cache request.</summary>
     private static (IUIAutomationElementArray? Wins, bool Cached) FindWindowElements(
         IUIAutomation uia, IUIAutomationElement root)
     {
@@ -937,6 +961,7 @@ public sealed class UiaBackend : IElementBackend
             c.AddProperty(UiaIds.NameProperty);
             c.AddProperty(UiaIds.ProcessIdProperty);
             c.AddProperty(UiaIds.NativeWindowHandleProperty);
+            try { c.AddPattern(UiaIds.ItemContainerPattern); } catch { }
             c.TreeScope = TreeScope.TreeScope_Element;
             UiaPerf.ComCall();
             var arr = root.FindAllBuildCache(

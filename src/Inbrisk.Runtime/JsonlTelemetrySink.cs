@@ -10,6 +10,8 @@ namespace Inbrisk.Runtime;
 /// "h"), so truncation/rewrites are detectable via AuditLog.VerifyChain.
 /// An optional mirrorPath receives a byte-identical copy (agent-readable
 /// mirror under the data dir); the primary file is the source of truth.
+/// Emit() also forwards every action to AuditTrail — the dedicated
+/// tamper-evident audit stream (F32), additive and never fatal.
 /// </summary>
 public sealed class JsonlTelemetrySink : ITelemetrySink, IDisposable
 {
@@ -31,7 +33,7 @@ public sealed class JsonlTelemetrySink : ITelemetrySink, IDisposable
         _path = path;
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         CheckRotation();
-        _writer = OpenWriter();
+        _writer ??= OpenWriter(); // rotation above may already have opened it
         _prevHash = AuditLog.LastChainHash(path);
         // rotated just now? keep the chain anchored on the .old tail hash
         if (_prevHash == AuditLog.GenesisHash && File.Exists(path + ".old"))
@@ -94,7 +96,14 @@ public sealed class JsonlTelemetrySink : ITelemetrySink, IDisposable
         }
     }
 
-    public void Emit(ActionTelemetry record) => WriteRecord(record);
+    public void Emit(ActionTelemetry record)
+    {
+        lock (_gate)   // keep telemetry line and audit record adjacent per sink
+        {
+            WriteRecord(record);
+            AuditTrail.Action(record);   // dedicated audit stream — additive, best-effort
+        }
+    }
 
     public void EmitPipeline(PipelineTelemetry record) => WriteRecord(record);
 

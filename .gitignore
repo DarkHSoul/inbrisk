@@ -51,6 +51,10 @@ inbrisksetup.txt
 tools/*.json
 qwen-code-export-*
 
+# Session captures / probe artifacts (F37 hygiene)
+*_transcript.txt
+mcp_probe_requests.jsonl
+
 # Rust build output
 target/
 

@@ -73,6 +73,10 @@ public sealed class FakeEmergencyHotkeyRegistrar : IEmergencyHotkeyRegistrar
 /// the shared stop-marker file — so an MCP host that spawns several server
 /// processes still gets one consistent kill switch. Cross-process sync:
 /// authority writes/deletes the marker on panic/resume; peers poll it.
+/// F18: peers NEVER resume just because the marker vanished — they mirror a
+/// resume only while a live authority exists (its held lifetime event), so
+/// deleting the marker and/or killing the authority cannot un-panic peers;
+/// only the local resume gesture on a live authority clears a panic stop.
 /// </summary>
 public sealed class EmergencyControl : IDisposable
 {
@@ -99,6 +103,14 @@ public sealed class EmergencyControl : IDisposable
     // deleting the stop-marker file can no longer clear the panic state.
     private Thread? _stopMutexHolder;
     private ManualResetEventSlim? _stopMutexRelease;
+    // F18: while this process is the panic authority it also holds a named
+    // event open (EmergencyGate.AuthorityEventName) for its whole lifetime.
+    // An open event handle tracks the process — no thread affinity, no
+    // release by another process — so "event gone" unambiguously means the
+    // authority died. Peers consult it as the resume gate: a vanished
+    // marker with no live authority is NOT a resume.
+    private EventWaitHandle? _authorityEvent;
+    private bool _wedgeLogged;
     private ComputerControlState _state = ComputerControlState.EmergencyStopped;
     private bool _stoppedByPanic;
     private bool _peerAuthority;   // another inbrisk process owns the hotkey
@@ -239,7 +251,12 @@ public sealed class EmergencyControl : IDisposable
     /// resume — only the authority's local gesture releases the mutex
     /// (F18). If we are the authority and the marker vanished while the
     /// mutex is still held, rewrite it so late-joining processes stay
-    /// stopped.</summary>
+    /// stopped. A resume is mirrored only while a LIVE authority exists —
+    /// its lifetime event stays open exactly as long as the process runs,
+    /// so "signals gone + authority alive" means a local resume happened,
+    /// while "signals gone + authority dead" means it was killed or the
+    /// files tampered with — fail closed: stay stopped for a local
+    /// gesture, never auto-resume.</summary>
     private void SyncMarker()
     {
         var markerExists = File.Exists(StopMarkerPath);
@@ -254,19 +271,44 @@ public sealed class EmergencyControl : IDisposable
                     catch { /* marker heal is best-effort — the mutex still latches the stop */ }
             }
         }
-        if (markerExists || mutexHeld) ApplyStop("peer panic marker", recheckMarker: true);
-        else ApplyResume("peer resume marker");
+        if (markerExists || mutexHeld)
+            ApplyStop("peer panic marker", recheckMarker: true);
+        else if (EmergencyGate.AuthorityAlive(PanicHotkey) == true)
+            // Live authority holds no stop latch — it resumed through its
+            // own local gesture; mirror it. The lifetime event can only be
+            // held by the authority process itself, so this branch is
+            // unreachable after the authority is killed (F18).
+            ApplyResume("authority resume");
+        else
+        {
+            // Marker/mutex gone with NO live authority: the previous
+            // authority was killed while stopped or its files were deleted
+            // after death — indistinguishable from a legit resume only to
+            // something that cannot see process liveness. Stay stopped; a
+            // wedged peer reclaims the chord below so a local gesture has
+            // somewhere to land.
+            bool report;
+            lock (_gate) { report = _stoppedByPanic && !_wedgeLogged; _wedgeLogged |= report; }
+            if (report)
+                Log("Stop signals cleared with no live panic authority — control stays " +
+                    $"stopped (possible tamper); local resume: {ResumeHotkey} or the tray icon");
+        }
 
-        // Recoverable stop: the panic chord was held by another process at
-        // startup and no peer authority existed. That holder may have exited
-        // since — retry acquisition periodically instead of staying stopped
-        // forever. Never retries while _stoppedByPanic (a real panic must
-        // require an explicit resume).
+        // Reacquire attempts: a stopped peer retries only while no live
+        // authority owns the chord — re-probe first, since the recorded
+        // peer authority may have died (wedge case). Reclaiming the chord
+        // while _stoppedByPanic re-latches the stop under the new
+        // authority but never activates — a real panic still requires an
+        // explicit local resume.
         if (Interlocked.Increment(ref _retryTicks) % 20 != 0) return;
         lock (_gate)
-            if (_state != ComputerControlState.EmergencyStopped ||
-                _stoppedByPanic || _disposed ||
-                PanicAvailable || _peerAuthority) return;
+        {
+            if (_disposed || PanicAvailable ||
+                _state != ComputerControlState.EmergencyStopped) return;
+            if (_peerAuthority)
+                _peerAuthority = DetectPeerAuthority();
+            if (_peerAuthority) return;
+        }
         TryReacquireAuthority();
     }
 
@@ -282,6 +324,16 @@ public sealed class EmergencyControl : IDisposable
     /// the mutex is the fallback for older binaries.</summary>
     private void BecomeAuthority()
     {
+        try
+        {
+            // Lifetime event (F18): held open for the rest of this
+            // process's life so peers can prove a live authority exists.
+            // Created here, only ever opened (never created) by peers.
+            _authorityEvent ??= new EventWaitHandle(false,
+                EventResetMode.ManualReset,
+                EmergencyGate.AuthorityEventName(PanicHotkey));
+        }
+        catch (Exception e) { Log($"authority event create failed: {e.Message}"); }
         try { _ownerMutex?.Dispose(); } catch { }
         _ownerMutex = new Mutex(initiallyOwned: false, OwnerMutexName);
         try { _ownerMutex.WaitOne(0); }
@@ -302,6 +354,10 @@ public sealed class EmergencyControl : IDisposable
         if (owner != null && owner.PanicHotkey.Equals(PanicHotkey,
                 StringComparison.OrdinalIgnoreCase) &&
             EmergencyGate.OwnerAlive(owner)) return true;
+        // Lifetime event: a live authority holds it open for its whole
+        // process life — robust where the owner mutex's thread-affinity
+        // can be lost when the acquiring thread exits (F18).
+        if (EmergencyGate.AuthorityAlive(PanicHotkey) == true) return true;
         try
         {
             _ownerMutex ??= new Mutex(false, OwnerMutexName);
@@ -327,30 +383,47 @@ public sealed class EmergencyControl : IDisposable
         }
         catch { /* construction/start failure → stay stopped, retry next tick */ }
 
+        bool stillStopped;
         lock (_gate)
         {
-            if (_disposed || _stoppedByPanic) return;
+            if (_disposed) return;
 
             if (_registrar.PanicAvailable)
             {
                 _peerAuthority = false;
+                if (_stoppedByPanic)
+                {
+                    // Chord reclaimed while still panic-stopped (the previous
+                    // authority was killed — F18 wedge): re-latch the stop
+                    // under the new authority so peers keep mirroring it.
+                    // Activation is still gated below — reclaiming the
+                    // chord is never a resume by itself.
+                    try { File.WriteAllText(StopMarkerPath,
+                        DateTimeOffset.UtcNow.ToString("O")); }
+                    catch { /* marker write best-effort; the held mutex is the durable latch */ }
+                    TryHoldStoppedMutexLocked();
+                }
                 BecomeAuthority();
             }
             else
             {
                 _peerAuthority = DetectPeerAuthority();
             }
-            if ((_registrar.PanicAvailable || _peerAuthority) &&
+            if (!_stoppedByPanic &&
+                (_registrar.PanicAvailable || _peerAuthority) &&
                 !EmergencyGate.IsStopped)
             {
                 _epoch.Dispose();
                 _epoch = new CancellationTokenSource();
                 _state = ComputerControlState.Active;
             }
+            stillStopped = _stoppedByPanic;
         }
         FireStateChanged();
         if (PanicAvailable || PanicDelegated)
-            Log("Emergency hotkey reacquired — computer control enabled");
+            Log(stillStopped
+                ? "Emergency hotkey reacquired — control remains stopped until a local resume"
+                : "Emergency hotkey reacquired — computer control enabled");
     }
 
     /// <summary>Acquire and park the emergency-stop mutex on a background
@@ -442,6 +515,7 @@ public sealed class EmergencyControl : IDisposable
             _epoch.Dispose();
             _epoch = new CancellationTokenSource();
             _stoppedByPanic = false;
+            _wedgeLogged = false;
             _state = ComputerControlState.Active;
             foreach (var input in _inputs)
                 try { input.ClearEmergency(); } catch { }
@@ -502,6 +576,7 @@ public sealed class EmergencyControl : IDisposable
         }
         _markerWatch?.Dispose();
         _registrar.Dispose();
+        try { _authorityEvent?.Dispose(); } catch { }
         try { _ownerMutex?.ReleaseMutex(); } catch { }
         try { _ownerMutex?.Dispose(); } catch { }
         EmergencyGate.ClearOwner(Environment.ProcessId);

@@ -694,7 +694,7 @@ public class PhaseEBatchingTests
     [Fact]
     public void ToolsList_CatalogSize_WithinRound1Budget()
     {
-        Assert.Equal(16, McpHost.CoreTools.Count);
+        Assert.Equal(25, McpHost.CoreTools.Count);
         Assert.Contains("computer_read", McpHost.CoreTools);
 
         const int baselineBytes = 56499;
@@ -750,10 +750,10 @@ public class PhaseEBatchingTests
 
         using var doc = JsonDocument.Parse(((TextContentBlock)res.Content[0]).Text);
         var root = doc.RootElement;
-        Assert.True(root.TryGetProperty("steps", out var steps));
+        Assert.True(root.TryGetProperty("results", out var steps));
         Assert.Equal(1, steps.GetArrayLength());
         var s0 = steps[0];
-        Assert.Equal("set_value", s0.GetProperty("action").GetString());
+        Assert.Equal("set_value", s0.GetProperty("do").GetString());
     }
 
     [Fact]
@@ -790,9 +790,12 @@ public class PhaseEBatchingTests
 
         using var doc = JsonDocument.Parse(((TextContentBlock)res.Content[0]).Text);
         var root = doc.RootElement;
+        // compact batch contract: halt-on-first-error reports the failing
+        // step's outcome kind as status plus a failedStep index
         Assert.True(root.TryGetProperty("status", out var status));
-        Assert.Equal("Paused", status.GetString());
-        Assert.Equal(0, root.GetProperty("pause").GetProperty("step").GetInt32());
+        Assert.Equal("TargetNotFound", status.GetString());
+        Assert.False(root.GetProperty("success").GetBoolean());
+        Assert.Equal(0, root.GetProperty("failedStep").GetInt32());
     }
 
     [Fact]
@@ -813,15 +816,19 @@ public class PhaseEBatchingTests
 
         using var doc = JsonDocument.Parse(((TextContentBlock)res.Content[0]).Text);
         var root = doc.RootElement;
-        Assert.Equal("Paused", root.GetProperty("status").GetString());
-        Assert.Equal(1, root.GetProperty("pause").GetProperty("step").GetInt32());
+        // compact contract: halt reports the step's outcome kind + failedStep;
+        // results[] only contains the steps that actually ran
+        Assert.Equal("Malformed", root.GetProperty("status").GetString());
+        Assert.Equal(1, root.GetProperty("failedStep").GetInt32());
+        Assert.Equal(2, root.GetProperty("stepsExecuted").GetInt32());
 
-        var stepsArr = root.GetProperty("steps");
+        var stepsArr = root.GetProperty("results");
         Assert.Equal(2, stepsArr.GetArrayLength());
         Assert.Equal(0, stepsArr[0].GetProperty("step").GetInt32());
-        Assert.True(stepsArr[0].GetProperty("status").GetString() is "Ok" or "Verified");
+        Assert.True(stepsArr[0].GetProperty("ok").GetBoolean());
         Assert.Equal(1, stepsArr[1].GetProperty("step").GetInt32());
-        Assert.Equal("Malformed", stepsArr[1].GetProperty("status").GetString());
+        Assert.False(stepsArr[1].GetProperty("ok").GetBoolean());
+        Assert.Contains("Malformed", stepsArr[1].GetProperty("error").GetString());
     }
 
     [Fact]
@@ -845,7 +852,8 @@ public class PhaseEBatchingTests
         var root = doc.RootElement;
         if (root.TryGetProperty("error", out var err))
         {
-            Assert.Equal("Cancelled", err.GetString());
+            // compact contract reports cancellation as a literal detail string
+            Assert.Equal("execution cancelled", err.GetString());
         }
         else
         {
@@ -891,11 +899,13 @@ public class PhaseEBatchingTests
 
         var rawJson = ((TextContentBlock)res.Content[0]).Text;
         using var doc = JsonDocument.Parse(rawJson);
-        var s0 = doc.RootElement.GetProperty("steps")[0];
+        // compact contract: per-step entries live under results[] with
+        // step/do/ok keys — verbose internals stay out of the payload
+        var s0 = doc.RootElement.GetProperty("results")[0];
 
         Assert.True(s0.TryGetProperty("step", out _));
-        Assert.True(s0.TryGetProperty("action", out _));
-        Assert.True(s0.TryGetProperty("status", out _));
+        Assert.True(s0.TryGetProperty("do", out _));
+        Assert.True(s0.TryGetProperty("ok", out _));
 
         Assert.False(s0.TryGetProperty("internalActions", out _));
         Assert.False(s0.TryGetProperty("retryReasons", out _));
@@ -974,9 +984,9 @@ public class PhaseEBatchingTests
         Assert.NotNull(resSet);
         using var docSet = JsonDocument.Parse(((TextContentBlock)resSet.Content[0]).Text);
         Assert.False(docSet.RootElement.TryGetProperty("error", out var setErr) && setErr.GetString() == "Malformed");
-        var setSteps = docSet.RootElement.GetProperty("steps");
+        var setSteps = docSet.RootElement.GetProperty("results");
         Assert.Equal(1, setSteps.GetArrayLength());
-        Assert.Equal("set_value", setSteps[0].GetProperty("action").GetString());
+        Assert.Equal("set_value", setSteps[0].GetProperty("do").GetString());
 
         // Steps alone with set_value -> valid for sequenced/interleaved workflows
         var stepsInterleaved = new[]
@@ -988,9 +998,9 @@ public class PhaseEBatchingTests
         Assert.NotNull(resSteps);
         using var docSteps = JsonDocument.Parse(((TextContentBlock)resSteps.Content[0]).Text);
         Assert.False(docSteps.RootElement.TryGetProperty("error", out var stepsErr) && stepsErr.GetString() == "Malformed");
-        var interleavedSteps = docSteps.RootElement.GetProperty("steps");
+        var interleavedSteps = docSteps.RootElement.GetProperty("results");
         Assert.True(interleavedSteps.GetArrayLength() >= 1);
-        Assert.Equal("set_value", interleavedSteps[0].GetProperty("action").GetString());
+        Assert.Equal("set_value", interleavedSteps[0].GetProperty("do").GetString());
     }
 
     [Fact]
@@ -1178,9 +1188,10 @@ public class PhaseEBatchingTests
         var res = await batchTask;
         Assert.NotNull(res);
 
-        // Verify batch executed the planned step
+        // Verify batch executed the planned step — compact contract lists
+        // executed entries under results[]
         using var doc = JsonDocument.Parse(((TextContentBlock)res.Content[0]).Text);
-        var stepsArr = doc.RootElement.GetProperty("steps");
+        var stepsArr = doc.RootElement.GetProperty("results");
         Assert.Equal(1, stepsArr.GetArrayLength());
         Assert.Equal(0, stepsArr[0].GetProperty("step").GetInt32());
 

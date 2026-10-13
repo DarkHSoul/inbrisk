@@ -49,20 +49,12 @@ def main():
                 msg_type = data.get("type", "user_msg")
                 msg_ts = float(data.get("timestamp", 0.0))
 
-                # Yeni bir mesaj veya aynı id'ye ait yeni bir tool_result mı?
                 is_new = (msg_id > last_id) or (msg_id == last_id and msg_type != last_type and msg_ts > last_ts)
 
                 if is_new:
                     save_state({"last_id": msg_id, "last_type": msg_type, "last_ts": msg_ts})
-                    
-                    if msg_type == "user_msg":
-                        text = data.get("text", "")
-                        print(f"=== BRIDGE_USER_MSG ===\nID: {msg_id}\nTEXT: {text}\n=== END ===")
-                    elif msg_type == "tool_result":
-                        cmd = data.get("command", "")
-                        out = data.get("output", "")
-                        code = data.get("exit_code", 0)
-                        print(f"=== BRIDGE_TOOL_RESULT ===\nID: {msg_id}\nCMD: {cmd}\nCODE: {code}\nOUTPUT:\n{out}\n=== END ===")
+                    text = data.get("text", "")
+                    print(f"=== BRIDGE_USER_MSG ===\nID: {msg_id}\nTEXT: {text}\n=== END ===")
                     sys.exit(0)
             except Exception:
                 pass

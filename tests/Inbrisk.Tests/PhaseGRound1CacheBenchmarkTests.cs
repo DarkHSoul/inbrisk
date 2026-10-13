@@ -186,17 +186,28 @@ public sealed class PhaseGRound1CacheBenchmarkTests
     {
         const int N = 100;
         var cache = new HwndMetadataCache();
-        var currentPid = Environment.ProcessId;
-        var startTime = Process.GetCurrentProcess().StartTime;
         var hwnd = NativeMethods.GetDesktopWindow().ToInt64();
+        // The identity gate compares cached metadata against the live hwnd
+        // owner — resolve the desktop window's real pid so hits validate.
+        NativeMethods.GetWindowThreadProcessId(new IntPtr(hwnd), out var ownerPidU);
+        var ownerPid = unchecked((int)ownerPidU);
+        // The desktop owner may be a protected process — StartTime/ProcessName
+        // can be unreadable; null generation tokens still validate.
+        string? ownerName = null;
+        DateTimeOffset? ownerStartTime = null;
+        try
+        {
+            using var ownerProc = Process.GetProcessById(ownerPid);
+            ownerName = ownerProc.ProcessName;
+            try { ownerStartTime = ownerProc.StartTime; } catch (Exception) { }
+        }
+        catch (Exception) { }
 
         int systemCalls = 0;
         HwndMetadata? NativeResolver(long h)
         {
             Interlocked.Increment(ref systemCalls);
-            // Real Win32 process lookup
-            using var p = Process.GetProcessById(currentPid);
-            return new HwndMetadata(h, currentPid, p.ProcessName, p.StartTime, false);
+            return new HwndMetadata(h, ownerPid, ownerName, ownerStartTime, false);
         }
 
         var latencies = new List<double>(N);
@@ -217,16 +228,19 @@ public sealed class PhaseGRound1CacheBenchmarkTests
         Assert.Equal(1, systemCalls);
         Assert.Equal(N - 1, cache.Telemetry.HitCount);
 
-        // Simulate PID reuse: inject stale start time into cache
+        // Simulate PID reuse: inject a stale entry whose pid is NOT the hwnd's
+        // live owner — the identity check must evict it before any stale hit.
+        var wrongPid = Environment.ProcessId;
+        var wrongStart = Process.GetCurrentProcess().StartTime;
         long reuseHwnd = hwnd;
         cache.Clear();
-        cache.GetOrAdd(reuseHwnd, h => new HwndMetadata(h, currentPid, "old_dead_proc.exe", startTime.AddHours(-1), false));
+        cache.GetOrAdd(reuseHwnd, h => new HwndMetadata(h, wrongPid, "old_dead_proc.exe", wrongStart.AddHours(-1), false));
 
         int staleHitCount = 0;
         var resolved = cache.GetOrAdd(reuseHwnd, h =>
         {
             systemCalls++;
-            return new HwndMetadata(h, currentPid, "new_active_proc.exe", startTime, false);
+            return new HwndMetadata(h, ownerPid, "new_active_proc.exe", ownerStartTime, false);
         });
 
         // PID reuse rejection incremented, stale hit was 0

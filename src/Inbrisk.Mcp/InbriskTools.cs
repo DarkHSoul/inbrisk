@@ -526,9 +526,11 @@ public sealed class InbriskTools
         {
             for (int i = ProcessBarriers.Count - 1; i >= 0; i--)
             {
-                try { await ProcessBarriers[i].DisposeAsync().ConfigureAwait(false); } catch { }
+                try { await ProcessBarriers[i].DisposeAsync().ConfigureAwait(false); }
+                catch (Exception ex) { Debug.WriteLine($"close scope barrier dispose failed: {ex.Message}"); }
             }
-            try { GlobalLease?.Dispose(); } catch { }
+            try { GlobalLease?.Dispose(); }
+            catch (Exception ex) { Debug.WriteLine($"close scope lease dispose failed: {ex.Message}"); }
         }
     }
 
@@ -576,9 +578,12 @@ public sealed class InbriskTools
         "normally, the app stays in control). Target by hwnd, process name, " +
         "title substring, list of hwnds, owned: true (closes purely ephemeral helper windows opened by the agent), " +
         "or lastOwned: true (closes the most recent agent-owned window). Respects the conservative Application Lifecycle Policy: " +
-        "never close pre-existing user applications or protected processes. Do NOT automatically close windows merely because you opened them — " +
-        "leave user-facing results open (Notepad documents, browser tabs, Calculator, Explorer folders). 'When in doubt, leave it open.' " +
-        "Pre-existing user applications cannot be closed unless force:true is explicitly set.")]
+        "windows the agent opened may be closed; pre-existing user windows are refused unless force:true is passed. " +
+        "Protected windows and processes (the agent host, terminals, IDEs, shell, anything in the host process tree) " +
+        "can never be closed — force does not override them. force:true may additionally hard-kill the owning process, " +
+        "but only when it is a single-purpose process that owns no other windows and is not a shared/protected host. " +
+        "Do NOT automatically close windows merely because you opened them — " +
+        "leave user-facing results open (Notepad documents, browser tabs, Calculator, Explorer folders). 'When in doubt, leave it open.'")]
     public async Task<CallToolResult> CloseWindow(
         [Description("window handle — decimal or 0x-prefixed")] string? hwnd = null,
         [Description("batch list of window handles to close in one call")] string[]? hwnds = null,
@@ -673,7 +678,10 @@ public sealed class InbriskTools
                             proc.Kill();
                             wasClosed = proc.WaitForExit(1000) || proc.HasExited;
                         }
-                        catch { }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"computer_close_window owned-batch force-kill pid={win.Pid} failed: {ex.Message}");
+                        }
                     }
                 }
                 if (wasClosed)
@@ -802,7 +810,10 @@ public sealed class InbriskTools
                             proc.Kill();
                             c = proc.WaitForExit(1000) || proc.HasExited;
                         }
-                        catch { }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"computer_close_window hwnds-batch force-kill pid={win.Pid} failed: {ex.Message}");
+                        }
                     }
                 }
                 if (c)
@@ -1102,7 +1113,7 @@ public sealed class InbriskTools
     /// multi-window host, or owns visible top-level windows outside the current
     /// close batch — killing it would end the AI session or destroy unrelated
     /// user windows. Returns null when a force-kill is permitted.</summary>
-    private static (string Kind, string Reason)? ForceKillRefusal(
+    private (string Kind, string Reason)? ForceKillRefusal(
         WindowInfo w, IReadOnlyList<WindowInfo> wins, IReadOnlyCollection<long> batchTargetHwnds)
     {
         if (w.Pid > 0 &&
@@ -1110,6 +1121,19 @@ public sealed class InbriskTools
         {
             return ("ProtectedProcess",
                 $"Force-kill refused: {ancestorReason}. Terminating it would end the AI host session or a shared terminal. " +
+                "Close windows with WM_CLOSE (no force) instead.");
+        }
+
+        // Host-tree descendant: a process spawned beneath this runtime
+        // (respawned server, helper, renamed host binary) carries no
+        // protected name and may own an unprotected window — force must
+        // never launder its termination. Agent-owned windows are exempt:
+        // the lifecycle policy already authorizes their kill.
+        if (w.Pid > 0 && !IsWindowAgentOwned(w) &&
+            WindowService.IsDescendantOfAgentHost(w.Pid, out var descendantReason))
+        {
+            return ("ProtectedProcess",
+                $"Force-kill refused: {descendantReason}. Terminating a process inside the agent host's process tree would end or degrade the AI host session. " +
                 "Close windows with WM_CLOSE (no force) instead.");
         }
 
@@ -1259,7 +1283,10 @@ public sealed class InbriskTools
             {
                 normalLease = await arbiter.AcquireAsync("reset_input", LeaseKind.PhysicalInput, "clean input reset", timeout: TimeSpan.FromSeconds(2), ct: ct).ConfigureAwait(false);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"reset_input lease acquire failed, proceeding without lease: {ex.Message}");
+            }
         }
 
         try
@@ -1359,7 +1386,10 @@ public sealed class InbriskTools
             els = _s.Rt.Find(findSpec);
             comPropertyReads += els.Count * 2;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"BuildInitialAppMap find hwnd=0x{hwnd:X} failed: {ex.Message}");
+        }
 
         if (sw.Elapsed > timeBudget || els.Count >= maxNodesVisited)
         {
@@ -1409,7 +1439,10 @@ public sealed class InbriskTools
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"BuildInitialAppMap profile landmark read failed: {ex.Message}");
+            }
         }
 
         var map = new Dictionary<string, object?>
@@ -1638,7 +1671,10 @@ public sealed class InbriskTools
                 using var targetProc = Process.GetProcessById(targetPid);
                 finalStartTime = targetProc.StartTime;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"computer_launch pid={targetPid} start-time probe failed: {ex.Message}");
+            }
         }
 
         var foundWin = _s.Rt.Windows().FirstOrDefault(w => (targetHwnd != 0 && w.Hwnd == targetHwnd) || (targetPid > 0 && w.Pid == targetPid));
@@ -1650,7 +1686,10 @@ public sealed class InbriskTools
                 using var targetP = Process.GetProcessById(targetPid);
                 targetProcName = targetP.ProcessName;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"computer_launch pid={targetPid} name probe failed: {ex.Message}");
+            }
         }
 
         bool isHostedProcess = string.Equals(targetProcName, "ApplicationFrameHost", StringComparison.OrdinalIgnoreCase) ||
@@ -1785,7 +1824,10 @@ public sealed class InbriskTools
                     continuationOutcome = JsonSerializer.Deserialize<Dictionary<string, object?>>(rawJson, J);
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"computer_launch continuation outcome parse failed: {ex.Message}");
+            }
             if (continuationOutcome == null)
             {
                 continuationOutcome = planResult.Content;
@@ -3881,7 +3923,10 @@ public sealed class InbriskTools
                         };
                     }
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"computer_batch read-merge failed: {ex.Message}");
+                }
             }
         }
 
@@ -4020,9 +4065,11 @@ public sealed class InbriskTools
         };
         if (runId != null) outDoc["runId"] = runId;
         if (reflexJson != null)
-            try { outDoc["reflex"] = JsonSerializer.Deserialize<JsonElement>(reflexJson, J); } catch { }
+            try { outDoc["reflex"] = JsonSerializer.Deserialize<JsonElement>(reflexJson, J); }
+            catch (Exception ex) { Debug.WriteLine($"computer_batch reflex payload parse failed: {ex.Message}"); }
         if (modalJson != null)
-            try { outDoc["modal"] = JsonSerializer.Deserialize<JsonElement>(modalJson, J); } catch { }
+            try { outDoc["modal"] = JsonSerializer.Deserialize<JsonElement>(modalJson, J); }
+            catch (Exception ex) { Debug.WriteLine($"computer_batch modal payload parse failed: {ex.Message}"); }
         if (!failFast) outDoc["failFast"] = false;
         if (!success)
         {
@@ -4128,6 +4175,11 @@ public sealed class InbriskTools
     {
         if (string.IsNullOrWhiteSpace(name))
             return Task.FromResult(Error(OutcomeKind.Malformed, "recipe name is required"));
+
+        // F11: persisting recipes mutates user state — honour the latched
+        // emergency stop like every other mutating tool.
+        if (_s.Control.ActionToken() == null)
+            return Task.FromResult(Error(OutcomeKind.EmergencyStopped, StoppedDetail));
 
         RunStep[]? resolvedSteps = null;
         if (!string.IsNullOrWhiteSpace(fromRunId))
@@ -4664,6 +4716,15 @@ public sealed class InbriskTools
             return Error(OutcomeKind.ConfirmationDenied,
                 ScriptExecDeniedDetail("computer_adapter"), sw);
         }
+
+        // F11: adapter actions mutate apps/desktop (media control, CDP DOM
+        // actions, Blender bridge) — honour the latched emergency stop.
+        var epoch = _s.Control.ActionToken();
+        if (epoch == null)
+            return Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+            ct, _s.SessionCts.Token, epoch.Value);
+        ct = linked.Token;
 
         CallToolResult result;
         Inbrisk.Core.AdapterResult? res = null;
@@ -5592,7 +5653,11 @@ public sealed class InbriskTools
                 reflexEng.Arm(hwnd, pid, reflexDismiss);
                 reflexArmedHwnd = hwnd;
             }
-            catch { reflexBroken = true; }
+            catch (Exception ex)
+            {
+                reflexBroken = true;
+                Debug.WriteLine($"reflex arm hwnd=0x{hwnd:X} failed, engine disabled for this leg: {ex.Message}");
+            }
         }
         EnsureReflexArmed(scope ?? 0);
 
@@ -6134,7 +6199,10 @@ public sealed class InbriskTools
                         }).ToList(),
                     };
                 }
-                catch { }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"computer_run post-step observation build failed: {ex.Message}");
+                }
             }
             if (postId != null) { state.LastElementId = postId; _s.NoteElementRef(postId); }
             if (!ok)
@@ -6281,7 +6349,8 @@ public sealed class InbriskTools
         }
         finally
         {
-            try { if (reflexArmedHwnd != 0) reflexEng?.Disarm(); } catch { }
+            try { if (reflexArmedHwnd != 0) reflexEng?.Disarm(); }
+            catch (Exception ex) { Debug.WriteLine($"reflex disarm hwnd=0x{reflexArmedHwnd:X} failed: {ex.Message}"); }
             planHighlightLease?.Dispose();
         }
     }
@@ -7916,7 +7985,10 @@ public sealed class InbriskTools
             app = fg?.ProcessName ?? "";
             curScreen = _s?.Memory?.GetCurrentScreen(app);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"RunReport current-screen lookup failed: {ex.Message}");
+        }
 
         var payload = new Dictionary<string, object?>
         {
@@ -8059,7 +8131,8 @@ public sealed class InbriskTools
             TargetDiagnosis? diag = null;
             if (doc.RootElement.TryGetProperty("diagnosis", out var diagEl))
             {
-                try { diag = JsonSerializer.Deserialize<TargetDiagnosis>(diagEl.GetRawText(), J); } catch { }
+                try { diag = JsonSerializer.Deserialize<TargetDiagnosis>(diagEl.GetRawText(), J); }
+                catch (Exception ex) { Debug.WriteLine($"target diagnosis payload parse failed: {ex.Message}"); }
             }
             return (kind, detail, diag);
         }
@@ -8401,6 +8474,11 @@ public sealed class InbriskTools
         "Open the Inbrisk Settings & Tools window for the user. Interactive, non-blocking.")]
     public CallToolResult UiOpenSettings(CancellationToken ct = default)
     {
+        // F11: spawning a process is a desktop mutation — honour the
+        // latched emergency stop like every other mutating tool.
+        if (_s.Control.ActionToken() == null)
+            return Error(OutcomeKind.EmergencyStopped, StoppedDetail);
+
         try
         {
             var exe = Inbrisk.Setup.InstallLayout.CanonicalExePath;
@@ -8451,9 +8529,15 @@ public sealed class InbriskTools
         [Description("explicitly restart the Inbrisk SERVER itself (default false)")] bool server = false,
         CancellationToken ct = default)
     {
+        // P1/F11: restart closes and re-spawns processes — it must honour the
+        // latched emergency stop like every other mutating tool.
+        if (_s.Control.ActionToken() == null)
+            return Error(OutcomeKind.EmergencyStopped, StoppedDetail);
+
         if (server)
         {
-            Task.Run(async () =>
+            // deliberate fire-and-forget: respawn self after a grace delay
+            _ = Task.Run(async () =>
             {
                 try
                 {
@@ -8518,9 +8602,11 @@ public sealed class InbriskTools
 
         if (server)
         {
-            Task.Run(async () =>
+            // deliberate fire-and-forget: exit self after the response flushes
+            _ = Task.Run(async () =>
             {
-                try { await Task.Delay(250); } catch { }
+                try { await Task.Delay(250); }
+                catch (Exception ex) { Debug.WriteLine($"app_shutdown server-exit delay failed: {ex.Message}"); }
                 Environment.Exit(0);
             });
 
@@ -8568,6 +8654,16 @@ public sealed class InbriskTools
             {
                 return Error(OutcomeKind.PolicyDenied,
                     $"Refusing to shut down {ancestorReason}. Terminating it would end the AI host session.");
+            }
+
+            // A windowless descendant of the host tree (respawned server,
+            // helper, renamed host binary) is equally un-killable — except
+            // pids the agent itself launched and still owns.
+            if (_s.Rt.Provenance.GetProvenance(pVal)?.OpenedByAgent != true &&
+                WindowService.IsDescendantOfAgentHost(pVal, out var descendantReason))
+            {
+                return Error(OutcomeKind.PolicyDenied,
+                    $"Refusing to shut down {descendantReason}. Terminating it would degrade the AI host session.");
             }
 
             string? procName;
@@ -8656,6 +8752,7 @@ public sealed class InbriskTools
         [Description("elementId for element target")] string? elementId = null,
         [Description("monitor index")] int monitorIndex = 0,
         [Description("cap image width in px — wider captures are downscaled (bilinear); image-space coordinates still map back via frameId")] int? maxWidth = null,
+        [Description("snake_case alias of maxWidth")] int? max_width = null,
         [Description("draw numbered marks at clickable element centers (window/element targets only); marks are listed in the result text")] bool marks = false,
         CancellationToken ct = default)
     {
@@ -8690,7 +8787,7 @@ public sealed class InbriskTools
             RawFrame raw;
             using (PerfTrace.Stage("capture"))
                 raw = _s.Rt.CaptureRaw(ct2);
-            if (maxWidth is { } mw && mw > 0 && raw.Width > mw)
+            if ((maxWidth ?? max_width) is { } mw && mw > 0 && raw.Width > mw)
                 using (PerfTrace.Stage("downscale"))
                     raw = raw.ScaledToMaxWidth(mw);
             List<(int Index, UiElement El)>? marked = null;
@@ -9560,7 +9657,10 @@ public sealed class InbriskTools
                         SuggestedAction: "wait for application to finish its busy state before retrying"));
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"target diagnosis responding-probe pid={pid} failed: {ex.Message}");
+            }
         }
 
         // Check if a modal dialog appeared and is blocking the target window
@@ -9601,7 +9701,10 @@ public sealed class InbriskTools
                     }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"target diagnosis offscreen-find failed: {ex.Message}");
+            }
         }
 
         // Check DesktopStateMemory for navigation suggestions across screens
@@ -9980,7 +10083,7 @@ public sealed class InbriskTools
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
                 ct, _s?.SessionCts?.Token ?? CancellationToken.None, epoch.Value);
             using var cancelReg = linked.Token.CanBeCanceled
-                ? linked.Token.Register(() => { try { _s?.Rt?.PurgePendingWork(); } catch { } })
+                ? linked.Token.Register(() => { try { _s?.Rt?.PurgePendingWork(); } catch (Exception ex) { Debug.WriteLine($"cancel purge of pending work failed: {ex.Message}"); } })
                 : default;
             var actx = new ActionContext(linked.Token, null,
                 _s?.SessionId ?? "session", null, null);
@@ -10129,7 +10232,8 @@ public sealed class InbriskTools
                 highlightLease?.Dispose();
                 foreach (var ms in mutationScopes)
                 {
-                    try { await ms.DisposeAsync().ConfigureAwait(false); } catch { }
+                    try { await ms.DisposeAsync().ConfigureAwait(false); }
+                    catch (Exception ex) { Debug.WriteLine($"mutation scope dispose failed: {ex.Message}"); }
                 }
                 physicalLease?.Dispose();
             }
@@ -10214,7 +10318,10 @@ public sealed class InbriskTools
                     return new ContextualPostView("scrolled_content", "Visible items after scroll", summaries);
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"contextual post-action view build failed: {ex.Message}");
+        }
 
         return null;
     }
@@ -10458,7 +10565,10 @@ public sealed class InbriskTools
                     } : null,
                 };
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"post-action payload observation build failed: {ex.Message}");
+            }
         }
         var json = JsonSerializer.Serialize(payload, J);
         return new CallToolResult

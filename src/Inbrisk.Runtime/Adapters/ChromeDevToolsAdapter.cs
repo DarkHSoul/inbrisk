@@ -81,12 +81,23 @@ public sealed class ChromeDevToolsAdapter : IApplicationAdapter, IAsyncDisposabl
         int port = ResolvePort(args);
         string baseUrl = $"http://127.0.0.1:{port}";
 
+        // A live attached session proves the endpoint is up — probing
+        // /json/version would only risk a spurious OnBrowserRestart that
+        // invalidates the very session we are about to reuse (a dead
+        // browser instead leaves transports closed, so TryGetSession
+        // misses and the normal probe/self-heal path below still runs).
+        var requestedTabId = GetArgString(args, "tabId", GetArgString(args, "id", ""));
+        var haveLiveSession = SessionManager.TryGetSession(port,
+            string.IsNullOrWhiteSpace(requestedTabId) ? null : requestedTabId, out _);
+
         // Verify Chrome DevTools connectivity — self-heal by spawning a
         // dedicated debug-enabled browser instance when the port is dead.
         JsonNode? versionInfo = null;
         try
         {
-            versionInfo = await Http.GetFromJsonAsync<JsonNode>($"{baseUrl}/json/version", ct).ConfigureAwait(false);
+            versionInfo = haveLiveSession
+                ? new JsonObject { ["Browser"] = "attached-session" }
+                : await Http.GetFromJsonAsync<JsonNode>($"{baseUrl}/json/version", ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

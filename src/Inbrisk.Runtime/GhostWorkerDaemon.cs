@@ -881,7 +881,7 @@ public class GhostInputExecutor
 
 /// <summary>
 /// High-speed shared memory writer writing desktop frames directly into the cross-session
-/// Inbrisk double-buffered shared memory layout with NULL DACL permissions.
+/// Inbrisk double-buffered shared memory layout with a restricted DACL.
 /// Binary-compatible with <c>GhostSharedFrameBuffer</c> and <c>GhostPipRenderer</c>.
 /// </summary>
 internal sealed class NativeGhostFrameBufferWriter : IDisposable
@@ -909,6 +909,14 @@ internal sealed class NativeGhostFrameBufferWriter : IDisposable
     [DllImport("advapi32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetSecurityDescriptorDacl(IntPtr pSecurityDescriptor, [MarshalAs(UnmanagedType.Bool)] bool bDaclPresent, IntPtr pDacl, [MarshalAs(UnmanagedType.Bool)] bool bDaclDefaulted);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string stringSecurityDescriptor, uint stringSdRevision, out IntPtr securityDescriptor, out int securityDescriptorSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LocalFree(IntPtr hMem);
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr CreateFileMappingW(IntPtr hFile, ref SECURITY_ATTRIBUTES lpFileMappingAttributes, uint flProtect, uint dwMaximumSizeHigh, uint dwMaximumSizeLow, string lpName);
@@ -961,14 +969,39 @@ internal sealed class NativeGhostFrameBufferWriter : IDisposable
         InitSharedMemory(totalMappingSize);
     }
 
-    private void InitSharedMemory(long totalSize)
+    /// <summary>Restricted cross-session DACL matching
+    /// <c>GhostSharedFrameBuffer</c>: full control SYSTEM/Admins, read-write
+    /// for the creating user, read-only for interactive users (other-session
+    /// consumers). A NULL DACL let any local process read/corrupt frames.</summary>
+    private static IntPtr BuildRestrictedSd()
     {
-        IntPtr pSd = Marshal.AllocHGlobal(64);
+        var sddl = new System.Text.StringBuilder("D:(A;;GA;;;SY)(A;;GA;;;BA)");
         try
         {
-            InitializeSecurityDescriptor(pSd, SECURITY_DESCRIPTOR_REVISION);
-            SetSecurityDescriptorDacl(pSd, true, IntPtr.Zero, false);
+            var userSid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value;
+            if (!string.IsNullOrEmpty(userSid))
+            {
+                sddl.Append("(A;;GRGW;;;").Append(userSid).Append(')');
+            }
+        }
+        catch { }
+        sddl.Append("(A;;GR;;;IU)");
 
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.ToString(), SECURITY_DESCRIPTOR_REVISION, out IntPtr pSd, out _))
+        {
+            return IntPtr.Zero;
+        }
+        return pSd;
+    }
+
+    private void InitSharedMemory(long totalSize)
+    {
+        IntPtr pSd = BuildRestrictedSd();
+        try
+        {
+            // Fail closed: without a DACL we would create a world-accessible
+            // mapping — rather run with default object security than none.
             var sa = new SECURITY_ATTRIBUTES
             {
                 nLength = Marshal.SizeOf<SECURITY_ATTRIBUTES>(),
@@ -1015,7 +1048,10 @@ internal sealed class NativeGhostFrameBufferWriter : IDisposable
         }
         finally
         {
-            Marshal.FreeHGlobal(pSd);
+            if (pSd != IntPtr.Zero)
+            {
+                LocalFree(pSd);
+            }
         }
     }
 
@@ -1612,6 +1648,10 @@ public sealed class GhostWorkerDaemon : IAsyncDisposable, IDisposable
         // 5. "execute_batch" -> GhostInputExecutor executes batch steps
         _ipcClient.RegisterHandler("execute_batch", async payloadJson =>
         {
+            if (EmergencyGate.IsStopped)
+            {
+                return JsonSerializer.Serialize(new { status = "emergency_stopped", error = "Emergency stop is engaged" });
+            }
             var result = await _inputExecutor.ExecuteBatchAsync(payloadJson, _cts?.Token ?? default).ConfigureAwait(false);
             return JsonSerializer.Serialize(result);
         });
@@ -1664,6 +1704,13 @@ public sealed class GhostWorkerDaemon : IAsyncDisposable, IDisposable
         var action = packet.Action?.ToLowerInvariant() ?? "";
         var btn = PipInputTranslator.ParseMouseButton(packet.Button);
 
+        // Emergency gate: mutating input is refused while stopped; release
+        // passes so panic always unwinds held ghost-side state.
+        if (EmergencyGate.IsStopped && !type.Contains("release") && action != "release_all")
+        {
+            return;
+        }
+
         if (type.Contains("move") || action == "move")
         {
             _inputExecutor.InputService.MoveMouse(packet.X, packet.Y);
@@ -1711,6 +1758,12 @@ public sealed class GhostWorkerDaemon : IAsyncDisposable, IDisposable
         using var doc = JsonDocument.Parse(payloadJson);
         var root = doc.RootElement;
         string evt = root.TryGetProperty("event", out var evProp) ? evProp.GetString()?.ToLowerInvariant() ?? "" : "";
+
+        // Emergency gate: only key releases pass while stopped.
+        if (EmergencyGate.IsStopped && evt != "keyup" && evt != "release")
+        {
+            return;
+        }
 
         if (evt == "char" && root.TryGetProperty("char", out var charProp))
         {

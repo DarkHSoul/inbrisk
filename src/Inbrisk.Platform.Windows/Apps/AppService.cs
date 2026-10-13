@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using Inbrisk.Core;
 using Microsoft.Win32;
 using Windows.Win32;
@@ -37,8 +38,24 @@ public sealed class AppService : IAppService, IDisposable
         "mshta.exe", "rundll32", "rundll32.exe", "regsvr32", "regsvr32.exe",
         "wmic", "wmic.exe", "msiexec", "msiexec.exe",
         "conhost", "conhost.exe", "bash", "bash.exe",
-        "sh", "sh.exe", "wt", "wt.exe", "curl", "curl.exe",
+        "sh", "sh.exe", "zsh", "zsh.exe", "fish", "fish.exe",
+        "nu", "nu.exe", "wt", "wt.exe",
+        "windowsterminal", "windowsterminal.exe",
+        "wsl", "wsl.exe", "curl", "curl.exe",
+        "python", "python.exe", "pythonw", "pythonw.exe",
+        "node", "node.exe",
     };
+
+    internal static bool IsShellHost(string? name)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return false;
+        var stem = Path.GetFileNameWithoutExtension(name.Trim().Trim('"'));
+        if (ShellHosts.Contains(stem) || ShellHosts.Contains(stem + ".exe"))
+            return true;
+        var n = Norm(stem);
+        return n.Length > 0 &&
+            System.Text.RegularExpressions.Regex.IsMatch(n, @"^pythonw?\d*$");
+    }
 
     private readonly IWindowService _windows;
     private readonly Func<long, bool>? _uiaProbe;
@@ -71,6 +88,7 @@ public sealed class AppService : IAppService, IDisposable
     // process-name set refreshed at most every 250ms — a full EnumWindows /
     // GetProcesses on every poll slice is what made waits expensive.
     private const long WindowSnapshotTtlMs = 120;
+    private const long FallbackPollMs = 500;
     private IReadOnlyList<WindowInfo>? _windowSnapshot;
     private long _windowSnapshotGen = -1;
     private long _windowSnapshotTicks;
@@ -291,8 +309,7 @@ public sealed class AppService : IAppService, IDisposable
         {
             // a friendly name that itself denotes a shell is denied before
             // any resolution or running-instance reuse
-            if (ShellHosts.Contains(Norm(spec.App)) ||
-                ShellHosts.Contains(Norm(spec.App) + ".exe") ||
+            if (IsShellHost(spec.App) ||
                 _isDeniedProcess(Norm(spec.App)))
                 return Fail("PolicyDenied",
                     $"refusing to launch '{spec.App}' — computer_launch is " +
@@ -381,12 +398,53 @@ public sealed class AppService : IAppService, IDisposable
         // into an "AlreadyRunning" success.
         foreach (var hint in chosen.ExeHints.Append(
                      Path.GetFileNameWithoutExtension(chosen.Identifier)))
-            if (hint != null && (ShellHosts.Contains(hint) ||
-                                 ShellHosts.Contains(hint + ".exe") ||
+            if (hint != null && (IsShellHost(hint) ||
                                  _isDeniedProcess(hint)))
                 return Fail("PolicyDenied",
                     $"refusing to launch '{hint}' — computer_launch is not a " +
                     "shell; use executable UI applications", total);
+
+        if (ResolveLaunchTarget(chosen) is { } launchTarget)
+        {
+            var identity = TargetIdentity(launchTarget);
+            if (IsShellHost(launchTarget) || IsShellHost(identity))
+                return Fail("PolicyDenied",
+                    $"refusing to launch " +
+                    $"'{identity ?? Path.GetFileName(launchTarget)}' — " +
+                    "computer_launch is not a shell; use executable UI " +
+                    "applications", total,
+                    resolvedName: chosen.DisplayName,
+                    identifier: chosen.Identifier);
+
+            if (chosen.Method is LaunchMethod.ExplicitPath
+                    or LaunchMethod.Executable &&
+                LooksLikePe(launchTarget) &&
+                !IsSignedBinary(launchTarget))
+            {
+                if (!LaunchPathGate.ConsentGranted(out var consentSrc))
+                    return Fail("ConfirmationRequired",
+                        $"'{Path.GetFileName(launchTarget)}' is an unsigned " +
+                        "binary outside the registered-app catalog — " +
+                        "refusing to launch unverifiable code; set " +
+                        $"{LaunchPathGate.AllowEnvVar}=1 or " +
+                        "\"allowScriptLaunch\": true in settings.json to " +
+                        "permit unsigned launches", total,
+                        resolvedName: chosen.DisplayName,
+                        identifier: chosen.Identifier);
+                try
+                {
+                    PerfLog.Write(new
+                    {
+                        kind = "launch_unsigned_consent",
+                        at = DateTimeOffset.Now,
+                        target = launchTarget,
+                        via = consentSrc,
+                        identifier = chosen.Identifier,
+                    });
+                }
+                catch { /* telemetry must never break a launch */ }
+            }
+        }
 
         // ---- reuse a running instance for explicit targets too ----
         // titleMatch stays loose only for friendly names — an explicit
@@ -899,20 +957,12 @@ public sealed class AppService : IAppService, IDisposable
     /// <summary>Inspects a .lnk via IShellLinkW — checks if target exists
     /// and resolves the target executable stem (File Explorer.lnk → "explorer").
     /// Stale/dead shortcuts to uninstalled apps return (false, null).</summary>
-    private static unsafe (bool isValid, string? stem) InspectLnk(string lnk)
+    private static (bool isValid, string? stem) InspectLnk(string lnk)
     {
         try
         {
-            var link = (global::Windows.Win32.UI.Shell.IShellLinkW)
-                new global::Windows.Win32.UI.Shell.ShellLink();
-            ((global::Windows.Win32.System.Com.IPersistFile)link)
-                .Load(lnk, global::Windows.Win32.System.Com.STGM.STGM_READ);
-            var buf = new char[1024];
-            var fd = new global::Windows.Win32.Storage.FileSystem
-                .WIN32_FIND_DATAW();
-            link.GetPath(buf, ref fd,
-                (uint)global::Windows.Win32.UI.Shell.SLR_FLAGS.SLR_NO_UI);
-            var path = new string(buf).TrimEnd('\0');
+            var path = LnkTargetPath(lnk);
+            if (path == null) return (false, null);
             // shell:/folder targets have no exe path — they open in
             // Explorer (File Explorer.lnk is exactly this shape)
             if (path.Length == 0) return (true, "explorer");
@@ -928,6 +978,289 @@ public sealed class AppService : IAppService, IDisposable
         }
         catch { return (false, null); }
     }
+
+    private static unsafe string? LnkTargetPath(string lnk)
+    {
+        try
+        {
+            var link = (global::Windows.Win32.UI.Shell.IShellLinkW)
+                new global::Windows.Win32.UI.Shell.ShellLink();
+            ((global::Windows.Win32.System.Com.IPersistFile)link)
+                .Load(lnk, global::Windows.Win32.System.Com.STGM.STGM_READ);
+            var buf = new char[1024];
+            var fd = new global::Windows.Win32.Storage.FileSystem
+                .WIN32_FIND_DATAW();
+            link.GetPath(buf, ref fd,
+                (uint)global::Windows.Win32.UI.Shell.SLR_FLAGS.SLR_NO_UI);
+            return new string(buf).TrimEnd('\0');
+        }
+        catch { return null; }
+    }
+
+    private static string? ResolveLaunchTarget(ResolvedApp app)
+    {
+        try
+        {
+            string? raw = app.Method switch
+            {
+                LaunchMethod.StartMenu => LnkTargetPath(app.Identifier),
+                LaunchMethod.ExplicitPath or LaunchMethod.AppPath
+                    or LaunchMethod.Executable =>
+                    app.Identifier.EndsWith(".exe",
+                        StringComparison.OrdinalIgnoreCase)
+                        ? app.Identifier
+                    : app.Identifier.EndsWith(".lnk",
+                        StringComparison.OrdinalIgnoreCase)
+                        ? LnkTargetPath(app.Identifier)
+                        : LooksLikePe(app.Identifier)
+                            ? app.Identifier : null,
+                _ => null,
+            };
+            if (string.IsNullOrWhiteSpace(raw)) return null;
+            return Path.GetFullPath(
+                Environment.ExpandEnvironmentVariables(
+                    raw.Trim().Trim('"')));
+        }
+        catch { return null; }
+    }
+
+    private static string? TargetIdentity(string path)
+    {
+        try
+        {
+            var vi = FileVersionInfo.GetVersionInfo(path);
+            return vi.OriginalFilename ?? vi.InternalName;
+        }
+        catch { return null; }
+    }
+
+    private static bool LooksLikePe(string path)
+    {
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open,
+                FileAccess.Read, FileShare.Read);
+            Span<byte> magic = stackalloc byte[2];
+            return fs.Read(magic) == 2 && magic[0] == 'M' && magic[1] == 'Z';
+        }
+        catch { return false; }
+    }
+
+    private static bool IsSignedBinary(string path)
+    {
+        // X509Certificate.CreateFromSignedFile only sees signatures
+        // EMBEDDED in the PE — the overwhelming majority of Windows system
+        // binaries (notepad.exe, cmd.exe, calc.exe, …) are CATALOG-signed:
+        // their signature lives in a security catalog under CatRoot, not in
+        // the file, so CreateFromSignedFile throws and they'd be refused as
+        // "unsigned". WinVerifyTrust with the generic-verify action resolves
+        // both embedded and catalog signatures.
+        if (!OperatingSystem.IsWindows())
+        {
+            try
+            {
+                _ = System.Security.Cryptography.X509Certificates
+                    .X509Certificate.CreateFromSignedFile(path);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        return VerifyFileTrust(path) || IsCatalogSigned(path);
+    }
+
+    /// <summary>WinVerifyTrust (GENERIC_VERIFY_V2) on a single file —
+    /// covers embedded signatures AND .cat catalog files themselves.</summary>
+    private static bool VerifyFileTrust(string path)
+    {
+        var fileInfo = new WINTRUST_FILE_INFO
+        {
+            cbStruct = (uint)Marshal.SizeOf<WINTRUST_FILE_INFO>(),
+            pcwszFilePath = Marshal.StringToHGlobalUni(path),
+        };
+        var data = new WINTRUST_DATA
+        {
+            cbStruct = (uint)Marshal.SizeOf<WINTRUST_DATA>(),
+            dwUIChoice = WtdUiNone,
+            fdwRevocationChecks = WtdRevokeNone,
+            dwUnionChoice = WtdChoiceFile,
+            dwProvFlags = WtdRevocationCheckNone,
+            dwStateAction = WtdStateactionVerify,
+        };
+
+        IntPtr pFile = IntPtr.Zero;
+        IntPtr pData = IntPtr.Zero;
+        try
+        {
+            pFile = Marshal.AllocHGlobal(Marshal.SizeOf(fileInfo));
+            Marshal.StructureToPtr(fileInfo, pFile, false);
+            data.pFile = pFile;
+            pData = Marshal.AllocHGlobal(Marshal.SizeOf(data));
+            Marshal.StructureToPtr(data, pData, false);
+            var action = WintrustActionGenericVerifyV2;
+            int status = WinVerifyTrust(InvalidHwnd, ref action, pData);
+            // trust status is a literal — end the WVT state data either way
+            data.dwStateAction = WtdStateactionClose;
+            Marshal.StructureToPtr(data, pData, true);
+            WinVerifyTrust(InvalidHwnd, ref action, pData);
+            return status == 0;
+        }
+        catch { return false; }
+        finally
+        {
+            if (fileInfo.pcwszFilePath != IntPtr.Zero)
+                Marshal.FreeHGlobal(fileInfo.pcwszFilePath);
+            if (pFile != IntPtr.Zero) Marshal.FreeHGlobal(pFile);
+            if (pData != IntPtr.Zero) Marshal.FreeHGlobal(pData);
+        }
+    }
+
+    /// <summary>
+    /// Catalog fallback: WinVerifyTrust on a bare file does NOT resolve
+    /// Windows catalog signatures (notepad.exe/calc.exe/cmd.exe report
+    /// TRUST_E_NOSIGNATURE even though Get-AuthenticodeSignature validates
+    /// them). Walk the catalog chain like Authenticode does: hash the file,
+    /// enumerate catalogs containing that hash, and accept when any owning
+    /// .cat file itself verifies.
+    /// </summary>
+    private static bool IsCatalogSigned(string path)
+    {
+        const uint GenericRead = 0x80000000;
+        const uint OpenExisting = 3;
+        const int MaxCatalogs = 16;
+        IntPtr hFile = IntPtr.Zero;
+        IntPtr hCatAdmin = IntPtr.Zero;
+        IntPtr hash = IntPtr.Zero;
+        try
+        {
+            hFile = CreateFileW(path, GenericRead,
+                FileShareRead | FileShareWrite | FileShareDelete,
+                IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (hFile == InvalidHandle) return false;
+            if (!CryptCATAdminAcquireContext2(out hCatAdmin, IntPtr.Zero,
+                    IntPtr.Zero, IntPtr.Zero, 0))
+                return false;
+            var cbHash = 0;
+            if (!CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, hFile,
+                    ref cbHash, IntPtr.Zero, 0) || cbHash <= 0)
+                return false;
+            hash = Marshal.AllocHGlobal(cbHash);
+            if (!CryptCATAdminCalcHashFromFileHandle2(hCatAdmin, hFile,
+                    ref cbHash, hash, 0))
+                return false;
+            IntPtr prev = IntPtr.Zero;
+            for (var i = 0; i < MaxCatalogs; i++)
+            {
+                var hCatInfo = CryptCATAdminEnumCatalogFromHash(
+                    hCatAdmin, hash, cbHash, 0, ref prev);
+                if (hCatInfo == IntPtr.Zero) break;
+                var ci = new CATALOG_INFO
+                { cbStruct = (uint)Marshal.SizeOf<CATALOG_INFO>() };
+                if (CryptCATCatalogInfoFromContext(hCatInfo, ref ci, 0) &&
+                    !string.IsNullOrEmpty(ci.wszCatalogFile) &&
+                    VerifyFileTrust(ci.wszCatalogFile))
+                {
+                    CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
+                    return true;
+                }
+                prev = hCatInfo;
+            }
+            return false;
+        }
+        catch { return false; }
+        finally
+        {
+            if (hash != IntPtr.Zero) Marshal.FreeHGlobal(hash);
+            if (hCatAdmin != IntPtr.Zero) CryptCATAdminReleaseContext(hCatAdmin, 0);
+            if (hFile != IntPtr.Zero && hFile != InvalidHandle) CloseHandle(hFile);
+        }
+    }
+
+    private static readonly IntPtr InvalidHandle = new(-1);
+    private const uint FileShareRead = 1;
+    private const uint FileShareWrite = 2;
+    private const uint FileShareDelete = 4;
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateFileW(string lpFileName, uint dwDesiredAccess,
+        uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition,
+        uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("wintrust.dll", SetLastError = true)]
+    private static extern bool CryptCATAdminAcquireContext2(out IntPtr phCatAdmin,
+        IntPtr pgSubsystem, IntPtr pwszHashAlgorithm, IntPtr pStrongHashPolicy,
+        uint dwFlags);
+
+    [DllImport("wintrust.dll", SetLastError = true)]
+    private static extern bool CryptCATAdminCalcHashFromFileHandle2(IntPtr hCatAdmin,
+        IntPtr hFile, ref int pcbHash, IntPtr pbHash, uint dwFlags);
+
+    [DllImport("wintrust.dll", SetLastError = true)]
+    private static extern IntPtr CryptCATAdminEnumCatalogFromHash(IntPtr hCatAdmin,
+        IntPtr pbHash, int cbHash, uint dwFlags, ref IntPtr phPrevCatInfo);
+
+    [DllImport("wintrust.dll")]
+    private static extern bool CryptCATAdminReleaseCatalogContext(IntPtr hCatAdmin,
+        IntPtr hCatInfo, uint dwFlags);
+
+    [DllImport("wintrust.dll")]
+    private static extern bool CryptCATAdminReleaseContext(IntPtr hCatAdmin, uint dwFlags);
+
+    [DllImport("wintrust.dll", CharSet = CharSet.Unicode)]
+    private static extern bool CryptCATCatalogInfoFromContext(IntPtr hCatInfo,
+        ref CATALOG_INFO psCatInfo, uint dwFlags);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct CATALOG_INFO
+    {
+        public uint cbStruct;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string wszCatalogFile;
+    }
+
+    private static readonly Guid WintrustActionGenericVerifyV2 =
+        new("{00AAC56B-CD44-11d0-8CC2-00C04FC295EE}");
+    private static readonly IntPtr InvalidHwnd = new(-1);
+    private const uint WtdUiNone = 2;
+    private const uint WtdRevokeNone = 0;
+    private const uint WtdChoiceFile = 1;
+    private const uint WtdRevocationCheckNone = 0x00000040;
+    private const uint WtdStateactionVerify = 0;
+    private const uint WtdStateactionClose = 1;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WINTRUST_FILE_INFO
+    {
+        public uint cbStruct;
+        public IntPtr pcwszFilePath;
+        public IntPtr hFile;
+        public IntPtr pgKnownSubject;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct WINTRUST_DATA
+    {
+        public uint cbStruct;
+        public IntPtr pPolicyCallbackData;
+        public IntPtr pSIPClientData;
+        public uint dwUIChoice;
+        public uint fdwRevocationChecks;
+        public uint dwUnionChoice;
+        public IntPtr pFile;
+        public uint dwStateAction;
+        public IntPtr hWVTStateData;
+        public IntPtr pwszURLReference;
+        public uint dwProvFlags;
+        public uint dwUIContext;
+        public IntPtr pSignatureSettings;
+    }
+
+    [DllImport("wintrust.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+    private static extern int WinVerifyTrust(
+        IntPtr hwnd, ref Guid pgActionID, IntPtr pWVTData);
 
     /// <summary>The exe registered to open a document type —
     /// HKCR\.ext → ProgID → shell\open\command. Used so a `path:` launch
@@ -1441,6 +1774,7 @@ public sealed class AppService : IAppService, IDisposable
         var baselineGen = _eventBuffer?.CurrentGeneration ?? 0;
         var startTicks = Stopwatch.GetTimestamp();
         long timeToFirstWinMs = 0;
+        long lastPollTicks = 0;
 
         while (total.ElapsedMilliseconds < deadline)
         {
@@ -1470,7 +1804,7 @@ public sealed class AppService : IAppService, IDisposable
                 if (_eventBuffer.WaitForNextEvent(baselineGen, remaining, ct))
                 {
                     baselineGen = _eventBuffer.CurrentGeneration;
-                    var recents = _eventBuffer.Snapshot(5);
+                    var recents = _eventBuffer.Snapshot(10);
                     if (recents.Any(e => e.Kind is EventKind.WindowOpened or EventKind.WindowShown or EventKind.ForegroundChanged))
                     {
                         eventWoke = true;
@@ -1480,13 +1814,18 @@ public sealed class AppService : IAppService, IDisposable
             }
             else
             {
-                ct.WaitHandle.WaitOne(Math.Min(150, (int)Math.Max(1, deadline - total.ElapsedMilliseconds)));
+                ct.WaitHandle.WaitOne(Math.Min(250, (int)Math.Max(1, deadline - total.ElapsedMilliseconds)));
             }
 
+            var nowTicks = Environment.TickCount64;
             if (!eventWoke)
             {
+                if (_eventBuffer != null && lastPollTicks != 0 &&
+                    nowTicks - lastPollTicks < FallbackPollMs)
+                    continue;
                 Telemetry.IncLaunchFallbackPoll();
             }
+            lastPollTicks = nowTicks;
 
             var win = MatchWindow(spawnedPid, hints, spawnedName,
                 app.DisplayName, requestedName);

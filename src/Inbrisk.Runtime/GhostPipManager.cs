@@ -429,7 +429,11 @@ public class GhostPipManager : IDisposable
 
     private void HandleInteractiveInput(PipInputEventArgs e)
     {
-        if (!_isInteractive || _windowHost == null)
+        // Release events must always reach the injector: the host synthesizes
+        // them on click-through/hide/focus-loss to unwind ghost-side pressed
+        // state — dropping them strands held buttons/keys on the ghost side.
+        bool isRelease = e.EventType is PipInputEventType.MouseUp or PipInputEventType.KeyUp;
+        if ((!_isInteractive && !isRelease) || _windowHost == null)
         {
             return;
         }

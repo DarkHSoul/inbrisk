@@ -241,9 +241,9 @@ public sealed class GhostDxgiCapture : IDisposable
                             var pDeviceUnk = Marshal.GetIUnknownForObject(_d3dDevice);
                             try
                             {
-                                // IDXGIOutput1::DuplicateOutput is slot 22 in IDXGIOutput1Vtbl
+                                // IDXGIOutput1::DuplicateOutput is slot 16 in IDXGIOutput1Vtbl
                                 IntPtr* vtbl = *(IntPtr**)pOutput1;
-                                var duplicateOutputFunc = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, out IntPtr, int>)vtbl[22];
+                                var duplicateOutputFunc = (delegate* unmanaged[Stdcall]<IntPtr, IntPtr, out IntPtr, int>)vtbl[16];
                                 int hrDup = duplicateOutputFunc(pOutput1, pDeviceUnk, out _pOutputDuplication);
                                 if (hrDup < 0 || _pOutputDuplication == IntPtr.Zero)
                                 {
@@ -432,18 +432,20 @@ public sealed class GhostDxgiCapture : IDisposable
             return false;
         }
 
-        // 3. Frame acquired: Query ID3D11Texture2D
+        // 3. Frame acquired: take ownership of the desktop resource and acquired frame
+        // immediately so every failure path below releases them via ReleaseFrame()
+        _currentDesktopResource = pDesktopResource;
+        _hasAcquiredFrame = true;
+        pDesktopResource = IntPtr.Zero;
+
         try
         {
             var iidTex2D = IID_ID3D11Texture2D;
-            int qihr = Marshal.QueryInterface(pDesktopResource, ref iidTex2D, out IntPtr pTex);
+            int qihr = Marshal.QueryInterface(_currentDesktopResource, ref iidTex2D, out IntPtr pTex);
             if (qihr < 0 || pTex == IntPtr.Zero)
             {
                 _lastError = $"QueryInterface ID3D11Texture2D failed with HR 0x{qihr:X8}";
-                Marshal.Release(pDesktopResource);
-                // Slot 14 is ReleaseFrame
-                var releaseFrameFunc = (delegate* unmanaged[Stdcall]<IntPtr, int>)vtbl[14];
-                releaseFrameFunc(_pOutputDuplication);
+                ReleaseFrame();
                 return false;
             }
 
@@ -457,29 +459,34 @@ public sealed class GhostDxgiCapture : IDisposable
                 Marshal.Release(pTex);
             }
 
-            var desc = new D3D11_TEXTURE2D_DESC();
-            acquiredTex.GetDesc(&desc);
-            uint w = desc.Width;
-            uint h = desc.Height;
+            try
+            {
+                var desc = new D3D11_TEXTURE2D_DESC();
+                acquiredTex.GetDesc(&desc);
+                uint w = desc.Width;
+                uint h = desc.Height;
 
-            EnsureStagingTexture(w, h, desc.Format);
+                EnsureStagingTexture(w, h, desc.Format);
 
-            // Copy from GPU duplicated texture to CPU staging texture
-            _d3dContext.CopyResource((ID3D11Resource)(object)_stagingTexture!, (ID3D11Resource)(object)acquiredTex);
+                // Copy from GPU duplicated texture to CPU staging texture
+                _d3dContext.CopyResource((ID3D11Resource)(object)_stagingTexture!, (ID3D11Resource)(object)acquiredTex);
 
-            // Map CPU staging texture
-            var mapped = new D3D11_MAPPED_SUBRESOURCE();
-            _d3dContext.Map((ID3D11Resource)(object)_stagingTexture!, 0, D3D11_MAP.D3D11_MAP_READ, 0, &mapped);
-            _isMapped = true;
-            _currentDesktopResource = pDesktopResource;
-            _hasAcquiredFrame = true;
+                // Map CPU staging texture
+                var mapped = new D3D11_MAPPED_SUBRESOURCE();
+                _d3dContext.Map((ID3D11Resource)(object)_stagingTexture!, 0, D3D11_MAP.D3D11_MAP_READ, 0, &mapped);
+                _isMapped = true;
 
-            pSurface = (IntPtr)mapped.pData;
-            width = (int)w;
-            height = (int)h;
-            stride = (int)mapped.RowPitch;
-            _lastError = null;
-            return true;
+                pSurface = (IntPtr)mapped.pData;
+                width = (int)w;
+                height = (int)h;
+                stride = (int)mapped.RowPitch;
+                _lastError = null;
+                return true;
+            }
+            finally
+            {
+                try { Marshal.ReleaseComObject(acquiredTex); } catch { }
+            }
         }
         catch (Exception ex)
         {
@@ -514,9 +521,13 @@ public sealed class GhostDxgiCapture : IDisposable
             MiscFlags = 0,
         };
 
-        ID3D11Texture2D_unmanaged* stgUnmanaged;
+        ID3D11Texture2D_unmanaged* stgUnmanaged = null;
         _d3dDevice!.CreateTexture2D(&stagingDesc, null, &stgUnmanaged);
         var stgPtr = (IntPtr)stgUnmanaged;
+        if (stgPtr == IntPtr.Zero)
+        {
+            throw new InvalidOperationException("ID3D11Device::CreateTexture2D returned a null staging texture pointer.");
+        }
         _stagingTexture = (ID3D11Texture2D)Marshal.GetObjectForIUnknown(stgPtr);
         Marshal.Release(stgPtr);
 

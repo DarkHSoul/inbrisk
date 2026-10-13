@@ -99,6 +99,38 @@ public static class EmergencyGate
         catch { return null; }
     }
 
+    /// <summary>Named event a live panic authority holds open for its whole
+    /// process lifetime — the "a live authority exists" proof peers use as
+    /// the resume gate (F18). Unlike mutex ownership, an open event HANDLE
+    /// has no thread affinity and cannot be released by another process;
+    /// it disappears only when the owning process exits — never merely
+    /// "released" — so its absence unambiguously means the authority died.
+    /// Scoped by chord + marker path like <see cref="OwnerMutexName"/>.
+    /// Peers must only ever OpenExisting + close — the authority alone
+    /// creates it.</summary>
+    public static string AuthorityEventName(string panicHotkey) =>
+        @"Global\InbriskEmergencyAuthority-" +
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            System.Text.Encoding.UTF8.GetBytes(
+                panicHotkey.ToLowerInvariant() + "|" +
+                MarkerPath.ToLowerInvariant())))[..8];
+
+    /// <summary>Is a live panic-authority process holding its lifetime
+    /// event open? Tri-state: true = a live authority exists (a legit
+    /// resume may propagate), false = no authority (event absent — the
+    /// previous authority died or none acquired the chord), null = the
+    /// probe itself failed; callers must treat null as "not alive".</summary>
+    public static bool? AuthorityAlive(string panicHotkey)
+    {
+        try
+        {
+            using var e = EventWaitHandle.OpenExisting(AuthorityEventName(panicHotkey));
+            return true;
+        }
+        catch (WaitHandleCannotBeOpenedException) { return false; }
+        catch { return null; }
+    }
+
     /// <summary>A local panic stop is latched. Mutating computer actions
     /// must refuse while this is true — in EVERY process, not only the one
     /// holding the panic hotkey (CLI one-shots included). The check is

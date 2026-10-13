@@ -10,6 +10,8 @@ landmarks, payload size (bytes), and truncation enforcement.
 
 import json
 import time
+
+from inbrisk_paths import ARTIFACTS
 import os
 import random
 import numpy as np
@@ -123,7 +125,7 @@ def build_synthetic_initial_app_map(hwnd, pid, title, elements):
 
 def run_benchmark(n=100):
     random.seed(42)
-    os.makedirs(r"C:\Users\Ahmet\Documents\inbrisk\artifacts", exist_ok=True)
+    os.makedirs(ARTIFACTS, exist_ok=True)
 
     latencies = []
     nodes_visited_arr = []
@@ -201,7 +203,7 @@ def run_benchmark(n=100):
         "budget_violations": 0
     }
 
-    out_path = r"C:\Users\Ahmet\Documents\inbrisk\artifacts\synthetic_map_benchmark.json"
+    out_path = str(ARTIFACTS / "synthetic_map_benchmark.json")
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 

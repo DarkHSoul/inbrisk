@@ -131,6 +131,10 @@ public static class GhostDesktopNative
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CloseHandle(IntPtr hObject);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool TerminateProcess(IntPtr hProcess, uint uExitCode);
+
     [DllImport("kernel32.dll", EntryPoint = "CreateProcessW", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool CreateProcessW(
@@ -259,6 +263,12 @@ public static class GhostDesktopNative
             var proc = Process.GetProcessById(pi.dwProcessId);
             proc.EnableRaisingEvents = true;
             return proc;
+        }
+        catch
+        {
+            // The spawned process would otherwise be orphaned on the ghost desktop: kill it via its process handle.
+            if (pi.hProcess != IntPtr.Zero) TerminateProcess(pi.hProcess, 1);
+            throw;
         }
         finally
         {
@@ -515,6 +525,8 @@ public sealed class GhostLocalDesktop : IDisposable
         catch (Exception ex)
         {
             GhostLogger.Warn($"[GhostLocalDesktop] Process {pi.dwProcessId} was created on desktop '{_desktopName}' but could not be inspected via Process.GetProcessById: {ex.Message}");
+            // The spawned process would otherwise be orphaned on the ghost desktop: kill it via its process handle.
+            if (pi.hProcess != IntPtr.Zero) GhostDesktopNative.TerminateProcess(pi.hProcess, 1);
             throw;
         }
         finally
@@ -725,6 +737,43 @@ public sealed class GhostLocalDesktop : IDisposable
         });
     }
 
+    /// <summary>
+    /// Kills processes that still own top-level windows on this desktop but are not in the
+    /// tracked set (e.g. children spawned indirectly or processes that failed to attach).
+    /// Only invoked when this instance originally created the desktop, so shared/opened
+    /// desktops owned by another component are never swept.
+    /// </summary>
+    private void TerminateOrphanedDesktopProcesses()
+    {
+        IntPtr handle = _desktopHandle;
+        if (handle == IntPtr.Zero) return;
+
+        var trackedIds = new HashSet<int>();
+        foreach (var p in _startedProcesses)
+        {
+            try { trackedIds.Add(p.Id); } catch { }
+        }
+
+        int selfPid = Environment.ProcessId;
+        foreach (var hwnd in GhostDesktopNative.EnumerateWindows(handle))
+        {
+            try
+            {
+                GhostDesktopNative.GetWindowThreadProcessId(hwnd, out uint pid);
+                int pid32 = (int)pid;
+                if (pid32 <= 0 || pid32 == selfPid || trackedIds.Contains(pid32)) continue;
+
+                using var proc = Process.GetProcessById(pid32);
+                if (!proc.HasExited)
+                {
+                    proc.Kill(entireProcessTree: true);
+                    GhostLogger.Info($"[GhostLocalDesktop] Terminated orphaned process {pid32} lingering on desktop '{_desktopName}'.");
+                }
+            }
+            catch { }
+        }
+    }
+
     private void ThrowIfDisposed()
     {
         if (_isDisposed)
@@ -757,6 +806,18 @@ public sealed class GhostLocalDesktop : IDisposable
                 catch (Exception ex)
                 {
                     GhostLogger.Warn($"[GhostLocalDesktop] Exception during TerminateAllProcesses in Dispose: {ex.Message}");
+                }
+
+                if (_wasCreatedNew)
+                {
+                    try
+                    {
+                        TerminateOrphanedDesktopProcesses();
+                    }
+                    catch (Exception ex)
+                    {
+                        GhostLogger.Warn($"[GhostLocalDesktop] Exception during orphaned process cleanup in Dispose: {ex.Message}");
+                    }
                 }
 
                 foreach (var proc in _startedProcesses)

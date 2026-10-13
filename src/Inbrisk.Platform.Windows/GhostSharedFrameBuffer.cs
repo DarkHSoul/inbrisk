@@ -130,6 +130,14 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetSecurityDescriptorDacl(ref SECURITY_DESCRIPTOR pSecurityDescriptor, [MarshalAs(UnmanagedType.Bool)] bool bDaclPresent, IntPtr pDacl, [MarshalAs(UnmanagedType.Bool)] bool bDaclDefaulted);
 
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string stringSecurityDescriptor, uint stringSdRevision, out IntPtr securityDescriptor, out int securityDescriptorSize);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr LocalFree(IntPtr hMem);
+
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     private static extern IntPtr CreateFileMappingW(IntPtr hFile, ref SECURITY_ATTRIBUTES lpFileMappingAttributes, uint flProtect, uint dwMaximumSizeHigh, uint dwMaximumSizeLow, string lpName);
 
@@ -220,7 +228,7 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
     #region Constructors & Factory Methods
 
     /// <summary>
-    /// Opens or creates the shared frame buffer with cross-session NULL DACL permissions.
+    /// Opens or creates the shared frame buffer with a restricted cross-session DACL.
     /// </summary>
     /// <param name="isProducer">True to initialize as writer/producer, false as reader/consumer.</param>
     /// <param name="mapName">Name of the memory mapped file (default: Global\InbriskGhostFrameBuffer).</param>
@@ -246,7 +254,7 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
 
         if (isProducer)
         {
-            _mapHandle = CreateSharedMemoryWithNullDacl(
+            _mapHandle = CreateSharedMemoryWithRestrictedDacl(
                 totalMappingSize,
                 mapName,
                 allowFallback: true,
@@ -286,7 +294,7 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
 
             // Optional synchronization event
             _eventName = _mapName.Contains("Local") ? FallbackEventName : DefaultEventName;
-            _eventHandle = CreateEventWithNullDacl(_eventName);
+            _eventHandle = CreateEventWithRestrictedDacl(_eventName);
         }
         else
         {
@@ -466,7 +474,7 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
             }
 
             int dataLength = (int)slotHeader->DataLength;
-            if (dataLength <= 0 || buffer.Length < dataLength)
+            if (dataLength <= 0 || dataLength > _slotCapacity || buffer.Length < dataLength)
             {
                 header = default;
                 return false;
@@ -530,7 +538,7 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
         }
 
         int dataLength = (int)slotHeader->DataLength;
-        if (dataLength <= 0)
+        if (dataLength <= 0 || dataLength > _slotCapacity)
         {
             header = default;
             pixelSpan = default;
@@ -591,11 +599,50 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
 
     #region Security & Memory Mapping Helpers
 
+    /// <summary>Builds the restricted cross-session DACL for the frame
+    /// buffer objects. Full control: SYSTEM + Administrators. Read/write:
+    /// the creating user and the ghost worker account (the session-2
+    /// producer/consumer). Read-only: interactive users — so a console-side
+    /// consumer in another session can still read frames, but arbitrary
+    /// local processes cannot write or corrupt the buffer. A NULL DACL here
+    /// would let any local process read the ghost screen and forge frames.</summary>
+    private static IntPtr BuildRestrictedSecurityDescriptor()
+    {
+        var sddl = new System.Text.StringBuilder("D:(A;;GA;;;SY)(A;;GA;;;BA)");
+        try
+        {
+            var userSid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value;
+            if (!string.IsNullOrEmpty(userSid))
+            {
+                sddl.Append("(A;;GRGW;;;").Append(userSid).Append(')');
+            }
+        }
+        catch { }
+        try
+        {
+            var ghostSid = Inbrisk.Core.GhostIpcDefaults
+                .ResolveAccountSid(Inbrisk.Core.GhostIpcDefaults.DefaultClientAccountName)?.Value;
+            if (!string.IsNullOrEmpty(ghostSid))
+            {
+                sddl.Append("(A;;GRGW;;;").Append(ghostSid).Append(')');
+            }
+        }
+        catch { }
+        sddl.Append("(A;;GR;;;IU)");
+
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.ToString(), SECURITY_DESCRIPTOR_REVISION, out IntPtr pSd, out _))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "ConvertStringSecurityDescriptorToSecurityDescriptor failed.");
+        }
+        return pSd;
+    }
+
     /// <summary>
-    /// Creates a shared memory section with a NULL DACL security descriptor.
-    /// NULL DACL grants read/write permissions to processes across all Windows sessions (Session 0, 1, 2+).
+    /// Creates a shared memory section with the restricted cross-session DACL.
     /// </summary>
-    private static IntPtr CreateSharedMemoryWithNullDacl(
+    private static IntPtr CreateSharedMemoryWithRestrictedDacl(
         long size,
         string requestedName,
         bool allowFallback,
@@ -605,22 +652,9 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
         actualName = requestedName;
         alreadyExisted = false;
 
-        var sd = new SECURITY_DESCRIPTOR();
-        if (!InitializeSecurityDescriptor(out sd, SECURITY_DESCRIPTOR_REVISION))
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "InitializeSecurityDescriptor failed.");
-        }
-
-        // bDaclPresent = true, pDacl = NULL specifies a NULL DACL (unconditional access to everyone across sessions)
-        if (!SetSecurityDescriptorDacl(ref sd, true, IntPtr.Zero, false))
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "SetSecurityDescriptorDacl failed.");
-        }
-
-        IntPtr pSd = Marshal.AllocHGlobal(Marshal.SizeOf<SECURITY_DESCRIPTOR>());
+        IntPtr pSd = BuildRestrictedSecurityDescriptor();
         try
         {
-            Marshal.StructureToPtr(sd, pSd, false);
 
             var sa = new SECURITY_ATTRIBUTES
             {
@@ -673,7 +707,7 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
         }
         finally
         {
-            Marshal.FreeHGlobal(pSd);
+            LocalFree(pSd);
         }
     }
 
@@ -708,21 +742,13 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
         return handle;
     }
 
-    private static IntPtr CreateEventWithNullDacl(string eventName)
+    private static IntPtr CreateEventWithRestrictedDacl(string eventName)
     {
         try
         {
-            var sd = new SECURITY_DESCRIPTOR();
-            if (!InitializeSecurityDescriptor(out sd, SECURITY_DESCRIPTOR_REVISION) ||
-                !SetSecurityDescriptorDacl(ref sd, true, IntPtr.Zero, false))
-            {
-                return IntPtr.Zero;
-            }
-
-            IntPtr pSd = Marshal.AllocHGlobal(Marshal.SizeOf<SECURITY_DESCRIPTOR>());
+            IntPtr pSd = BuildRestrictedSecurityDescriptor();
             try
             {
-                Marshal.StructureToPtr(sd, pSd, false);
                 var sa = new SECURITY_ATTRIBUTES
                 {
                     nLength = Marshal.SizeOf<SECURITY_ATTRIBUTES>(),
@@ -734,7 +760,7 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
             }
             finally
             {
-                Marshal.FreeHGlobal(pSd);
+                LocalFree(pSd);
             }
         }
         catch
@@ -760,6 +786,7 @@ public sealed unsafe class GhostSharedFrameBuffer : IDisposable
         {
             UnmapViewOfFile(_mappedViewBase);
             _mappedViewBase = IntPtr.Zero;
+            _controlBlock = null;
         }
 
         if (_mapHandle != IntPtr.Zero && _mapHandle != INVALID_HANDLE_VALUE)

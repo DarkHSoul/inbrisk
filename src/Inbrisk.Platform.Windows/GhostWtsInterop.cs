@@ -128,6 +128,11 @@ public static class GhostWtsInterop
 
             for (int i = 0; i < count; i++)
             {
+                if (current == IntPtr.Zero)
+                {
+                    break;
+                }
+
                 var si = Marshal.PtrToStructure<WTS_SESSION_INFO>(current);
                 string winStationName = si.pWinStationName != IntPtr.Zero
                     ? (Marshal.PtrToStringUni(si.pWinStationName) ?? string.Empty)

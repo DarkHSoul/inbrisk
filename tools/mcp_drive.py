@@ -1,6 +1,7 @@
 import json, subprocess, sys, threading, queue
 
-EXE = r"C:\Users\Ahmet\Documents\inbrisk\src\Inbrisk.Mcp\bin\Debug\net8.0-windows10.0.19041.0\inbrisk-mcp.exe"
+from inbrisk_paths import MCP_EXE
+EXE = str(MCP_EXE)
 
 proc = subprocess.Popen(
     [EXE],

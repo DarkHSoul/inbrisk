@@ -336,6 +336,8 @@ public sealed class GhostInputExecutor : IDisposable
 
     #region State & Tracking
 
+    private const int MaxSteps = 500;
+
     private readonly object _stateGate = new();
     private readonly HashSet<uint> _heldButtons = new();
     private readonly HashSet<ushort> _heldVirtualKeys = new();
@@ -373,6 +375,28 @@ public sealed class GhostInputExecutor : IDisposable
         ObjectDisposedException.ThrowIf(_isDisposed, this);
         ArgumentNullException.ThrowIfNull(steps);
 
+        if (steps.Count > MaxSteps)
+        {
+            return new GhostBatchResult(
+                Success: false,
+                StepsCompleted: 0,
+                TotalSteps: steps.Count,
+                StepResults: Array.Empty<GhostStepResult>(),
+                FailureReason: $"Batch exceeds the {MaxSteps}-step limit.",
+                TotalDuration: TimeSpan.Zero);
+        }
+
+        if (EmergencyGate.IsStopped)
+        {
+            return new GhostBatchResult(
+                Success: false,
+                StepsCompleted: 0,
+                TotalSteps: steps.Count,
+                StepResults: Array.Empty<GhostStepResult>(),
+                FailureReason: "Computer control stopped by the local emergency hotkey; only the local user can resume.",
+                TotalDuration: TimeSpan.Zero);
+        }
+
         var totalWatch = Stopwatch.StartNew();
         var results = new List<GhostStepResult>(steps.Count);
         int completedCount = 0;
@@ -387,6 +411,20 @@ public sealed class GhostInputExecutor : IDisposable
                 bool stepSuccess = false;
                 string? stepError = null;
                 object? stepOutput = null;
+
+                if (EmergencyGate.IsStopped)
+                {
+                    stepError = "Computer control stopped by the local emergency hotkey; only the local user can resume.";
+                    results.Add(new GhostStepResult(i, step, false, stepError, stepWatch.Elapsed));
+                    ReleaseAll();
+                    return new GhostBatchResult(
+                        Success: false,
+                        StepsCompleted: completedCount,
+                        TotalSteps: steps.Count,
+                        StepResults: results,
+                        FailureReason: stepError,
+                        TotalDuration: totalWatch.Elapsed);
+                }
 
                 try
                 {
@@ -418,7 +456,7 @@ public sealed class GhostInputExecutor : IDisposable
                     results.Add(new GhostStepResult(i, step, stepSuccess, stepError, stepWatch.Elapsed, stepOutput));
                 }
 
-                if (!stepSuccess && (failFast || step.FailFast))
+                if (!stepSuccess && failFast && step.FailFast)
                 {
                     ReleaseAll();
                     return new GhostBatchResult(
@@ -541,7 +579,7 @@ public sealed class GhostInputExecutor : IDisposable
                 if (string.IsNullOrWhiteSpace(step.ProcessPath))
                     throw new ArgumentException("LaunchProcess requires ProcessPath.");
                 var proc = LaunchProcess(step.ProcessPath, step.Arguments, step.WorkingDirectory,
-                    step.WaitForInputIdle, step.TimeoutMs);
+                    step.WaitForInputIdle, Math.Clamp(step.TimeoutMs, 100, 120_000));
                 return proc?.Id;
 
             case GhostActionKind.ActivateWindow:
@@ -555,7 +593,7 @@ public sealed class GhostInputExecutor : IDisposable
                 string targetWin = step.WindowTitle ?? step.ProcessName ?? "";
                 if (string.IsNullOrWhiteSpace(targetWin))
                     throw new ArgumentException("ActivateWindow requires WindowHandle, WindowTitle, or ProcessName.");
-                bool foundAndActivated = await ActivateWindowAsync(targetWin, step.TimeoutMs, ct).ConfigureAwait(false);
+                bool foundAndActivated = await ActivateWindowAsync(targetWin, Math.Clamp(step.TimeoutMs, 100, 120_000), ct).ConfigureAwait(false);
                 if (!foundAndActivated)
                     throw new InvalidOperationException($"Window not found or failed to activate: \"{targetWin}\"");
                 return true;
@@ -568,7 +606,7 @@ public sealed class GhostInputExecutor : IDisposable
                 throw new ArgumentException("CloseWindow requires WindowHandle or WindowTitle.");
 
             case GhostActionKind.Delay:
-                int ms = step.Milliseconds ?? 100;
+                int ms = Math.Clamp(step.Milliseconds ?? 100, 0, 300_000);
                 if (ms > 0)
                     await Task.Delay(ms, ct).ConfigureAwait(false);
                 return ms;
@@ -577,7 +615,7 @@ public sealed class GhostInputExecutor : IDisposable
                 string waitTarget = step.WindowTitle ?? step.ProcessName ?? "";
                 if (string.IsNullOrWhiteSpace(waitTarget))
                     throw new ArgumentException("WaitForWindow requires WindowTitle or ProcessName.");
-                var hwnd = await WaitForWindowAsync(waitTarget, step.TimeoutMs, ct).ConfigureAwait(false);
+                var hwnd = await WaitForWindowAsync(waitTarget, Math.Clamp(step.TimeoutMs, 100, 120_000), ct).ConfigureAwait(false);
                 if (hwnd == IntPtr.Zero)
                     throw new TimeoutException($"Timeout waiting for window: \"{waitTarget}\"");
                 return hwnd;
@@ -598,6 +636,9 @@ public sealed class GhostInputExecutor : IDisposable
     public void MoveMouse(int x, int y, bool smooth = false, int steps = 10, int delayMs = 5, CancellationToken ct = default)
     {
         ObjectDisposedException.ThrowIf(_isDisposed, this);
+
+        steps = Math.Clamp(steps, 1, 200);
+        delayMs = Math.Clamp(delayMs, 0, 100);
 
         if (!smooth || steps <= 1)
         {
@@ -625,6 +666,7 @@ public sealed class GhostInputExecutor : IDisposable
     public void Click(int x, int y, MouseButton button = MouseButton.Left, int count = 1, CancellationToken ct = default)
     {
         ObjectDisposedException.ThrowIf(_isDisposed, this);
+        count = Math.Clamp(count, 1, 8);
         MoveMouse(x, y, smooth: false, ct: ct);
 
         var (downFlag, upFlag) = GetButtonFlags(button);
@@ -635,10 +677,15 @@ public sealed class GhostInputExecutor : IDisposable
             SendMouseFlag(downFlag);
             lock (_stateGate) _heldButtons.Add(downFlag);
 
-            Thread.Sleep(20);
-
-            SendMouseFlag(upFlag);
-            lock (_stateGate) _heldButtons.Remove(downFlag);
+            try
+            {
+                Thread.Sleep(20);
+            }
+            finally
+            {
+                SendMouseFlag(upFlag);
+                lock (_stateGate) _heldButtons.Remove(downFlag);
+            }
 
             if (i + 1 < count)
                 Thread.Sleep(60);
@@ -696,7 +743,8 @@ public sealed class GhostInputExecutor : IDisposable
         try
         {
             Thread.Sleep(25);
-            steps = Math.Max(4, steps);
+            steps = Math.Clamp(steps, 4, 200);
+            durationMs = Math.Clamp(durationMs, 25, 10_000);
             int sleepPerStep = Math.Max(5, durationMs / steps);
 
             for (int i = 1; i <= steps; i++)
@@ -828,6 +876,8 @@ public sealed class GhostInputExecutor : IDisposable
         if (string.IsNullOrEmpty(text))
             return;
 
+        delayBetweenKeysMs = Math.Clamp(delayBetweenKeysMs, 0, 200);
+
         for (int i = 0; i < text.Length; i++)
         {
             ct.ThrowIfCancellationRequested();
@@ -924,8 +974,16 @@ public sealed class GhostInputExecutor : IDisposable
 
             ushort targetVk = KeyCodeToVk(targetKey);
             SendKey(targetVk, down: true);
-            Thread.Sleep(30);
-            SendKey(targetVk, down: false);
+            lock (_stateGate) _heldVirtualKeys.Add(targetVk);
+            try
+            {
+                Thread.Sleep(30);
+            }
+            finally
+            {
+                SendKey(targetVk, down: false);
+                lock (_stateGate) _heldVirtualKeys.Remove(targetVk);
+            }
         }
         finally
         {
@@ -956,14 +1014,21 @@ public sealed class GhostInputExecutor : IDisposable
     public void KeyPress(ushort vk, int holdDurationMs = 25, CancellationToken ct = default)
     {
         ObjectDisposedException.ThrowIf(_isDisposed, this);
+        holdDurationMs = Math.Clamp(holdDurationMs, 0, 2000);
+
         SendKey(vk, down: true);
         lock (_stateGate) _heldVirtualKeys.Add(vk);
 
-        if (holdDurationMs > 0)
-            Thread.Sleep(holdDurationMs);
-
-        SendKey(vk, down: false);
-        lock (_stateGate) _heldVirtualKeys.Remove(vk);
+        try
+        {
+            if (holdDurationMs > 0)
+                Thread.Sleep(holdDurationMs);
+        }
+        finally
+        {
+            SendKey(vk, down: false);
+            lock (_stateGate) _heldVirtualKeys.Remove(vk);
+        }
     }
 
     /// <summary>
@@ -1148,6 +1213,7 @@ public sealed class GhostInputExecutor : IDisposable
     {
         ObjectDisposedException.ThrowIf(_isDisposed, this);
         ArgumentException.ThrowIfNullOrWhiteSpace(fileName);
+        waitTimeoutMs = Math.Clamp(waitTimeoutMs, 0, 120_000);
 
         string resolvedExe = ResolveExecutablePath(fileName);
 

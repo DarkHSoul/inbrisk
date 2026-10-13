@@ -27,20 +27,6 @@ TOOLS_DECLARATION = [
     {
         "functionDeclarations": [
             {
-                "name": "run_command",
-                "description": "Execute a shell command or script in Windows Command Prompt and return stdout/stderr.",
-                "parameters": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "command": {
-                            "type": "STRING",
-                            "description": "The exact shell command line to run."
-                        }
-                    },
-                    "required": ["command"]
-                }
-            },
-            {
                 "name": "read_file",
                 "description": "Read the text contents of a file from disk.",
                 "parameters": {
@@ -92,18 +78,7 @@ def get_access_token():
         sys.exit(1)
 
 def execute_tool(func_name, args):
-    if func_name == "run_command":
-        cmd = args.get("command", "")
-        try:
-            res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
-            output = res.stdout
-            if res.stderr:
-                output += ("\nSTDERR:\n" + res.stderr if output else res.stderr)
-            return {"exit_code": res.returncode, "output": output or "(bos cikti)"}
-        except Exception as e:
-            return {"exit_code": -1, "error": str(e)}
-
-    elif func_name == "read_file":
+    if func_name == "read_file":
         path = args.get("path", "")
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -135,7 +110,7 @@ def call_gemini(contents, token):
             "parts": [
                 {
                     "text": "Sen Windows terminalinde calisan bagimsiz bir AI gelistirici asistanisin. "
-                            "Kullanici bir eylem istediginde uygun araci (run_command, read_file, write_file) cagir. "
+                            "Kullanici bir eylem istediginde uygun araci (read_file, write_file) cagir. "
                             "Yanitlarini Turkce, net ve ozet olarak ver."
                 }
             ]

@@ -93,6 +93,79 @@ public interface IGhostSessionManager
 }
 
 /// <summary>
+/// Field bounds and validation helpers for inbound Ghost IPC protocol messages.
+/// Enforces schema limits before dispatch so malformed envelopes fail fast instead of crashing.
+/// </summary>
+public static class GhostIpcMessageValidator
+{
+    /// <summary>Maximum allowed length for the message Id field.</summary>
+    public const int MaxIdLength = 64;
+
+    /// <summary>Maximum allowed length for the message Type field.</summary>
+    public const int MaxTypeLength = 32;
+
+    /// <summary>Maximum allowed length for the message Action field.</summary>
+    public const int MaxActionLength = 128;
+
+    /// <summary>Maximum allowed length for the message CorrelationId field.</summary>
+    public const int MaxCorrelationIdLength = 64;
+
+    /// <summary>Maximum allowed length for the message Error field.</summary>
+    public const int MaxErrorLength = 4096;
+
+    private static readonly HashSet<string> ValidTypes = new(StringComparer.Ordinal)
+    {
+        "request", "response", "ping", "pong"
+    };
+
+    /// <summary>
+    /// Validates inbound message fields (id, type, action, correlationId).
+    /// Returns false with a diagnostic reason when the message is malformed.
+    /// </summary>
+    public static bool TryValidate(
+        string? id,
+        string? type,
+        string? action,
+        string? correlationId,
+        out string error)
+    {
+        error = string.Empty;
+
+        if (string.IsNullOrEmpty(id) || id.Length > MaxIdLength)
+        {
+            error = "Missing or oversized message Id.";
+            return false;
+        }
+
+        if (string.IsNullOrEmpty(type) || type.Length > MaxTypeLength || !ValidTypes.Contains(type))
+        {
+            error = "Missing or unsupported message Type.";
+            return false;
+        }
+
+        if (string.Equals(type, "request", StringComparison.Ordinal) && string.IsNullOrEmpty(action))
+        {
+            error = "Request message is missing an Action.";
+            return false;
+        }
+
+        if (action != null && action.Length > MaxActionLength)
+        {
+            error = "Message Action exceeds maximum length.";
+            return false;
+        }
+
+        if (correlationId != null && correlationId.Length > MaxCorrelationIdLength)
+        {
+            error = "Message CorrelationId exceeds maximum length.";
+            return false;
+        }
+
+        return true;
+    }
+}
+
+/// <summary>
 /// Telemetry counters and performance tracing hooks for Ghost session lifecycle.
 /// </summary>
 public static class GhostTelemetry

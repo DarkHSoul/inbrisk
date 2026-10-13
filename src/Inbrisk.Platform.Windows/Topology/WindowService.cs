@@ -9,7 +9,20 @@ namespace Inbrisk.Platform.Windows.Topology;
 public sealed class WindowService : IWindowService
 {
     private static readonly int SelfPid = Environment.ProcessId;
-    private static readonly HashSet<int> ProtectedPids = GetSelfAndAncestorPids();
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, byte> ProtectedPids =
+        new(GetSelfAndAncestorPids().Select(pid =>
+            new KeyValuePair<int, byte>(pid, (byte)0)));
+
+    /// <summary>Adds a pid to the protected set at runtime — e.g. an
+    /// authenticated MCP client host connected over the daemon pipe. Its
+    /// windows then resist agent close/kill paths like the host's own.</summary>
+    public static void ProtectAdditionalPid(int pid)
+    {
+        if (pid > 0)
+        {
+            ProtectedPids.TryAdd(pid, 0);
+        }
+    }
 
     private readonly HwndMetadataCache? _metadataCache;
     private readonly MonitorTopologyCache? _monitorCache;
@@ -399,7 +412,7 @@ public sealed class WindowService : IWindowService
     /// root (terminal, IDE, shell). Killing any of them ends the AI host
     /// session. Snapshot taken once at startup — a process's own ancestry is
     /// fixed for its lifetime.</summary>
-    public static IReadOnlyCollection<int> AgentHostAndAncestorPids => ProtectedPids;
+    public static IReadOnlyCollection<int> AgentHostAndAncestorPids => ProtectedPids.Keys.ToArray();
 
     /// <summary>Is <paramref name="pid"/> the MCP server process itself or one
     /// of its ancestors? This is a raw pid check — it applies to processes that
@@ -408,9 +421,31 @@ public sealed class WindowService : IWindowService
     /// closing one Explorer folder window is safe, killing explorer.exe is not.</summary>
     public static bool IsAgentHostOrAncestorPid(int pid, out string? reason)
     {
-        if (pid > 0 && ProtectedPids.Contains(pid))
+        if (pid > 0 && ProtectedPids.ContainsKey(pid))
         {
             reason = $"agent host process or terminal/IDE ancestor (pid={pid})";
+            return true;
+        }
+        reason = null;
+        return false;
+    }
+
+    /// <summary>Reverse ancestry check for hard-termination paths: is
+    /// <paramref name="pid"/> spawned anywhere beneath this process — i.e.
+    /// does the target's own ancestor chain (walked live to the session
+    /// root) pass through the agent host? Processes inside the host's
+    /// process tree (respawned servers, helper processes, renamed host
+    /// binaries) cannot evade this by name the way they evade
+    /// <see cref="IsProcessProtected"/>. Callers that manage agent-launched
+    /// apps must exempt agent-owned pids — descendants are protected only
+    /// when they are NOT known agent spawns. Like
+    /// <see cref="IsAgentHostOrAncestorPid"/> this is a raw pid check for
+    /// Process.Kill paths and never applies to a graceful WM_CLOSE.</summary>
+    public static bool IsDescendantOfAgentHost(int pid, out string? reason)
+    {
+        if (pid > 0 && pid != SelfPid && GetAncestorPids(pid).Contains(SelfPid))
+        {
+            reason = $"process inside the agent host's own process tree (descendant of pid={SelfPid})";
             return true;
         }
         reason = null;
@@ -465,7 +500,7 @@ public sealed class WindowService : IWindowService
         bool isFileExplorerFolder = cls is "CabinetWClass" or "ExploreWClass"
             || (proc == "explorer.exe" && (title.Contains("File Explorer", StringComparison.OrdinalIgnoreCase) || title.Contains("Dosya Gezgini", StringComparison.OrdinalIgnoreCase)));
 
-        if (!isFileExplorerFolder && ProtectedPids.Contains(pid))
+        if (!isFileExplorerFolder && ProtectedPids.ContainsKey(pid))
         {
             reason = $"agent host process or terminal ancestor (pid={pid})";
             return true;
@@ -496,7 +531,18 @@ public sealed class WindowService : IWindowService
 
     private static HashSet<int> GetSelfAndAncestorPids()
     {
-        var pids = new HashSet<int> { SelfPid };
+        var pids = GetAncestorPids(SelfPid);
+        pids.Add(SelfPid);
+        return pids;
+    }
+
+    /// <summary>Live parent-PID walk: every ancestor of <paramref name="pid"/>
+    /// up to the session root, resolved against a fresh process snapshot —
+    /// unlike <see cref="ProtectedPids"/> this runs at check time and works
+    /// for any target pid.</summary>
+    private static HashSet<int> GetAncestorPids(int pid)
+    {
+        var pids = new HashSet<int>();
         try
         {
             var snap = NativeMethods.CreateToolhelp32Snapshot(NativeMethods.TH32CS_SNAPPROCESS, 0);
@@ -513,7 +559,7 @@ public sealed class WindowService : IWindowService
                     } while (NativeMethods.Process32NextW(snap, ref entry));
                 }
 
-                var cur = SelfPid;
+                var cur = pid;
                 while (parentMap.TryGetValue(cur, out var parent) && parent > 0 && !pids.Contains(parent))
                 {
                     pids.Add(parent);
@@ -638,7 +684,10 @@ public sealed class WindowService : IWindowService
             NativeMethods.keybd_event(NativeMethods.VK_MENU, 0, 0, UIntPtr.Zero);
             NativeMethods.keybd_event(NativeMethods.VK_MENU, 0, NativeMethods.KEYEVENTF_KEYUP, UIntPtr.Zero);
         }
-        catch { }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"FocusWindow foreground-lock Alt pulse failed: {ex.Message}");
+        }
 
         NativeMethods.BringWindowToTop(h);
         var ok = NativeMethods.SetForegroundWindow(h);

@@ -280,6 +280,15 @@ public sealed class GhostBatchDispatcher : IGhostBatchDispatcher
     /// <summary>Default timeout for batch execution (60 seconds).</summary>
     public static readonly TimeSpan DefaultBatchTimeout = TimeSpan.FromSeconds(60);
 
+    /// <summary>Maximum number of steps accepted in a single ghost batch dispatch.</summary>
+    public const int MaxBatchSteps = 200;
+
+    /// <summary>Maximum size in characters accepted for a single batch payload.</summary>
+    public const int MaxBatchPayloadChars = 1_000_000;
+
+    /// <summary>Upper bound applied to per-dispatch timeouts.</summary>
+    public static readonly TimeSpan MaxBatchTimeout = TimeSpan.FromMinutes(10);
+
     private static readonly JsonSerializerOptions DefaultJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
@@ -320,6 +329,26 @@ public sealed class GhostBatchDispatcher : IGhostBatchDispatcher
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(batchPayloadJson);
 
+        if (EmergencyGate.IsStopped)
+        {
+            return GhostBatchResult.Failed(
+                "Ghost batch dispatch refused: computer control stopped by the local emergency hotkey; only the local user can resume.",
+                rawJson: batchPayloadJson);
+        }
+
+        if (batchPayloadJson.Length > MaxBatchPayloadChars)
+        {
+            return GhostBatchResult.Failed(
+                $"Ghost batch payload exceeds the {MaxBatchPayloadChars}-character limit.",
+                rawJson: batchPayloadJson);
+        }
+
+        var stepCountValidation = ValidateStepCount(batchPayloadJson);
+        if (stepCountValidation != null)
+        {
+            return stepCountValidation;
+        }
+
         if (!_ipcBus.IsConnected)
         {
             throw new GhostSessionNotReadyException(
@@ -328,6 +357,10 @@ public sealed class GhostBatchDispatcher : IGhostBatchDispatcher
         }
 
         var effectiveTimeout = timeout ?? _defaultTimeout;
+        if (effectiveTimeout <= TimeSpan.Zero || effectiveTimeout > MaxBatchTimeout)
+        {
+            effectiveTimeout = effectiveTimeout <= TimeSpan.Zero ? _defaultTimeout : MaxBatchTimeout;
+        }
         var stopwatch = Stopwatch.StartNew();
 
         try
@@ -413,6 +446,49 @@ public sealed class GhostBatchDispatcher : IGhostBatchDispatcher
         TimeSpan? timeout = null,
         CancellationToken ct = default) =>
         DispatchBatchAsync(batchPayload, timeout, ct);
+
+    private static GhostBatchResult? ValidateStepCount(string batchPayloadJson)
+    {
+        int stepCount = -1;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(batchPayloadJson);
+            var root = doc.RootElement;
+
+            if (root.ValueKind == JsonValueKind.Array)
+            {
+                stepCount = root.GetArrayLength();
+            }
+            else if (root.ValueKind == JsonValueKind.Object)
+            {
+                int count = 0;
+                foreach (var name in new[] { "steps", "actions", "set" })
+                {
+                    if (root.TryGetProperty(name, out var arr) && arr.ValueKind == JsonValueKind.Array)
+                    {
+                        count += arr.GetArrayLength();
+                    }
+                }
+                stepCount = count;
+            }
+        }
+        catch (JsonException ex)
+        {
+            return GhostBatchResult.Failed(
+                $"Ghost batch payload is not valid JSON: {ex.Message}",
+                rawJson: batchPayloadJson);
+        }
+
+        if (stepCount > MaxBatchSteps)
+        {
+            return GhostBatchResult.Failed(
+                $"Ghost batch contains {stepCount} steps; the maximum is {MaxBatchSteps}.",
+                rawJson: batchPayloadJson);
+        }
+
+        return null;
+    }
 
     /// <summary>
     /// Sends a low-level ping to verify the Session 2 worker is responsive.

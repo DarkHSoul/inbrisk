@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -279,6 +280,8 @@ public sealed class GhostKeyboardForwarder : IDisposable
     private volatile bool _registerEscOnlyWhenFullscreen = true;
     private volatile bool _isListening;
     private volatile bool _disposed;
+    private volatile bool _panicReleaseSent;
+    private static (int Vk, bool Ctrl, bool Alt, bool Shift, bool Win)[]? _emergencyChords;
 
     private (int X, int Y, int Width, int Height)? _savedBounds;
 
@@ -470,7 +473,10 @@ public sealed class GhostKeyboardForwarder : IDisposable
             if (_listenerThreadId != 0)
             {
                 Win32.PostThreadMessageW(_listenerThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-                _listenerThread?.Join(1500);
+                if (_listenerThreadId != Win32.GetCurrentThreadId())
+                {
+                    _listenerThread?.Join(1500);
+                }
                 _listenerThread = null;
                 _listenerThreadId = 0;
             }
@@ -509,7 +515,7 @@ public sealed class GhostKeyboardForwarder : IDisposable
         }
         finally
         {
-            _listenerReady.Set();
+            try { _listenerReady.Set(); } catch { }
         }
 
         while (Win32.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -742,6 +748,13 @@ public sealed class GhostKeyboardForwarder : IDisposable
                 bool alt = (lp & (1 << 29)) != 0;
                 bool ctrl = (Win32.GetKeyState(0x11) & 0x8000) != 0;
                 bool shift = (Win32.GetKeyState(0x10) & 0x8000) != 0;
+                bool win = (Win32.GetKeyState(0x5B) & 0x8000) != 0 || (Win32.GetKeyState(0x5C) & 0x8000) != 0;
+
+                if (IsEmergencyChord(vk, ctrl, alt, shift, win))
+                {
+                    handled = true;
+                    return true;
+                }
 
                 // Escape key in fullscreen mode triggers exit to mini box
                 if (vk == VK_ESCAPE && _isFullscreen)
@@ -751,7 +764,7 @@ public sealed class GhostKeyboardForwarder : IDisposable
                     return true;
                 }
 
-                if (IsInteractive && _forwardingEnabled)
+                if (IsInteractive && _forwardingEnabled && !EmergencyGate.IsStopped)
                 {
                     _ = ForwardKeyAsync(GhostKeyEventKind.KeyDown, vk, scan, extended, alt, ctrl, shift);
                     handled = true;
@@ -770,7 +783,7 @@ public sealed class GhostKeyboardForwarder : IDisposable
                 bool ctrl = (Win32.GetKeyState(0x11) & 0x8000) != 0;
                 bool shift = (Win32.GetKeyState(0x10) & 0x8000) != 0;
 
-                if (IsInteractive && _forwardingEnabled)
+                if (IsInteractive && _forwardingEnabled && !EmergencyGate.IsStopped)
                 {
                     _ = ForwardKeyAsync(GhostKeyEventKind.KeyUp, vk, scan, extended, alt, ctrl, shift);
                     handled = true;
@@ -783,7 +796,7 @@ public sealed class GhostKeyboardForwarder : IDisposable
             {
                 char c = (char)wParam;
 
-                if (IsInteractive && _forwardingEnabled)
+                if (IsInteractive && _forwardingEnabled && !EmergencyGate.IsStopped)
                 {
                     _ = ForwardCharAsync(c);
                     handled = true;
@@ -876,6 +889,14 @@ public sealed class GhostKeyboardForwarder : IDisposable
     private async Task<bool> SendPayloadOverIpcAsync(GhostKeyboardPayload payload, CancellationToken ct)
     {
         var bus = _ipcBus;
+
+        if (EmergencyGate.IsStopped)
+        {
+            if (bus != null) SendPanicRelease(bus);
+            return false;
+        }
+        _panicReleaseSent = false;
+
         if (bus == null || !bus.IsConnected)
         {
             return false;
@@ -975,6 +996,115 @@ public sealed class GhostKeyboardForwarder : IDisposable
         >= 0x41 and <= 0x5A => ((char)vk).ToString(),
         >= 0x70 and <= 0x87 => $"F{vk - 0x70 + 1}",
         _ => null
+    };
+
+    private void SendPanicRelease(IGhostIpcBus bus)
+    {
+        if (_panicReleaseSent)
+        {
+            return;
+        }
+        _panicReleaseSent = true;
+        try
+        {
+            var release = new GhostInputPacket { Type = "ReleaseAll", Action = "release_all" };
+            _ = bus.SendRequestAsync("forward_input", release.ToJson(), TimeSpan.FromSeconds(1), CancellationToken.None);
+        }
+        catch { }
+    }
+
+    private static bool IsEmergencyChord(int vk, bool ctrl, bool alt, bool shift, bool win)
+    {
+        foreach (var c in EmergencyChords())
+        {
+            if (c.Vk == vk && c.Ctrl == ctrl && c.Alt == alt && c.Shift == shift && c.Win == win)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static (int Vk, bool Ctrl, bool Alt, bool Shift, bool Win)[] EmergencyChords()
+    {
+        if (_emergencyChords != null)
+        {
+            return _emergencyChords;
+        }
+
+        try
+        {
+            var settings = UserSettings.Load();
+            var panic = Environment.GetEnvironmentVariable("INBRISK_PANIC_HOTKEY") ?? settings.PanicHotkey ?? "Ctrl+Alt+Pause";
+            var resume = Environment.GetEnvironmentVariable("INBRISK_RESUME_HOTKEY") ?? settings.ResumeHotkey ?? "Ctrl+Alt+Shift+Pause";
+
+            var list = new List<(int Vk, bool Ctrl, bool Alt, bool Shift, bool Win)>();
+            if (TryParseChord(panic, out var p)) list.Add(p);
+            if (TryParseChord(resume, out var r)) list.Add(r);
+            _emergencyChords = list.Count > 0
+                ? list.ToArray()
+                : new[] { (0x13, true, true, false, false), (0x13, true, true, true, false) };
+        }
+        catch
+        {
+            _emergencyChords = new[] { (0x13, true, true, false, false), (0x13, true, true, true, false) };
+        }
+
+        return _emergencyChords;
+    }
+
+    private static bool TryParseChord(string? chord, out (int Vk, bool Ctrl, bool Alt, bool Shift, bool Win) result)
+    {
+        result = default;
+        if (string.IsNullOrWhiteSpace(chord))
+        {
+            return false;
+        }
+
+        bool ctrl = false, alt = false, shift = false, win = false;
+        int vk = 0;
+        foreach (var part in chord.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var p = part.ToLowerInvariant();
+            if (p is "ctrl" or "control") ctrl = true;
+            else if (p is "alt" or "menu") alt = true;
+            else if (p is "shift") shift = true;
+            else if (p is "win" or "windows" or "super") win = true;
+            else vk = ParseChordKey(p);
+        }
+
+        if (vk == 0)
+        {
+            return false;
+        }
+
+        result = (vk, ctrl, alt, shift, win);
+        return true;
+    }
+
+    private static int ParseChordKey(string name) => name switch
+    {
+        "pause" or "break" => 0x13,
+        "esc" or "escape" => 0x1B,
+        "enter" or "return" => 0x0D,
+        "tab" => 0x09,
+        "space" => 0x20,
+        "backspace" => 0x08,
+        "delete" or "del" => 0x2E,
+        "insert" or "ins" => 0x2D,
+        "home" => 0x24,
+        "end" => 0x23,
+        "pageup" or "pgup" => 0x21,
+        "pagedown" or "pgdn" => 0x22,
+        "up" => 0x26,
+        "down" => 0x28,
+        "left" => 0x25,
+        "right" => 0x27,
+        "capslock" => 0x14,
+        "printscreen" or "prtsc" => 0x2C,
+        _ when name.Length == 1 && char.IsLetterOrDigit(name[0]) => char.ToUpperInvariant(name[0]),
+        _ when name.Length > 1 && name[0] == 'f' && int.TryParse(name[1..], out var fn) && fn is >= 1 and <= 24 => 0x70 + fn - 1,
+        _ => 0
     };
 
     #endregion
@@ -1092,6 +1222,20 @@ public sealed class GhostKeyboardForwarder : IDisposable
         UpdateEscHotkeyRegistration();
         FullscreenChanged?.Invoke(false);
         FullscreenExitRequested?.Invoke();
+    }
+
+    /// <summary>
+    /// Notifies the forwarder that fullscreen state changed externally
+    /// (tray menu, IPC command, or expander) so the Escape hotkey stays registered correctly.
+    /// </summary>
+    public void NotifyFullscreen(bool isFullscreen)
+    {
+        if (_isFullscreen == isFullscreen)
+        {
+            return;
+        }
+        _isFullscreen = isFullscreen;
+        UpdateEscHotkeyRegistration();
     }
 
     /// <summary>

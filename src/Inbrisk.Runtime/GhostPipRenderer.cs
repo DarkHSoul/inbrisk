@@ -588,8 +588,13 @@ public sealed class GhostPipRenderer : IDisposable
         int height = Marshal.ReadInt32(slotBase, 8);
         int stride = Marshal.ReadInt32(slotBase, 12);
         long dataLength = Marshal.ReadInt64(slotBase, 40);
+        long slotCapacity = Marshal.ReadInt64(_mappedView, 16);
 
-        if (width <= 0 || height <= 0 || stride <= 0 || dataLength <= 0)
+        // Torn-read / corruption guard: never let header values carry the
+        // copy past the mapped slot (pixel data starts at slot offset 64).
+        if (width <= 0 || height <= 0 || stride <= 0 || dataLength <= 0
+            || slotCapacity <= 64 || dataLength > slotCapacity - 64
+            || stride < (long)width * 4 || dataLength > (long)stride * height)
         {
             return false;
         }

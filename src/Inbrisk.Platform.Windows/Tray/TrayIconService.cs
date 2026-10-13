@@ -25,6 +25,9 @@ public sealed class TrayIconService : IDisposable
     private const uint CmdResume = 2005;
     private const uint CmdQuit = 2006;
     private const uint CmdPreviewHud = 2007;
+    private const uint CmdApproveBase = 2100;
+    private const uint CmdDenyBase = 2200;
+    private const int MaxMenuPendings = 8;
 
     private readonly object _gate = new();
     private readonly ManualResetEventSlim _ready = new();
@@ -42,7 +45,9 @@ public sealed class TrayIconService : IDisposable
     private static TrayIconService? _current;
 
     private IntPtr _hIcon = IntPtr.Zero;
+    private Bitmap? _hIconBitmap;
     private bool _iconAdded;
+    private volatile bool _disposed;
 
     // Runtime state bindings
     private string _mcpClientName = "Devin";
@@ -60,6 +65,26 @@ public sealed class TrayIconService : IDisposable
     public Action<bool>? OnTogglePerimeter { get; set; }
     public Action? OnPreviewHud { get; set; }
     public Action? OnQuit { get; set; }
+
+    /// <summary>A confirmation request waiting on local consent — the tray
+    /// menu renders approve/deny items for each entry. Defined here (not
+    /// in Inbrisk.Mcp) so this assembly stays free of MCP types.</summary>
+    public sealed record PendingApprovalItem(string Id, string Summary, bool Dangerous);
+
+    /// <summary>Local-consent surface hook: supplies the pending approvals
+    /// to render in the context menu. Wired by the MCP host to the
+    /// session's ConfirmChannel; null → no approval section.</summary>
+    public Func<IReadOnlyList<PendingApprovalItem>>? PendingApprovals { get; set; }
+
+    /// <summary>Local-consent surface hook: the user approved a pending id
+    /// via the tray menu. Must call the session's ApproveLocal — never a
+    /// tool path.</summary>
+    public Action<string>? OnApprovePending { get; set; }
+    public Action<string>? OnDenyPending { get; set; }
+
+    /// <summary>Approval ids in the order the last context menu rendered
+    /// them — command ids index back into this list.</summary>
+    private readonly List<string> _menuPendingIds = new();
 
     private readonly bool _deduplicate;
 
@@ -145,7 +170,7 @@ public sealed class TrayIconService : IDisposable
         }
         finally
         {
-            _ready.Set();
+            try { _ready.Set(); } catch { }
         }
     }
 
@@ -168,7 +193,9 @@ public sealed class TrayIconService : IDisposable
 
             if (!_hasTrayAuthority)
             {
-                _ready.Set();
+                try { _ready.Set(); } catch { }
+                try { _trayMutex?.Dispose(); } catch { }
+                _trayMutex = null;
                 return; // Only the owner process manages the tray icon
             }
         }
@@ -208,7 +235,7 @@ public sealed class TrayIconService : IDisposable
         }
         finally
         {
-            _ready.Set();
+            try { _ready.Set(); } catch { }
         }
 
         while (NativeMethods.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -227,6 +254,11 @@ public sealed class TrayIconService : IDisposable
         }
 
         RemoveTrayIcon();
+        if (_hwnd != IntPtr.Zero)
+        {
+            NativeMethods.DestroyWindow(_hwnd);
+            _hwnd = IntPtr.Zero;
+        }
         if (_hwndHandle.IsAllocated) _hwndHandle.Free();
         try { _trayMutex?.ReleaseMutex(); } catch { }
         _trayMutex?.Dispose();
@@ -257,14 +289,17 @@ public sealed class TrayIconService : IDisposable
     {
         if (_hwnd == IntPtr.Zero) return;
 
-        try
+        if (_hIcon == IntPtr.Zero)
         {
-            var bmp = AppIconExtractor.GetInbriskLogo(32);
-            _hIcon = bmp.GetHicon();
-        }
-        catch
-        {
-            _hIcon = NativeMethods.LoadIconW(IntPtr.Zero, NativeMethods.IDI_APPLICATION);
+            try
+            {
+                _hIconBitmap = AppIconExtractor.GetInbriskLogo(32);
+                _hIcon = _hIconBitmap.GetHicon();
+            }
+            catch
+            {
+                _hIcon = NativeMethods.LoadIconW(IntPtr.Zero, NativeMethods.IDI_APPLICATION);
+            }
         }
 
         var nid = new NativeMethods.NOTIFYICONDATAW
@@ -300,6 +335,9 @@ public sealed class TrayIconService : IDisposable
             NativeMethods.DestroyIcon(_hIcon);
             _hIcon = IntPtr.Zero;
         }
+
+        _hIconBitmap?.Dispose();
+        _hIconBitmap = null;
     }
 
     public void OpenSettings()
@@ -409,6 +447,34 @@ public sealed class TrayIconService : IDisposable
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | NativeMethods.MF_DISABLED, (UIntPtr)0, mcpStatus);
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | NativeMethods.MF_DISABLED, (UIntPtr)0, runStatus);
 
+            // F04 local consent surface: CONFIRM/DANGEROUS-class actions the
+            // agent attempted sit here until a human approves/denies them.
+            // Rendered fresh on every menu open — the channel is the truth.
+            _menuPendingIds.Clear();
+            IReadOnlyList<PendingApprovalItem>? pendings = null;
+            try { pendings = PendingApprovals?.Invoke(); } catch { }
+            if (pendings is { Count: > 0 })
+            {
+                var sub = NativeMethods.CreatePopupMenu();
+                var shown = 0;
+                foreach (var p in pendings)
+                {
+                    if (shown >= MaxMenuPendings) break;
+                    _menuPendingIds.Add(p.Id);
+                    var label = p.Summary.Length > 60 ? p.Summary[..60] + "…" : p.Summary;
+                    var tag = p.Dangerous ? "⚠ " : "";
+                    NativeMethods.AppendMenuW(sub, NativeMethods.MF_STRING | NativeMethods.MF_DISABLED,
+                        (UIntPtr)0, $"{tag}{label}");
+                    NativeMethods.AppendMenuW(sub, NativeMethods.MF_STRING,
+                        (UIntPtr)(CmdApproveBase + shown), "   ✓ Onayla (Approve)");
+                    NativeMethods.AppendMenuW(sub, NativeMethods.MF_STRING,
+                        (UIntPtr)(CmdDenyBase + shown), "   ✗ Reddet (Deny)");
+                    shown++;
+                }
+                NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | NativeMethods.MF_POPUP,
+                    (UIntPtr)sub, $"⏳ Bekleyen onaylar ({pendings.Count})");
+            }
+
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | (hudOn ? NativeMethods.MF_CHECKED : NativeMethods.MF_UNCHECKED), (UIntPtr)CmdShowHud, "Show Activity HUD");
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | (perimOn ? NativeMethods.MF_CHECKED : NativeMethods.MF_UNCHECKED), (UIntPtr)CmdShowPerimeter, "Show Perimeter Smoke");
@@ -432,7 +498,26 @@ public sealed class TrayIconService : IDisposable
         NativeMethods.PostMessageW(_hwnd, NativeMethods.WM_NULL, IntPtr.Zero, IntPtr.Zero);
         NativeMethods.DestroyMenu(hMenu);
 
-        // Dispatch selection
+        // Dispatch selection — approval ids live in _menuPendingIds in the
+        // order the submenu rendered them (bounded by MaxMenuPendings).
+        if (cmd >= CmdApproveBase && cmd < CmdApproveBase + MaxMenuPendings)
+        {
+            var idx = (int)(cmd - CmdApproveBase);
+            if (idx < _menuPendingIds.Count)
+            {
+                try { OnApprovePending?.Invoke(_menuPendingIds[idx]); } catch { }
+            }
+            return;
+        }
+        if (cmd >= CmdDenyBase && cmd < CmdDenyBase + MaxMenuPendings)
+        {
+            var idx = (int)(cmd - CmdDenyBase);
+            if (idx < _menuPendingIds.Count)
+            {
+                try { OnDenyPending?.Invoke(_menuPendingIds[idx]); } catch { }
+            }
+            return;
+        }
         switch (cmd)
         {
             case CmdOpenSettings:
@@ -461,10 +546,21 @@ public sealed class TrayIconService : IDisposable
 
     public void Dispose()
     {
+        if (_disposed) return;
+        _disposed = true;
+
+        if (ReferenceEquals(_current, this))
+        {
+            _current = null;
+        }
+
         if (_threadId != 0)
         {
             NativeMethods.PostThreadMessageW(_threadId, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-            _thread?.Join(2000);
+            if (_threadId != NativeMethods.GetCurrentThreadId())
+            {
+                _thread?.Join(2000);
+            }
             _threadId = 0;
         }
         _ready.Dispose();

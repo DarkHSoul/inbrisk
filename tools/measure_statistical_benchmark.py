@@ -212,8 +212,10 @@ def run_mcp_benchmarks(dll_path, label):
     return results
 
 if __name__ == "__main__":
-    base_dll = r"C:\Users\Ahmet\Documents\inbrisk-baseline\src\Inbrisk.Mcp\bin\Debug\net8.0-windows10.0.19041.0\inbrisk-mcp.dll"
-    curr_dll = r"C:\Users\Ahmet\Documents\inbrisk\src\Inbrisk.Mcp\bin\Debug\net8.0-windows10.0.19041.0\inbrisk-mcp.dll"
+    from inbrisk_paths import BASELINE_ROOT, MCP_DLL, REPO_ROOT, mcp_dll
+
+    base_dll = str(mcp_dll(BASELINE_ROOT))
+    curr_dll = str(MCP_DLL)
 
     base_results = run_mcp_benchmarks(base_dll, "PRE-COMMIT LIVE MEASUREMENT (Baseline 4271b3f)")
     curr_results = run_mcp_benchmarks(curr_dll, "CURRENT MODIFIED LIVE MEASUREMENT")
@@ -223,7 +225,7 @@ if __name__ == "__main__":
         "current": curr_results
     }
 
-    with open(r"C:\Users\Ahmet\Documents\inbrisk\benchmark_comparison.json", "w", encoding="utf-8") as f:
+    with open(REPO_ROOT / "benchmark_comparison.json", "w", encoding="utf-8") as f:
         json.dump(combined, f, indent=2)
 
     print("\nBenchmark successfully finished and saved to benchmark_comparison.json!")

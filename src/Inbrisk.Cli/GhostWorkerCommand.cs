@@ -287,6 +287,12 @@ public static class GhostWorkerCommand
 
         LogHeader(options, sessionId, processId);
 
+        if (!string.Equals(options.ServerName, ".", StringComparison.Ordinal) &&
+            !string.Equals(options.ServerName, "localhost", StringComparison.OrdinalIgnoreCase))
+        {
+            LogWarn($"Remote pipe server '{options.ServerName}' configured: the worker will execute input and batch commands received from that host.", options);
+        }
+
         try
         {
             await using var daemon = new GhostWorkerDaemon(options.ToDaemonConfig());

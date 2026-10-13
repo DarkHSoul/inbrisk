@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -56,6 +57,11 @@ public sealed class GhostPipWindowHost : IDisposable
     private int _savedCompactX = -1;
     private int _savedCompactY = -1;
     private bool _isExpanded;
+
+    // Interactive input tracking (pump-thread only): keys whose KeyDown was forwarded to the
+    // ghost desktop and mouse buttons currently held, so they can be released on any exit path.
+    private readonly HashSet<int> _forwardedVks = new();
+    private int _pipButtonsDown;
 
     /// <summary>
     /// Raised during WM_PAINT so custom renderers (GDI / DirectX / Capture streams) can paint directly.
@@ -333,7 +339,8 @@ public sealed class GhostPipWindowHost : IDisposable
         }
         finally
         {
-            _ready.Set();
+            try { Teardown(); } catch { }
+            try { _ready.Set(); } catch { }
         }
     }
 
@@ -357,7 +364,7 @@ public sealed class GhostPipWindowHost : IDisposable
         }
         finally
         {
-            _ready.Set();
+            try { _ready.Set(); } catch { }
         }
 
         while (NativeMethods.GetMessageW(out var msg, IntPtr.Zero, 0, 0) > 0)
@@ -503,6 +510,11 @@ public sealed class GhostPipWindowHost : IDisposable
     private void ApplyClickThrough(bool enabled)
     {
         _clickThrough = enabled;
+        if (enabled)
+        {
+            ReleaseForwardedKeys();
+            ReleasePipButtons();
+        }
         if (_hwnd == IntPtr.Zero) return;
 
         var curExStyle = NativeMethods.GetWindowLongPtr(_hwnd, NativeMethods.GWL_EXSTYLE).ToInt64();
@@ -630,6 +642,11 @@ public sealed class GhostPipWindowHost : IDisposable
     private void ApplyVisibility(bool visible)
     {
         _visible = visible;
+        if (!visible)
+        {
+            ReleaseForwardedKeys();
+            ReleasePipButtons();
+        }
         if (_hwnd == IntPtr.Zero) return;
 
         if (visible)
@@ -645,6 +662,30 @@ public sealed class GhostPipWindowHost : IDisposable
         {
             NativeMethods.ShowWindow(_hwnd, SW_HIDE);
         }
+    }
+
+    private void ReleaseForwardedKeys()
+    {
+        if (_forwardedVks.Count == 0) return;
+        var vks = new List<int>(_forwardedVks);
+        _forwardedVks.Clear();
+        foreach (int vk in vks)
+        {
+            OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyUp, 0, 0, keyCode: vk));
+        }
+    }
+
+    private void ReleasePipButtons()
+    {
+        int held = _pipButtonsDown;
+        _pipButtonsDown = 0;
+        if (held == 0) return;
+
+        int upX = _width / 2;
+        int upY = HeaderHeight + 1;
+        if ((held & 1) != 0) OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.MouseUp, upX, upY, MouseButton.Left));
+        if ((held & 2) != 0) OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.MouseUp, upX, upY, MouseButton.Right));
+        if ((held & 4) != 0) OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.MouseUp, upX, upY, MouseButton.Middle));
     }
 
     private IntPtr InstanceWndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam)
@@ -844,6 +885,25 @@ public sealed class GhostPipWindowHost : IDisposable
                             NativeMethods.SetFocus(hWnd);
                         }
 
+                        if (eventType == PipInputEventType.MouseDown)
+                        {
+                            _pipButtonsDown |= button switch
+                            {
+                                MouseButton.Right => 2,
+                                MouseButton.Middle => 4,
+                                _ => 1
+                            };
+                        }
+                        else if (eventType == PipInputEventType.MouseUp)
+                        {
+                            _pipButtonsDown &= ~(button switch
+                            {
+                                MouseButton.Right => 2,
+                                MouseButton.Middle => 4,
+                                _ => 1
+                            });
+                        }
+
                         OnInteractiveInput?.Invoke(new PipInputEventArgs(eventType, clientX, clientY, button));
                         return IntPtr.Zero;
                     }
@@ -881,6 +941,7 @@ public sealed class GhostPipWindowHost : IDisposable
 
                     if (isCtrl || isAlt || IsSpecialKey(vk))
                     {
+                        _forwardedVks.Add(vk);
                         OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyDown, 0, 0, keyCode: vk));
                     }
                     return IntPtr.Zero;
@@ -897,10 +958,11 @@ public sealed class GhostPipWindowHost : IDisposable
                     bool isCtrl = (NativeMethods.GetKeyState(0x11 /* VK_CONTROL */) & 0x8000) != 0;
                     bool isAlt = (NativeMethods.GetKeyState(0x12 /* VK_MENU */) & 0x8000) != 0;
 
-                    if (isCtrl || isAlt || IsSpecialKey(vk))
+                    if (isCtrl || isAlt || IsSpecialKey(vk) || _forwardedVks.Contains(vk))
                     {
                         OnInteractiveInput?.Invoke(new PipInputEventArgs(PipInputEventType.KeyUp, 0, 0, keyCode: vk));
                     }
+                    _forwardedVks.Remove(vk);
                     return IntPtr.Zero;
                 }
                 break;
@@ -919,6 +981,15 @@ public sealed class GhostPipWindowHost : IDisposable
                 }
                 break;
             }
+
+            case 0x0008: // WM_KILLFOCUS
+                ReleaseForwardedKeys();
+                ReleasePipButtons();
+                break;
+
+            case NativeMethods.WM_CAPTURECHANGED:
+                ReleasePipButtons();
+                break;
 
             case 0x0232: // WM_EXITSIZEMOVE
             case 0x0003: // WM_MOVE
@@ -976,7 +1047,10 @@ public sealed class GhostPipWindowHost : IDisposable
                 return new IntPtr(1);
 
             case NativeMethods.WM_DESTROY:
+                ReleaseForwardedKeys();
+                ReleasePipButtons();
                 WindowDestroyed?.Invoke(this);
+                NativeMethods.PostQuitMessage(0);
                 return IntPtr.Zero;
         }
 
@@ -1007,6 +1081,9 @@ public sealed class GhostPipWindowHost : IDisposable
 
     private void Teardown()
     {
+        ReleaseForwardedKeys();
+        ReleasePipButtons();
+
         if (_hwnd != IntPtr.Zero)
         {
             NativeMethods.SetWindowLongPtr(_hwnd, GwlpUserdata, IntPtr.Zero);
@@ -1051,7 +1128,10 @@ public sealed class GhostPipWindowHost : IDisposable
         if (_threadId != 0)
         {
             NativeMethods.PostThreadMessageW(_threadId, NativeMethods.WM_QUIT, IntPtr.Zero, IntPtr.Zero);
-            _thread?.Join(2000);
+            if (Thread.CurrentThread.ManagedThreadId != _thread?.ManagedThreadId)
+            {
+                _thread?.Join(2000);
+            }
             _threadId = 0;
         }
 

@@ -324,9 +324,39 @@ public sealed class InbriskRuntimeDaemon : IAsyncDisposable, IDisposable
     {
         McpSession? session = null;
         string? sessionId = null;
+        SessionLaneWatchdog? laneWatchdog = null;
 
         try
         {
+            // 0. Client authentication (F12): the DACL confines this pipe
+            // to the daemon's user + admins + SYSTEM, but any same-user
+            // process could still open a session and drive the desktop.
+            // Verify the peer process identity and fail closed.
+            if (!PipeClientAuthenticator.TryVerifyClient(stream, out var peerDesc, out var authReject, out var clientPid))
+            {
+                System.Diagnostics.Debug.WriteLine(
+                    $"inbrisk-daemon rejected IPC client ({peerDesc}): {authReject}");
+                var deniedResp = new DaemonHandshakeResponse
+                {
+                    Success = false,
+                    ProtocolVersion = CurrentProtocolVersion,
+                    Error = $"IPC client rejected: {authReject}"
+                };
+                try { await WriteLineAsync(stream, JsonSerializer.Serialize(deniedResp, JsonOptions), ct).ConfigureAwait(false); } catch { }
+                return;
+            }
+
+            // An authenticated pipe client is an MCP host process (the IDE's
+            // inbrisk-mcp proxy / CLI). In daemon mode it is NOT in our
+            // ancestry, so close/kill paths could terminate it and orphan the
+            // session — protect it like our own host tree for the daemon's
+            // lifetime.
+            if (clientPid > 0 && clientPid != Environment.ProcessId)
+            {
+                try { Inbrisk.Platform.Windows.Topology.WindowService.ProtectAdditionalPid(clientPid); }
+                catch { }
+            }
+
             // 1. Handshake Phase: Read handshake line byte-by-byte
             var handshakeLine = await ReadLineByteByByteAsync(stream, ct).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(handshakeLine)) return;
@@ -352,6 +382,9 @@ public sealed class InbriskRuntimeDaemon : IAsyncDisposable, IDisposable
                 ? _sessionFactory(this)
                 : new McpSession(Control, arbiter: Arbiter, startEvents: _startEvents);
             session.Arbiter = Arbiter;
+            // F14: detach the session's per-pid UIA read lanes when a hung
+            // provider pins one past the fault threshold.
+            laneWatchdog = SessionLaneWatchdog.Attach(session);
             sessionId = session.SessionId;
 
             _activeSessions[sessionId] = session;
@@ -381,6 +414,8 @@ public sealed class InbriskRuntimeDaemon : IAsyncDisposable, IDisposable
                 _activeSessions.TryRemove(sessionId, out _);
                 _activeStreams.TryRemove(sessionId, out _);
             }
+
+            try { laneWatchdog?.Dispose(); } catch { }
 
             if (session != null)
             {

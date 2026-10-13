@@ -1,0 +1,12 @@
+Inbrisk
+Copyright (c) 2026 DarkHSoul. All rights reserved.
+
+Inbrisk is proprietary, source-available software. See LICENSE for the
+terms governing the source code and the distributed binaries.
+
+This product bundles third-party open source components, including
+packages published by Microsoft Corporation (MIT), the Model Context
+Protocol project (Apache-2.0), and Interop.UIAutomationClient (MIT).
+The full list of bundled and development-time third-party components,
+versions, licenses, and copyright notices is maintained in
+THIRD_PARTY_NOTICES.md.

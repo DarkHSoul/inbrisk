@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Text;
 using Inbrisk.Core;
 
 namespace Inbrisk.Runtime;
@@ -47,6 +49,154 @@ public sealed class SafetyPolicy
     /// this pass: null → dangerous actions deny with ConfirmationRequired
     /// until a local approval UI wires this.</summary>
     public Func<ActionIntent, UiElement?, WindowInfo?, bool>? LocalConsent { get; set; }
+
+    // ------------------------------------------------------------------
+    //  F04 server-side confirm registry — grants the client cannot mint.
+    //  The executor issues a challenge when a CONFIRM action has no valid
+    //  grant; a local approval surface (control window / tray) decides via
+    //  ApproveConfirmation / DenyConfirmation; the retry echoes the id via
+    //  args.approvalId and the grant is consumed once. Neither the MCP
+    //  request path nor the model can approve — they only carry the id.
+    // ------------------------------------------------------------------
+
+    private readonly ConcurrentDictionary<string, ConfirmChallenge> _confirmChallenges = new();
+
+    /// <summary>How long an issued challenge stays open for approval.</summary>
+    public TimeSpan ConfirmChallengeTtl { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>Pending (unexpired, undecided) challenges, oldest expiry
+    /// first — what a local approval surface should enumerate.</summary>
+    public IReadOnlyList<ConfirmChallenge> PendingConfirmations =>
+        _confirmChallenges.Values
+            .Where(c => c.State == ConfirmChallengeState.Pending && !c.IsExpired)
+            .OrderBy(c => c.ExpiresAt).ToList();
+
+    /// <summary>Issue (or reuse) a pending challenge for this action+target.
+    /// Same action+target inside the TTL returns the same challenge so a
+    /// local surface sees one row per pending decision.</summary>
+    public ConfirmChallenge IssueConfirmation(ActionIntent intent,
+        UiElement? element, WindowInfo? window)
+    {
+        var hash = ConfirmFingerprint(intent, element, window);
+        var existing = _confirmChallenges.Values.FirstOrDefault(c =>
+            c.ActionHash == hash && !c.IsExpired &&
+            c.State is ConfirmChallengeState.Pending or ConfirmChallengeState.Approved);
+        if (existing != null) return existing;
+        var ch = new ConfirmChallenge(
+            "cnf-" + Guid.NewGuid().ToString("N")[..16], hash,
+            DescribeConfirmation(intent, element, window),
+            DateTimeOffset.UtcNow + ConfirmChallengeTtl);
+        _confirmChallenges[ch.ApprovalId] = ch;
+        if (_confirmChallenges.Count > 256)
+            foreach (var dead in _confirmChallenges
+                    .Where(kv => kv.Value.IsExpired || kv.Value.State
+                        is ConfirmChallengeState.Denied or ConfirmChallengeState.Consumed)
+                    .Select(kv => kv.Key).ToList())
+                _confirmChallenges.TryRemove(dead, out _);
+        return ch;
+    }
+
+    /// <summary>Local-surface approval — only in-process code can reach
+    /// this; never the MCP request path. False when the id is unknown,
+    /// expired or already consumed.</summary>
+    public bool ApproveConfirmation(string approvalId) =>
+        SetConfirmationState(approvalId, ConfirmChallengeState.Approved);
+
+    /// <summary>Local-surface denial — a pending challenge the user refused.</summary>
+    public bool DenyConfirmation(string approvalId) =>
+        SetConfirmationState(approvalId, ConfirmChallengeState.Denied);
+
+    /// <summary>Consume an approved grant: the presented id must exist, be
+    /// Approved, unexpired, and bound to THIS action+target fingerprint —
+    /// then it is spent (single use).</summary>
+    internal bool TryConsumeConfirmation(ActionIntent intent,
+        UiElement? element, WindowInfo? window, string? approvalId)
+    {
+        if (approvalId == null ||
+            !_confirmChallenges.TryGetValue(approvalId, out var ch))
+            return false;
+        lock (ch)
+        {
+            if (ch.State != ConfirmChallengeState.Approved || ch.IsExpired ||
+                ch.ActionHash != ConfirmFingerprint(intent, element, window))
+                return false;
+            ch.State = ConfirmChallengeState.Consumed;
+            return true;
+        }
+    }
+
+    private bool SetConfirmationState(string approvalId, ConfirmChallengeState state)
+    {
+        if (!_confirmChallenges.TryGetValue(approvalId, out var ch)) return false;
+        lock (ch)
+        {
+            if (ch.IsExpired || ch.State == ConfirmChallengeState.Consumed)
+                return false;
+            ch.State = state;
+            return true;
+        }
+    }
+
+    /// <summary>Stable fingerprint of the action on its resolved target.
+    /// Registry element ids are per-process counters, so binding uses the
+    /// element's stable identity (hwnd/automationId/role/name/bounds), the
+    /// caller-supplied target, the resolved window and the full args —
+    /// a materially different action or target never collides.</summary>
+    private static string ConfirmFingerprint(ActionIntent intent,
+        UiElement? element, WindowInfo? window)
+    {
+        var sb = new StringBuilder(160);
+        sb.Append(intent.Kind).Append('|').Append(intent.Silent).Append('|');
+        var t = intent.Target;
+        sb.Append(t.ElementId).Append('|').Append(t.Hwnd).Append('|');
+        if (t.Point is { } pt) sb.Append(pt.X).Append(',').Append(pt.Y);
+        sb.Append('|');
+        if (t.Selector is { } s)
+            sb.Append(s.Hwnd).Append(';').Append(s.Pid).Append(';')
+              .Append(s.WindowTitle).Append(';').Append(s.Role).Append(';')
+              .Append(s.Name).Append(';').Append(s.AutomationId).Append(';')
+              .Append(s.ClassName).Append(';').Append(s.ValueEquals);
+        sb.Append('|');
+        if (element != null)
+            sb.Append(element.Hwnd).Append(';').Append(element.Pid).Append(';')
+              .Append(element.Role).Append(';').Append(element.Name).Append(';')
+              .Append(element.Handle.Recipe.AutomationId).Append(';')
+              .Append(element.Bounds);
+        sb.Append('|');
+        sb.Append(window?.Hwnd).Append(';').Append(window?.ProcessName);
+        if (intent.Args != null)
+            foreach (var kv in intent.Args.OrderBy(k => k.Key, StringComparer.Ordinal))
+            {
+                if (kv.Key == "approvalId") continue;
+                sb.Append('|').Append(kv.Key).Append('=');
+                if (kv.Value is string vs) sb.Append(vs);
+                else if (kv.Value is System.Collections.IEnumerable en)
+                    sb.Append(string.Join(",",
+                        en.Cast<object?>().Select(o => o?.ToString())));
+                else sb.Append(kv.Value);
+            }
+        return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(sb.ToString())));
+    }
+
+    private static string DescribeConfirmation(ActionIntent intent,
+        UiElement? element, WindowInfo? window)
+    {
+        var target = element != null
+            ? $"{element.Role} '{element.Name}'"
+            : intent.Target.Point is { } pt ? $"point ({pt.X},{pt.Y})"
+            : window != null ? $"window '{window.Title}'" : "focused element";
+        var what = intent.Kind.ToString();
+        if (intent.Args?.TryGetValue("text", out var tx) == true && tx != null)
+        {
+            var s = tx.ToString() ?? "";
+            what += $" \"{(s.Length > 60 ? s[..60] + "…" : s)}\"";
+        }
+        else if (intent.Args?.TryGetValue("key", out var k) == true && k != null)
+            what += $" {k}";
+        var where = window != null ? $" in '{window.Title}'" : "";
+        return $"{what} on {target}{where}";
+    }
 
     /// <summary>F04 dangerous classification: a CONFIRM-classified action
     /// whose effect is a destructive or arbitrary-execution channel —

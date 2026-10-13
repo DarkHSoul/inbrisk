@@ -75,7 +75,8 @@ public sealed record GhostControlOptions(
     string Username = "InbriskAgent",
     string ControlPipeName = GhostControlCommand.DefaultControlPipeName,
     bool JsonOutput = false,
-    bool Verbose = false)
+    bool Verbose = false,
+    bool RemoveUser = false)
 {
     /// <summary>
     /// Parses CLI argument tokens into strongly-typed <see cref="GhostControlOptions"/>.
@@ -95,6 +96,7 @@ public sealed record GhostControlOptions(
         string controlPipeName = GhostControlCommand.DefaultControlPipeName;
         bool jsonOutput = false;
         bool verbose = false;
+        bool removeUser = false;
 
         if (args == null || args.Length == 0)
         {
@@ -105,7 +107,7 @@ public sealed record GhostControlOptions(
 
         // 1. Identify primary subcommand
         var first = args[0].ToLowerInvariant();
-        if (first is "ghost-tray" or "ghost_tray")
+        if (first is "ghost-tray" or "ghost_tray" or "ghost-control" or "ghost_control")
         {
             subcommand = GhostSubcommand.Tray;
             startIndex = 1;
@@ -124,6 +126,15 @@ public sealed record GhostControlOptions(
         {
             subcommand = GhostSubcommand.Stop;
             startIndex = 1;
+        }
+        else if (first is "ghost-logs" or "ghost_logs")
+        {
+            subcommand = GhostSubcommand.Logs;
+            startIndex = 1;
+        }
+        else if (first is "ghost-help" or "ghost_help")
+        {
+            return new GhostControlOptions(Subcommand: GhostSubcommand.Help);
         }
         else if (first == "ghost")
         {
@@ -166,14 +177,16 @@ public sealed record GhostControlOptions(
                     case "-h":
                         return new GhostControlOptions(Subcommand: GhostSubcommand.Help);
                     default:
-                        // Default to Tray if subcommand not recognised
-                        subcommand = GhostSubcommand.Tray;
-                        break;
+                        return new GhostControlOptions(Subcommand: GhostSubcommand.Help);
                 }
+            }
+            else if (args.Length == 1)
+            {
+                subcommand = GhostSubcommand.Help;
             }
             else
             {
-                subcommand = GhostSubcommand.Help;
+                subcommand = GhostSubcommand.Tray;
             }
         }
 
@@ -199,6 +212,15 @@ public sealed record GhostControlOptions(
             if (a is "--verbose" or "-v")
             {
                 verbose = true;
+                continue;
+            }
+
+            // Full teardown: also delete the dedicated ghost account and
+            // its stored machine credential (default keeps the account for
+            // the next session start).
+            if (a is "--remove-user" or "--purge")
+            {
+                removeUser = true;
                 continue;
             }
 
@@ -376,7 +398,8 @@ public sealed record GhostControlOptions(
             Username: username,
             ControlPipeName: controlPipeName,
             JsonOutput: jsonOutput,
-            Verbose: verbose);
+            Verbose: verbose,
+            RemoveUser: removeUser);
     }
 
     private static bool ParseBoolVal(string raw)
@@ -475,6 +498,126 @@ public static class GhostControlCommand
 
     #endregion
 
+    #region Control Channel Authorization
+
+    private static string? _controlToken;
+
+    private sealed record ControlDaemonState(int Pid, DateTime StartTimeUtc, string Token, string PipeName);
+
+    private static string ControlStatePath =>
+        Path.Combine(UserSettings.DataDir, "ghost-control.json");
+
+    private static void WriteControlState(string token, string pipeName)
+    {
+        try
+        {
+            Directory.CreateDirectory(UserSettings.DataDir);
+            using var p = Process.GetCurrentProcess();
+            var tmp = ControlStatePath + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(new
+            {
+                pid = p.Id,
+                startTimeUtc = p.StartTime.ToUniversalTime().ToString("O"),
+                token,
+                pipeName
+            }, JsonOptions));
+            File.Move(tmp, ControlStatePath, overwrite: true);
+        }
+        catch { }
+    }
+
+    private static ControlDaemonState? ReadControlState()
+    {
+        try
+        {
+            if (!File.Exists(ControlStatePath))
+            {
+                return null;
+            }
+            using var doc = JsonDocument.Parse(File.ReadAllText(ControlStatePath));
+            var r = doc.RootElement;
+            if (!r.TryGetProperty("pid", out var pidProp) || pidProp.ValueKind != JsonValueKind.Number)
+            {
+                return null;
+            }
+            var start = r.TryGetProperty("startTimeUtc", out var s) &&
+                DateTime.TryParse(s.GetString(), null, DateTimeStyles.RoundtripKind, out var st)
+                ? st
+                : DateTime.MinValue;
+            var token = r.TryGetProperty("token", out var t) ? t.GetString() ?? string.Empty : string.Empty;
+            var pipe = r.TryGetProperty("pipeName", out var pn) ? pn.GetString() ?? DefaultControlPipeName : DefaultControlPipeName;
+            return new ControlDaemonState(pidProp.GetInt32(), start, token, pipe);
+        }
+        catch { return null; }
+    }
+
+    private static bool ControlStateAlive(ControlDaemonState state)
+    {
+        try
+        {
+            using var p = Process.GetProcessById(state.Pid);
+            if (!p.ProcessName.Contains("inbrisk", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            if (state.StartTimeUtc != DateTime.MinValue &&
+                Math.Abs((p.StartTime.ToUniversalTime() - state.StartTimeUtc).TotalSeconds) > 2)
+            {
+                return false;
+            }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    private static string? ControlToken() => ReadControlState()?.Token;
+
+    private static bool IsAuthorized(string? payloadJson)
+    {
+        var expected = _controlToken;
+        if (expected == null || string.IsNullOrEmpty(payloadJson))
+        {
+            return false;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            return doc.RootElement.TryGetProperty("token", out var t) &&
+                t.ValueKind == JsonValueKind.String &&
+                string.Equals(t.GetString(), expected, StringComparison.Ordinal);
+        }
+        catch { return false; }
+    }
+
+    private static void DeleteControlStateIfOurs()
+    {
+        try
+        {
+            var s = ReadControlState();
+            if (s != null && s.Pid == Environment.ProcessId)
+            {
+                File.Delete(ControlStatePath);
+            }
+        }
+        catch { }
+    }
+
+    private static bool ResponseOk(string? resp)
+    {
+        if (string.IsNullOrEmpty(resp))
+        {
+            return true;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(resp);
+            return !doc.RootElement.TryGetProperty("ok", out var ok) || ok.ValueKind != JsonValueKind.False;
+        }
+        catch { return true; }
+    }
+
+    #endregion
+
     /// <summary>
     /// Determines whether the provided CLI arguments should be routed to <see cref="GhostControlCommand"/>.
     /// </summary>
@@ -483,7 +626,7 @@ public static class GhostControlCommand
         if (args == null || args.Length == 0) return false;
 
         var first = args[0].ToLowerInvariant();
-        if (first is "ghost-tray" or "ghost_tray" or "ghost-pip" or "ghost_pip" or "ghost-control" or "ghost_control" or "ghost-status")
+        if (first is "ghost-tray" or "ghost_tray" or "ghost-pip" or "ghost_pip" or "ghost-control" or "ghost_control" or "ghost-status" or "ghost_status" or "ghost-stop" or "ghost_stop" or "ghost-logs" or "ghost_logs" or "ghost-help" or "ghost_help")
         {
             return true;
         }
@@ -597,6 +740,12 @@ public static class GhostControlCommand
         AppDomain.CurrentDomain.ProcessExit += processExitHandler;
 
         LogHeader(options);
+
+        if (EmergencyGate.IsStopped)
+        {
+            LogWarning("Ghost OS start refused: computer control is stopped by the local emergency hotkey; only the local user can resume.", options);
+            return 1;
+        }
 
         GhostLocalDesktop? localDesktop = null;
         GhostDesktopCapture? desktopCapture = null;
@@ -798,7 +947,9 @@ public static class GhostControlCommand
 
             // 7. Start Remote Control IPC Server
             controlServer = new GhostIpcServer(options.ControlPipeName);
-            RegisterIpcControlHandlers(controlServer, pipManager, expander, trayApp, sessionManager, linkedCts, options);
+            _controlToken = Guid.NewGuid().ToString("N");
+            WriteControlState(_controlToken, options.ControlPipeName);
+            RegisterIpcControlHandlers(controlServer, pipManager, expander, trayApp, keyboardForwarder, sessionManager, linkedCts, options);
             await controlServer.StartAsync(linkedCts.Token).ConfigureAwait(false);
             LogSuccess($"Control IPC server listening on \\\\.\\pipe\\{options.ControlPipeName}", options);
 
@@ -807,6 +958,7 @@ public static class GhostControlCommand
             {
                 expander.ExpandToFullScreen(pipManager.WindowHandle, 0, false);
                 trayApp.SetFullScreen(true);
+                keyboardForwarder?.NotifyFullscreen(true);
                 LogInfo("PiP expanded to Full-Screen Shadow Mode.", options);
             }
 
@@ -838,6 +990,9 @@ public static class GhostControlCommand
         {
             Console.CancelKeyPress -= cancelHandler;
             AppDomain.CurrentDomain.ProcessExit -= processExitHandler;
+
+            DeleteControlStateIfOurs();
+            _controlToken = null;
 
             LogInfo("Shutting down Ghost OS components cleanly...", options);
 
@@ -942,6 +1097,7 @@ public static class GhostControlCommand
             {
                 expander.ToggleFullScreen(pipManager.WindowHandle, 0, false);
                 trayApp.SetFullScreen(expander.IsFullScreen);
+                keyboardForwarder?.NotifyFullscreen(expander.IsFullScreen);
                 LogInfo($"[Tray] Full-screen mode {(expander.IsFullScreen ? "EXPANDED" : "RESTORED")}", options);
             }
         };
@@ -1015,6 +1171,16 @@ public static class GhostControlCommand
                     LogInfo("[Hotkey] Esc pressed: Restored PiP from full-screen Shadow Mode.", options);
                 }
             };
+
+            keyboardForwarder.FullscreenExitRequested += () =>
+            {
+                if (expander.IsFullScreen && pipManager.WindowHandle != IntPtr.Zero)
+                {
+                    expander.ShrinkToPip(pipManager.WindowHandle);
+                    trayApp.SetFullScreen(false);
+                    LogInfo("[Hotkey] Exited full-screen Shadow Mode.", options);
+                }
+            };
         }
     }
 
@@ -1023,6 +1189,7 @@ public static class GhostControlCommand
         GhostPipManager pipManager,
         GhostPipExpander expander,
         GhostTrayApp trayApp,
+        GhostKeyboardForwarder? keyboardForwarder,
         GhostSessionManager? sessionManager,
         CancellationTokenSource linkedCts,
         GhostControlOptions options)
@@ -1031,6 +1198,10 @@ public static class GhostControlCommand
         server.RegisterHandler("pip_interactive", async (payloadJson) =>
         {
             await Task.Yield();
+            if (!IsAuthorized(payloadJson))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
             bool targetVal;
             try
             {
@@ -1060,6 +1231,10 @@ public static class GhostControlCommand
         server.RegisterHandler("pip_fullscreen", async (payloadJson) =>
         {
             await Task.Yield();
+            if (!IsAuthorized(payloadJson))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
             bool isFs = false;
             if (pipManager.WindowHandle != IntPtr.Zero)
             {
@@ -1092,6 +1267,7 @@ public static class GhostControlCommand
 
                 isFs = expander.IsFullScreen;
                 trayApp.SetFullScreen(isFs);
+                keyboardForwarder?.NotifyFullscreen(isFs);
                 LogInfo($"[IPC] PiP full-screen mode toggled to: {(isFs ? "ON" : "OFF")}", options);
             }
 
@@ -1102,6 +1278,10 @@ public static class GhostControlCommand
         server.RegisterHandler("pip_position", async (payloadJson) =>
         {
             await Task.Yield();
+            if (!IsAuthorized(payloadJson))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
             string posName = "TopRight";
             try
             {
@@ -1127,6 +1307,10 @@ public static class GhostControlCommand
         server.RegisterHandler("pip_opacity", async (payloadJson) =>
         {
             await Task.Yield();
+            if (!IsAuthorized(payloadJson))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
             byte alpha = 255;
             try
             {
@@ -1150,6 +1334,10 @@ public static class GhostControlCommand
         server.RegisterHandler("pip_scale", async (payloadJson) =>
         {
             await Task.Yield();
+            if (!IsAuthorized(payloadJson))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
             float scale = 1.0f;
             try
             {
@@ -1161,6 +1349,7 @@ public static class GhostControlCommand
             }
             catch { }
 
+            scale = Math.Clamp(scale, 0.25f, 5.0f);
             pipManager.SetScale(scale);
             LogInfo($"[IPC] PiP scale updated to: {scale:F2}x", options);
 
@@ -1212,6 +1401,10 @@ public static class GhostControlCommand
         server.RegisterHandler("stop", async (stopReq) =>
         {
             await Task.Yield();
+            if (!IsAuthorized(stopReq))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
             LogInfo("[IPC] Remote stop request received via IPC pipe.", options);
             _ = Task.Run(async () =>
             {
@@ -1238,7 +1431,7 @@ public static class GhostControlCommand
 
         try
         {
-            client = new GhostIpcClient(options.ControlPipeName);
+            client = new GhostIpcClient(ReadControlState()?.PipeName ?? options.ControlPipeName);
             await client.ConnectAsync(TimeSpan.FromMilliseconds(600), ct).ConfigureAwait(false);
             connected = client.IsConnected;
         }
@@ -1257,9 +1450,12 @@ public static class GhostControlCommand
                 if (options.Interactive.HasValue)
                 {
                     anyActionExecuted = true;
-                    var payload = JsonSerializer.Serialize(new { interactive = options.Interactive.Value });
+                    var payload = JsonSerializer.Serialize(new { interactive = options.Interactive.Value, token = ControlToken() });
                     var resp = await client.SendRequestAsync("pip_interactive", payload, TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
-                    LogSuccess($"[Ghost OS] PiP interactive mode set to: {(options.Interactive.Value ? "ON (Clickable)" : "OFF (Click-through)")}", options);
+                    if (ResponseOk(resp))
+                        LogSuccess($"[Ghost OS] PiP interactive mode set to: {(options.Interactive.Value ? "ON (Clickable)" : "OFF (Click-through)")}", options);
+                    else
+                        LogWarning("[Ghost OS] PiP interactive request was rejected by the daemon.", options);
                     if (options.JsonOutput) Console.WriteLine(resp);
                 }
 
@@ -1267,9 +1463,12 @@ public static class GhostControlCommand
                 if (options.FullScreen.HasValue)
                 {
                     anyActionExecuted = true;
-                    var payload = JsonSerializer.Serialize(new { fullscreen = options.FullScreen.Value });
+                    var payload = JsonSerializer.Serialize(new { fullscreen = options.FullScreen.Value, token = ControlToken() });
                     var resp = await client.SendRequestAsync("pip_fullscreen", payload, TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
-                    LogSuccess($"[Ghost OS] PiP full-screen display set to: {(options.FullScreen.Value ? "ON (Shadow Mode)" : "OFF (Mini PiP)")}", options);
+                    if (ResponseOk(resp))
+                        LogSuccess($"[Ghost OS] PiP full-screen display set to: {(options.FullScreen.Value ? "ON (Shadow Mode)" : "OFF (Mini PiP)")}", options);
+                    else
+                        LogWarning("[Ghost OS] PiP full-screen request was rejected by the daemon.", options);
                     if (options.JsonOutput) Console.WriteLine(resp);
                 }
 
@@ -1277,9 +1476,12 @@ public static class GhostControlCommand
                 if (options.Position.HasValue)
                 {
                     anyActionExecuted = true;
-                    var payload = JsonSerializer.Serialize(new { position = options.Position.Value.ToString() });
+                    var payload = JsonSerializer.Serialize(new { position = options.Position.Value.ToString(), token = ControlToken() });
                     var resp = await client.SendRequestAsync("pip_position", payload, TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
-                    LogSuccess($"[Ghost OS] PiP anchor position set to: {options.Position.Value}", options);
+                    if (ResponseOk(resp))
+                        LogSuccess($"[Ghost OS] PiP anchor position set to: {options.Position.Value}", options);
+                    else
+                        LogWarning("[Ghost OS] PiP position request was rejected by the daemon.", options);
                     if (options.JsonOutput) Console.WriteLine(resp);
                 }
 
@@ -1287,10 +1489,13 @@ public static class GhostControlCommand
                 if (options.Opacity.HasValue)
                 {
                     anyActionExecuted = true;
-                    var payload = JsonSerializer.Serialize(new { opacity = options.Opacity.Value });
+                    var payload = JsonSerializer.Serialize(new { opacity = options.Opacity.Value, token = ControlToken() });
                     var resp = await client.SendRequestAsync("pip_opacity", payload, TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
                     int pct = (int)Math.Round(options.Opacity.Value * 100.0 / 255.0);
-                    LogSuccess($"[Ghost OS] PiP opacity set to: {pct}% (alpha {options.Opacity.Value})", options);
+                    if (ResponseOk(resp))
+                        LogSuccess($"[Ghost OS] PiP opacity set to: {pct}% (alpha {options.Opacity.Value})", options);
+                    else
+                        LogWarning("[Ghost OS] PiP opacity request was rejected by the daemon.", options);
                     if (options.JsonOutput) Console.WriteLine(resp);
                 }
 
@@ -1298,9 +1503,12 @@ public static class GhostControlCommand
                 if (options.Scale.HasValue)
                 {
                     anyActionExecuted = true;
-                    var payload = JsonSerializer.Serialize(new { scale = options.Scale.Value });
+                    var payload = JsonSerializer.Serialize(new { scale = options.Scale.Value, token = ControlToken() });
                     var resp = await client.SendRequestAsync("pip_scale", payload, TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
-                    LogSuccess($"[Ghost OS] PiP scale multiplier set to: {options.Scale.Value:F2}x", options);
+                    if (ResponseOk(resp))
+                        LogSuccess($"[Ghost OS] PiP scale multiplier set to: {options.Scale.Value:F2}x", options);
+                    else
+                        LogWarning("[Ghost OS] PiP scale request was rejected by the daemon.", options);
                     if (options.JsonOutput) Console.WriteLine(resp);
                 }
 
@@ -1380,7 +1588,7 @@ public static class GhostControlCommand
         // Try querying live daemon first
         try
         {
-            await using var client = new GhostIpcClient(options.ControlPipeName);
+            await using var client = new GhostIpcClient(ReadControlState()?.PipeName ?? options.ControlPipeName);
             await client.ConnectAsync(TimeSpan.FromMilliseconds(500), ct).ConfigureAwait(false);
             if (client.IsConnected)
             {
@@ -1451,16 +1659,40 @@ public static class GhostControlCommand
     {
         LogInfo("Initiating Ghost OS shutdown sequence...", options);
 
+        var daemonState = ReadControlState();
+
         // Try stopping via IPC first
         try
         {
-            await using var client = new GhostIpcClient(options.ControlPipeName);
+            await using var client = new GhostIpcClient(daemonState?.PipeName ?? options.ControlPipeName);
             await client.ConnectAsync(TimeSpan.FromMilliseconds(600), ct).ConfigureAwait(false);
             if (client.IsConnected)
             {
-                var resp = await client.SendRequestAsync("stop", "{}", TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
-                LogSuccess("Shutdown signal sent to active Ghost OS daemon.", options);
+                var resp = await client.SendRequestAsync("stop", JsonSerializer.Serialize(new { token = daemonState?.Token }), TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
+                if (ResponseOk(resp))
+                    LogSuccess("Shutdown signal sent to active Ghost OS daemon.", options);
+                else
+                    LogWarning("Shutdown request was rejected by the daemon; forcing local termination.", options);
                 if (options.JsonOutput) Console.WriteLine(resp);
+
+                if (daemonState != null && ControlStateAlive(daemonState))
+                {
+                    var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+                    while (ControlStateAlive(daemonState) && DateTime.UtcNow < deadline)
+                    {
+                        await Task.Delay(250, ct).ConfigureAwait(false);
+                    }
+                    if (ControlStateAlive(daemonState))
+                    {
+                        try
+                        {
+                            Process.GetProcessById(daemonState.Pid).Kill(entireProcessTree: true);
+                            LogWarning("Ghost daemon did not exit on its own; forced termination.", options);
+                        }
+                        catch { }
+                    }
+                }
+                try { File.Delete(ControlStatePath); } catch { }
 
                 // Run comprehensive cleanup
                 try { await GhostRdpConnector.CleanupAllSessionsAsync(options.Username).ConfigureAwait(false); } catch { }
@@ -1469,6 +1701,18 @@ public static class GhostControlCommand
             }
         }
         catch { }
+
+        // Fallback: terminate the recorded daemon process directly if it is still alive
+        if (daemonState != null && ControlStateAlive(daemonState))
+        {
+            try
+            {
+                Process.GetProcessById(daemonState.Pid).Kill(entireProcessTree: true);
+                LogSuccess($"Terminated Ghost daemon process {daemonState.Pid}.", options);
+            }
+            catch { }
+        }
+        try { File.Delete(ControlStatePath); } catch { }
 
         // Fallback: Terminate headless session directly via GhostRdpConnector
         try
@@ -1526,6 +1770,26 @@ public static class GhostControlCommand
         catch (Exception ex)
         {
             LogWarning($"Warning during cleanup: {ex.Message}", options);
+        }
+
+        // Full teardown (--remove-user/--purge): delete the dedicated ghost
+        // account and its stored machine credential. Routine stops keep the
+        // account so the next start needs no admin rights.
+        if (options.RemoveUser)
+        {
+            try
+            {
+                bool removed = await GhostUserProvisioner
+                    .RemoveGhostUserAsync(options.Username).ConfigureAwait(false);
+                if (removed)
+                    LogSuccess($"Ghost user '{options.Username}' and stored credential removed.", options);
+                else
+                    LogWarning($"Ghost user '{options.Username}' could not be fully removed.", options);
+            }
+            catch (Exception ex)
+            {
+                LogWarning($"Ghost user removal failed: {ex.Message}", options);
+            }
         }
 
         return 0;

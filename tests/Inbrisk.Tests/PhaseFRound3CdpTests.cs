@@ -1301,15 +1301,18 @@ public class PhaseFRound3CdpTests
     public void ToolsList_Round3_NoNewBrowserTools()
     {
         var coreTools = Inbrisk.Mcp.McpHost.CoreTools;
-        var expected16 = new HashSet<string>(StringComparer.Ordinal)
+        var expected25 = new HashSet<string>(StringComparer.Ordinal)
         {
             "computer_batch", "computer_do", "computer_run", "computer_launch",
             "computer_close_window", "computer_windows", "computer_observe", "computer_find",
             "computer_inspect", "computer_read", "computer_click", "computer_type",
-            "computer_hotkey", "computer_screenshot", "computer_reset_input", "computer_capabilities"
+            "computer_hotkey", "computer_screenshot", "computer_reset_input", "computer_capabilities",
+            "computer_toolset", "computer_save_recipe", "computer_run_recipe",
+            "computer_list_recipes", "computer_pause_run", "computer_resume_run",
+            "computer_wait_for", "ghost_control_open", "computer_ghost_control"
         };
-        Assert.Equal(16, coreTools.Count);
-        Assert.True(coreTools.SetEquals(expected16));
+        Assert.Equal(25, coreTools.Count);
+        Assert.True(coreTools.SetEquals(expected25));
         Assert.DoesNotContain("browser_browse", coreTools);
         Assert.DoesNotContain("browser_click", coreTools);
         Assert.DoesNotContain("browser_type", coreTools);

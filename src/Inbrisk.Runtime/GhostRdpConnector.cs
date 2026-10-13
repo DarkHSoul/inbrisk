@@ -94,8 +94,78 @@ public class GhostRdpConnector
         return targetPath;
     }
 
+    // ---- Credential Manager interop ----
+    // cmdkey.exe exposes /pass:"<pwd>" on its command line — visible to any
+    // same-user process enumeration. CredWriteW/CredDeleteW never put the
+    // secret on a command line.
+    private const uint CredTypeGeneric = 1;
+    private const uint CredPersistEnterprise = 3;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct CREDENTIAL
+    {
+        public uint Flags;
+        public uint Type;
+        public string TargetName;
+        public string? Comment;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+        public uint CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public uint Persist;
+        public uint AttributeCount;
+        public IntPtr Attributes;
+        public string? TargetAlias;
+        public string UserName;
+    }
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CredWriteW(ref CREDENTIAL credential, uint flags);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CredDeleteW(string target, uint type, uint flags);
+
+    private static bool WriteTermsrvCredential(string target, string username, string password)
+    {
+        IntPtr blob = IntPtr.Zero;
+        try
+        {
+            byte[] blobBytes = Encoding.Unicode.GetBytes(password);
+            blob = Marshal.AllocHGlobal(blobBytes.Length);
+            Marshal.Copy(blobBytes, 0, blob, blobBytes.Length);
+
+            var cred = new CREDENTIAL
+            {
+                Flags = 0,
+                Type = CredTypeGeneric,
+                TargetName = target,
+                Comment = "Inbrisk ghost loopback RDP",
+                CredentialBlobSize = (uint)blobBytes.Length,
+                CredentialBlob = blob,
+                Persist = CredPersistEnterprise,
+                AttributeCount = 0,
+                Attributes = IntPtr.Zero,
+                TargetAlias = null,
+                UserName = username,
+            };
+
+            return CredWriteW(ref cred, 0);
+        }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[GhostRdpConnector] CredWrite({target}) failed: {ex.Message}");
+            return false;
+        }
+        finally
+        {
+            if (blob != IntPtr.Zero) Marshal.FreeHGlobal(blob);
+        }
+    }
+
     /// <summary>
-    /// Configures Windows Credential Manager for the loopback target using cmdkey.
+    /// Configures Windows Credential Manager for the loopback target via
+    /// CredWrite — no credential ever appears on a process command line.
     /// This allows silent authentication without interactive credential prompts.
     /// </summary>
     /// <param name="username">Username for the ghost session (e.g. InbriskAgent).</param>
@@ -108,8 +178,8 @@ public class GhostRdpConnector
             throw new ArgumentException("Username cannot be empty.", nameof(username));
         }
 
-        bool ok1 = RunCmdKey($"/generic:TERMSRV/{DefaultLoopbackAddress} /user:\"{username}\" /pass:\"{password}\"");
-        bool ok2 = RunCmdKey($"/generic:TERMSRV/localhost /user:\"{username}\" /pass:\"{password}\"");
+        bool ok1 = WriteTermsrvCredential($"TERMSRV/{DefaultLoopbackAddress}", username, password);
+        bool ok2 = WriteTermsrvCredential("TERMSRV/localhost", username, password);
         return ok1 || ok2;
     }
 
@@ -118,8 +188,10 @@ public class GhostRdpConnector
     /// </summary>
     public static bool ClearLoopbackCredentials()
     {
-        bool ok1 = RunCmdKey($"/delete:TERMSRV/{DefaultLoopbackAddress}");
-        bool ok2 = RunCmdKey("/delete:TERMSRV/localhost");
+        bool ok1 = CredDeleteW($"TERMSRV/{DefaultLoopbackAddress}", CredTypeGeneric, 0);
+        bool ok2 = CredDeleteW("TERMSRV/localhost", CredTypeGeneric, 0);
+        if (!ok1) ok1 = RunCmdKey($"/delete:TERMSRV/{DefaultLoopbackAddress}");
+        if (!ok2) ok2 = RunCmdKey("/delete:TERMSRV/localhost");
         return ok1 || ok2;
     }
 
@@ -193,6 +265,10 @@ public class GhostRdpConnector
                 var psi = new ProcessStartInfo
                 {
                     FileName = freeRdpPath,
+                    // Residual: FreeRDP has no credential-manager/stdin path —
+                    // /p: keeps the password on its command line for the
+                    // process lifetime (same-user visible). Prefer mstsc,
+                    // which authenticates silently via the CredMan entries.
                     Arguments = $"/v:{DefaultLoopbackAddress}:{DefaultRdpPort} /u:\"{username}\" " +
                                 (string.IsNullOrEmpty(password) ? "" : $"/p:\"{password}\" ") +
                                 $"/size:{width}x{height} /bpp:32 /cert:ignore +auto-reconnect /kbd:0x00000409",

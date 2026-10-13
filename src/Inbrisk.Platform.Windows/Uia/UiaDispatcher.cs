@@ -14,12 +14,25 @@ namespace Inbrisk.Platform.Windows.Uia;
 public sealed class UiaDispatcher : IDisposable
 {
     private sealed record WorkItem(
-        Func<IUIAutomation, object?> Fn,
+        Func<IUIAutomation, CancellationToken, object?> Fn,
         TaskCompletionSource<object?> Done,
         CancellationToken Ct,
         long Generation,
         long DeadlineTicks,
-        string? IntentName);
+        string? IntentName)
+    {
+        /// <summary>
+        /// Cancelled the moment the caller stops waiting (timeout, cancellation,
+        /// purge) while this item may still be executing on an abandoned lane.
+        /// The lane checks <see cref="IsAbandoned"/> before applying the result,
+        /// so a late completion can never reply; cooperative callees observe
+        /// <see cref="AbandonToken"/> and skip their side effects entirely.
+        /// </summary>
+        private readonly CancellationTokenSource _abandoned = new();
+        public CancellationToken AbandonToken => _abandoned.Token;
+        public bool IsAbandoned => _abandoned.IsCancellationRequested;
+        public void Abandon() => _abandoned.Cancel();
+    }
 
     private readonly object _gate = new();
     private BlockingCollection<WorkItem> _queue = new();
@@ -32,8 +45,21 @@ public sealed class UiaDispatcher : IDisposable
     public long CurrentGeneration => Volatile.Read(ref _generation);
     public int QueuedCount => _queue.Count;
 
-    public async Task<T> RunAsync<T>(Func<IUIAutomation, T> fn, int? timeoutMs = null,
-        CancellationToken ct = default, string? intentName = null)
+    public Task<T> RunAsync<T>(Func<IUIAutomation, T> fn, int? timeoutMs = null,
+        CancellationToken ct = default, string? intentName = null) =>
+        RunAsyncCore<T>((u, _) => fn(u), timeoutMs, ct, intentName);
+
+    /// <summary>
+    /// Abandon-aware variant: <paramref name="fn"/> receives a token that is
+    /// cancelled if the caller's wait expires while the work is still running
+    /// on the abandoned lane — check it before applying side effects.
+    /// </summary>
+    public Task<T> RunAsync<T>(Func<IUIAutomation, CancellationToken, T> fn, int? timeoutMs = null,
+        CancellationToken ct = default, string? intentName = null) =>
+        RunAsyncCore<T>(fn, timeoutMs, ct, intentName);
+
+    private async Task<T> RunAsyncCore<T>(Func<IUIAutomation, CancellationToken, T> fn,
+        int? timeoutMs, CancellationToken ct, string? intentName)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ct.ThrowIfCancellationRequested();
@@ -41,11 +67,13 @@ public sealed class UiaDispatcher : IDisposable
         var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var timeout = timeoutMs ?? DefaultTimeoutMs;
         var deadlineTicks = Stopwatch.GetTimestamp() + (long)(timeout * (Stopwatch.Frequency / 1000.0));
+        WorkItem item;
         lock (_gate)
         {
             if (_poisoned) Restart();
             EnsureThread();
-            _queue.Add(new WorkItem(u => fn(u), tcs, ct, _generation, deadlineTicks, intentName));
+            item = new WorkItem((u, aband) => fn(u, aband), tcs, ct, _generation, deadlineTicks, intentName);
+            _queue.Add(item);
         }
 
         using var reg = ct.CanBeCanceled ? ct.UnsafeRegister(static state =>
@@ -61,13 +89,27 @@ public sealed class UiaDispatcher : IDisposable
         }
         catch (TimeoutException)
         {
+            // The abandoned thread may still complete this item late — mark it
+            // inert so the late result cannot reply and cooperative side effects
+            // are skipped; the lane itself is poisoned and restarts.
+            item.Abandon();
             lock (_gate) _poisoned = true;
             throw new InbriskException(ErrorCode.Timeout,
                 $"UIA call timed out after {timeout}ms (target app unresponsive?)");
         }
+        catch (OperationCanceledException)
+        {
+            item.Abandon();
+            throw;
+        }
     }
 
     public T Run<T>(Func<IUIAutomation, T> fn, int? timeoutMs = null,
+        CancellationToken ct = default, string? intentName = null) =>
+        RunAsync(fn, timeoutMs, ct, intentName).GetAwaiter().GetResult();
+
+    /// <summary>Abandon-aware variant: the delegate also receives the item's abandon token.</summary>
+    public T Run<T>(Func<IUIAutomation, CancellationToken, T> fn, int? timeoutMs = null,
         CancellationToken ct = default, string? intentName = null) =>
         RunAsync(fn, timeoutMs, ct, intentName).GetAwaiter().GetResult();
 
@@ -86,7 +128,10 @@ public sealed class UiaDispatcher : IDisposable
         {
             Interlocked.Increment(ref _generation);
             while (_queue.TryTake(out var item))
+            {
+                item.Abandon();
                 item.Done.TrySetCanceled(item.Ct.IsCancellationRequested ? item.Ct : default);
+            }
         }
     }
 
@@ -106,7 +151,13 @@ public sealed class UiaDispatcher : IDisposable
         var old = _queue;
         _queue = new BlockingCollection<WorkItem>();
         while (old.TryTake(out var item))
+        {
+            item.Abandon();
             item.Done.TrySetCanceled(item.Ct.IsCancellationRequested ? item.Ct : default);
+        }
+        // Close the abandoned queue so the stuck thread exits once its in-flight
+        // COM call returns, instead of parking forever in GetConsumingEnumerable.
+        old.CompleteAdding();
         _thread = null;
         _poisoned = false;
         EnsureThread();
@@ -139,7 +190,11 @@ public sealed class UiaDispatcher : IDisposable
         catch
         {
             try { uia = (IUIAutomation)new CUIAutomationClass(); }
-            catch { return; } // no UIA at all — exit the lane quietly
+            catch
+            {
+                Debug.WriteLine("inbrisk-uia: no UIA automation available — dispatcher lane exiting");
+                return; // no UIA at all — exit the lane quietly
+            }
         }
 
         var queue = _queue; // capture current queue; restarts swap the field
@@ -148,13 +203,15 @@ public sealed class UiaDispatcher : IDisposable
             // 1. Generation check: if generation changed (purge or restart), drop without executing
             if (item.Generation != Volatile.Read(ref _generation))
             {
+                item.Abandon();
                 item.Done.TrySetCanceled(item.Ct.IsCancellationRequested ? item.Ct : default);
                 continue;
             }
 
-            // 2. Cancellation and deadline check before touching COM
-            if (item.Ct.IsCancellationRequested || Stopwatch.GetTimestamp() > item.DeadlineTicks)
+            // 2. Cancellation, abandon and deadline check before touching COM
+            if (item.Ct.IsCancellationRequested || item.IsAbandoned || Stopwatch.GetTimestamp() > item.DeadlineTicks)
             {
+                item.Abandon();
                 item.Done.TrySetCanceled(item.Ct.IsCancellationRequested ? item.Ct : default);
                 continue;
             }
@@ -164,13 +221,20 @@ public sealed class UiaDispatcher : IDisposable
                 // 3. Re-check cancellation right before dispatching
                 if (item.Ct.IsCancellationRequested)
                 {
+                    item.Abandon();
                     item.Done.TrySetCanceled(item.Ct);
                     continue;
                 }
-                item.Done.TrySetResult(item.Fn(uia));
+                var result = item.Fn(uia, item.AbandonToken);
+                // 4. Late-completion guard: the caller timed out (or cancelled)
+                // while this item was executing on the abandoned lane — its
+                // result is inert and must never reach the caller's task.
+                if (item.IsAbandoned) continue;
+                item.Done.TrySetResult(result);
             }
             catch (Exception e)
             {
+                if (item.IsAbandoned) continue; // late fault on abandoned work — drop it
                 item.Done.TrySetException(e);
             }
         }

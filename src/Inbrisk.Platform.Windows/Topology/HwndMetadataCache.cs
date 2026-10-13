@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Text;
 using Inbrisk.Core;
 using Inbrisk.Platform.Windows.Native;
 
@@ -18,7 +19,10 @@ public sealed record HwndMetadata(
 
 /// <summary>
 /// Session-scoped cache for HWND -> process metadata (PID, ProcessName, ProcessStartTime, IsElevated).
-/// Incorporates process start-time verification to prevent stale hits across PID reuse.
+/// Incorporates process start-time verification to prevent stale hits across PID reuse,
+/// and a live window-identity probe (owning thread id + owning pid + class name, re-checked
+/// on every hit) to prevent stale hits across HWND reuse — Win32 exposes no window creation
+/// timestamp, so identity signals are the only defence against a recycled handle.
 /// Bounds capacity to 512 entries with LRU eviction.
 /// </summary>
 public sealed class HwndMetadataCache : IDisposable
@@ -53,31 +57,39 @@ public sealed class HwndMetadataCache : IDisposable
             {
                 var entry = node.Value;
 
-                // 1. Verify HWND is still a valid window
-                if (!IsWindowValid(hwnd))
+                // 1. Verify the live window behind this handle is still the one
+                // the entry describes (dead window, or hwnd recycled into a
+                // different pid/thread/class -> evict, never serve stale)
+                switch (ValidateIdentity(hwnd, entry))
                 {
-                    RemoveNode(node);
-                    Telemetry.IncEviction();
-                    // Window is dead; continue to re-resolve (which will return null or updated)
-                }
-                else
-                {
-                    // 2. Verify PID reuse via ProcessStartTime
-                    if (IsPidReused(entry.Metadata.Pid, entry.Metadata.ProcessStartTime))
-                    {
+                    case IdentityCheck.WindowDead:
+                        RemoveNode(node);
+                        Telemetry.IncEviction();
+                        break; // continue to re-resolve
+                    case IdentityCheck.PidReused:
                         RemoveNode(node);
                         Telemetry.IncPidReuseReject();
-                        // PID was reused or process exited; continue to re-resolve
-                    }
-                    else
-                    {
-                        // Cache hit! Move to front of LRU
+                        break;
+                    case IdentityCheck.HwndReused:
+                        RemoveNode(node);
+                        Telemetry.IncEviction();
+                        break;
+                    case IdentityCheck.Match:
+                        // 2. Verify PID reuse via ProcessStartTime
+                        if (IsPidReused(entry.Metadata.Pid, entry.Metadata.ProcessStartTime))
+                        {
+                            RemoveNode(node);
+                            Telemetry.IncPidReuseReject();
+                            // PID was reused or process exited; continue to re-resolve
+                            break;
+                        }
+                        // Cache hit! Refresh the seen-at stamp, move to front of LRU
+                        node.Value = entry with { SeenAtTicks = Stopwatch.GetTimestamp() };
                         _lruList.Remove(node);
                         _lruList.AddFirst(node);
                         Telemetry.IncHit();
                         PerfTrace.Count("hwnd_metadata:cache=hit");
                         return entry.Metadata;
-                    }
                 }
             }
         }
@@ -105,7 +117,10 @@ public sealed class HwndMetadataCache : IDisposable
                 Telemetry.IncEviction();
             }
 
-            var newEntry = new HwndMetadataEntry(hwnd, resolved, DateTimeOffset.UtcNow);
+            var identity = ProbeIdentity(hwnd);
+            var newEntry = new HwndMetadataEntry(hwnd, resolved,
+                identity.Tid, identity.Class,
+                Stopwatch.GetTimestamp(), DateTimeOffset.UtcNow);
             var newNode = _lruList.AddFirst(newEntry);
             _map[hwnd] = newNode;
             Telemetry.IncInsert();
@@ -120,12 +135,19 @@ public sealed class HwndMetadataCache : IDisposable
             if (_map.TryGetValue(hwnd, out var node))
             {
                 var entry = node.Value;
-                if (!IsWindowValid(hwnd))
+                switch (ValidateIdentity(hwnd, entry))
                 {
-                    RemoveNode(node);
-                    Telemetry.IncEviction();
-                    metadata = null;
-                    return false;
+                    case IdentityCheck.WindowDead:
+                    case IdentityCheck.HwndReused:
+                        RemoveNode(node);
+                        Telemetry.IncEviction();
+                        metadata = null;
+                        return false;
+                    case IdentityCheck.PidReused:
+                        RemoveNode(node);
+                        Telemetry.IncPidReuseReject();
+                        metadata = null;
+                        return false;
                 }
 
                 if (IsPidReused(entry.Metadata.Pid, entry.Metadata.ProcessStartTime))
@@ -136,6 +158,7 @@ public sealed class HwndMetadataCache : IDisposable
                     return false;
                 }
 
+                node.Value = entry with { SeenAtTicks = Stopwatch.GetTimestamp() };
                 _lruList.Remove(node);
                 _lruList.AddFirst(node);
                 Telemetry.IncHit();
@@ -212,6 +235,41 @@ public sealed class HwndMetadataCache : IDisposable
         return NativeMethods.IsWindow(new IntPtr(hwnd));
     }
 
+    private enum IdentityCheck { Match, WindowDead, PidReused, HwndReused }
+
+    /// <summary>
+    /// Hwnd-reuse gate: <see cref="NativeMethods.IsWindow"/> alone only proves SOME
+    /// window owns the handle now. A recycled hwnd is detected by comparing every
+    /// live identity signal — owning pid (cross-process reuse), owning thread id
+    /// and class name (same-process reuse) — against what was captured at insert.
+    /// </summary>
+    private static IdentityCheck ValidateIdentity(long hwnd, HwndMetadataEntry entry)
+    {
+        if (!IsWindowValid(hwnd))
+            return IdentityCheck.WindowDead;
+
+        var live = ProbeIdentity(hwnd);
+        if (live.Pid != entry.Metadata.Pid)
+            return IdentityCheck.PidReused; // hwnd recycled into another process
+        if (live.Tid != entry.OwnerThreadId ||
+            !string.Equals(live.Class, entry.ClassName, StringComparison.Ordinal))
+            return IdentityCheck.HwndReused; // recycled within the same process
+
+        return IdentityCheck.Match;
+    }
+
+    /// <summary>Live identity probe: owning thread id, owning pid, class name.</summary>
+    private static (uint Tid, int Pid, string? Class) ProbeIdentity(long hwnd)
+    {
+        var h = new IntPtr(hwnd);
+        var tid = NativeMethods.GetWindowThreadProcessId(h, out var pid);
+        string? cls = null;
+        var sb = new StringBuilder(256);
+        if (NativeMethods.GetClassNameW(h, sb, sb.Capacity) > 0)
+            cls = sb.ToString();
+        return (tid, pid, cls);
+    }
+
     private static bool IsPidReused(int pid, DateTimeOffset? cachedStartTime)
     {
         if (pid <= 0) return false;
@@ -246,8 +304,10 @@ public sealed class HwndMetadataCache : IDisposable
         {
             return true;
         }
-        catch
+        catch (Exception e)
         {
+            // Unexpected probe failure — do not treat as reuse, but do not be silent either.
+            Debug.WriteLine($"hwnd-metadata pid-reuse probe fault: {e}");
             return false;
         }
     }
@@ -258,9 +318,19 @@ public sealed class HwndMetadataCache : IDisposable
         Clear();
     }
 
+    /// <param name="OwnerThreadId">Thread id owning the hwnd at insert — immutable
+    /// for a window's lifetime, so a change proves the handle was recycled.</param>
+    /// <param name="ClassName">Window class at insert — a same-tid/same-pid recycled
+    /// hwnd for a different control class is still rejected.</param>
+    /// <param name="SeenAtTicks">Monotonic (clock-adjustment-proof) stamp of last
+    /// validated hit — no create-time signal exists, so this bounds how long an
+    /// identity could have silently changed.</param>
     private sealed record HwndMetadataEntry(
         long Hwnd,
         HwndMetadata Metadata,
+        uint OwnerThreadId,
+        string? ClassName,
+        long SeenAtTicks,
         DateTimeOffset CachedAt
     );
 }
