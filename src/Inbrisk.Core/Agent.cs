@@ -215,6 +215,14 @@ public enum OutcomeKind
     TargetElevated, SecureDesktop, WindowLost,
     Timeout, InputRejected, CaptureUnavailable,
     PolicyDenied, ConfirmationDenied, EmergencyStopped,
+    // NOTE on "ConfirmationRequired": it is NOT a separate outcome here.
+    // The executor reports both "the human refused" and "no approval surface
+    // answered" as the same ErrorCode.ConfirmationRequired (see
+    // ActionResolver), so at this layer the two are indistinguishable —
+    // collapsing them is honest. Splitting them would mean emitting a
+    // *pending* label for an actual refusal, which is worse. To do it
+    // properly the confirmer path must first emit its own error code
+    // (e.g. ConfirmationDeclined) so the cases diverge before mapping.
     /// <summary>The action ran but produced no meaningful delta — loop signal.</summary>
     NoProgress,
     /// <summary>Frame still valid id-wise, but the window moved/resized

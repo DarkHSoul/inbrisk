@@ -782,6 +782,12 @@ public sealed class ActionResolver
         { Error: ErrorCode.InputBlocked } => OutcomeKind.InputRejected,
         { Error: ErrorCode.CaptureFailed } => OutcomeKind.CaptureUnavailable,
         { Error: ErrorCode.PolicyDenied } => OutcomeKind.PolicyDenied,
+        // NOTE: deliberately still maps to ConfirmationDenied, NOT to a
+        // distinct ConfirmationRequired. ErrorCode.ConfirmationRequired is
+        // emitted for BOTH "the human said no" and "no approval surface
+        // answered", so splitting it here would label a real refusal as
+        // merely pending. Distinguishing them requires a separate error code
+        // at the executor/confirm layer first — see the note in Agent.cs.
         { Error: ErrorCode.ConfirmationRequired } => OutcomeKind.ConfirmationDenied,
         { Error: ErrorCode.Busy } => OutcomeKind.ConcurrencyConflict,
         { Error: ErrorCode.Unsupported } => OutcomeKind.NotSupported,
