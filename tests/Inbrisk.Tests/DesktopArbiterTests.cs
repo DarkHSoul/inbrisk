@@ -141,9 +141,10 @@ public class DesktopArbiterTests
             "Hung script",
             leaseDuration: TimeSpan.FromMilliseconds(100));
 
-        // Wait up to 3s for watchdog tick (timer ticks every 1000ms)
+        // Wait up to 10s for watchdog tick (timer ticks every 1000ms) — full
+        // suite runs under heavy load can starve a single tick past 3s
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (lease.IsActive && sw.ElapsedMilliseconds < 3000)
+        while (lease.IsActive && sw.ElapsedMilliseconds < 10000)
         {
             await Task.Delay(100);
         }

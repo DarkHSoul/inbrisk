@@ -36,6 +36,53 @@ public static class InbriskResources
             .Where(static n => n is not ("Verified" or "Unverified"
                                        or "Failed" or "ObservedChange"))
             .ToArray();
+
+    // ---------------- window ownership (single source of truth) --------
+    // The six lifecycle rules live here ONCE and are projected into both
+    // capability profiles: `full` publishes them as the rule1..rule6
+    // object clients already parse, `slim` publishes a compact
+    // ownership summary. Two hand-maintained copies used to exist, and
+    // the slim one simply did not exist — so a model that never passed
+    // detail:"full" had no way to learn that a pre-existing window is
+    // off-limits. Ownership guidance must never depend on a verbosity
+    // flag, so it is now in both.
+
+    internal const string OwnershipSummary =
+        "window ownership: 'agent' = this session opened it, safe to write " +
+        "into and to close when done; 'user' = it was already open before " +
+        "the task, it may hold unsaved user data — do not close it, do not " +
+        "minimize it, and do not overwrite what is in it. computer_launch " +
+        "returns ownership (+ownershipReason) on every launch; a reused " +
+        "window (method ExistingInstance, launchState AlreadyRunning) is " +
+        "always ownership:user. When in doubt, leave it open — leaving a " +
+        "window open costs nothing, closing a user window loses data.";
+
+    internal const string AmbiguityWarning =
+        "a friendly name matching several DISTINCT apps returns " +
+        "AmbiguousApplication + candidates + exact retryArgs — pick one and " +
+        "call computer_launch again immediately, never narrate in between; " +
+        "never guess between candidates";
+
+    private static readonly string[] LifecycleRules =
+    {
+        "Never close, minimize, or alter applications that were already open before the task started (ownership: user).",
+        "Applications opened by the agent (ownership: agent) may be closed when no longer required and there is no unsaved user data.",
+        "Prefer graceful close (computer_close_window). Never force-kill.",
+        "Do not close the agent host, terminal, IDE, Colab browser, or protected apps.",
+        "After closing an application, notify the user: 'Closed <app> — no longer needed for this task.'",
+        "When in doubt, leave it open. Cost of leaving open is minimal; cost of closing user apps causes data loss.",
+    };
+
+    /// <summary>The rule1..rule6 object clients already consume. Built from
+    /// <see cref="LifecycleRules"/> so the slim summary and this object can
+    /// never drift apart.</summary>
+    private static object LifecyclePolicyObject()
+    {
+        var o = new Dictionary<string, string>(LifecycleRules.Length);
+        for (var i = 0; i < LifecycleRules.Length; i++)
+            o[$"rule{i + 1}"] = LifecycleRules[i];
+        return o;
+    }
     [McpServerResource(UriTemplate = "inbrisk://capabilities",
         Name = "inbrisk-capabilities", MimeType = "application/json"),
      Description("Inbrisk runtime capabilities: tool contracts, computer_run " +
@@ -45,11 +92,13 @@ public static class InbriskResources
     /// <summary>The full machine-readable reference — shared by the
     /// inbrisk://capabilities resource and the computer_capabilities tool.</summary>
     internal static string CapabilitiesJson(
-        ComputerControlActivityService? activity = null) => JsonSerializer.Serialize(new
+        ComputerControlActivityService? activity = null,
+        SessionDesktop? sessionDesktop = null) => JsonSerializer.Serialize(new
     {
         server = "inbrisk",
         build = BuildProvenance(),
         controlState = EmergencyControl.Process.State.ToString(),
+        sessionDesktop = sessionDesktop == null ? null : SessionDesktops.ToWire(sessionDesktop.Value),
         indicator = activity == null ? null : new
         {
             state = activity.State.ToString(),
@@ -66,14 +115,41 @@ public static class InbriskResources
         coordinateSpace = "image-space (per-frame; always pass frameId + observationId)",
         confirmation = "the client's explicit tool call is the confirmation; " +
             "Deny-classified targets (elevated, password, kill-switch) still refuse",
-        lifecyclePolicy = new
+        ownership = OwnershipSummary,
+        ambiguity = AmbiguityWarning,
+        lifecyclePolicy = LifecyclePolicyObject(),
+
+        // ---------------- computer_batch step schema ----------------
+        // This rule used to exist only in the agent-side system prompt.
+        // Sending a field that is not listed here is not "ignored" — the
+        // WHOLE batch is rejected with Malformed and nothing runs.
+        batch = new
         {
-            rule1 = "Never close, minimize, or alter applications that were already open before the task started (ownership: user).",
-            rule2 = "Applications opened by the agent (ownership: agent) may be closed when no longer required and there is no unsaved user data.",
-            rule3 = "Prefer graceful close (computer_close_window). Never force-kill.",
-            rule4 = "Do not close the agent host, terminal, IDE, Colab browser, or protected apps.",
-            rule5 = "After closing an application, notify the user: 'Closed <app> — no longer needed for this task.'",
-            rule6 = "When in doubt, leave it open. Cost of leaving open is minimal; cost of closing user apps causes data loss.",
+            stepFields =
+                "do (alias action) — click|invoke|type|set_value|key|hotkey|" +
+                "wait|launch|focus|toggle|select|scroll | " +
+                "t (alias target) — element name, automationId, elementId " +
+                "(uia_*) or a semantic object {elementId,name,role,hwnd," +
+                "window,process,automationId} | " +
+                "v (aliases text, value) — text to type / hotkey string | " +
+                "role | hwnd | " +
+                "ms (alias waitFor) — wait duration; for do:launch waitFor " +
+                "instead accepts readiness window|process|none | " +
+                "submit (type: press Enter after) | keys (hotkey shorthand " +
+                "e.g. 'ctrl+s') | " +
+                "continueOnError — record this step's failure and keep going",
+            aliases = "action→do, target→t, text/value→v, waitFor→ms",
+            strictValidation =
+                "unknown step fields are REJECTED, not ignored: one field " +
+                "outside stepFields makes the entire batch Malformed and " +
+                "NO step executes (the error names the offending keys). The " +
+                "same applies to the set[] (target, value, role), until[] " +
+                "(appears, disappears, windowAppears, stable, value, state, " +
+                "timeoutMs, stableMs) and read[] (target, props, role) arrays.",
+            compactFields =
+                "the short aliases above (do/t/v/ms/submit/keys) are the " +
+                "common case — a step object may use either spelling, never " +
+                "both at once",
         },
 
         // ---------------- semantic target spec ----------------
@@ -205,7 +281,10 @@ public static class InbriskResources
                 "and opens the best match in one call",
             identifiers = new[]
             {
-                "app — friendly name (\"Spotify\", \"Notepad\", \"Calculator\") — preferred",
+                "app — friendly APPLICATION name (\"Spotify\", \"Notepad\", " +
+                    "\"Calculator\"), resolved through app registration — this " +
+                    "is an app identity, not a window title, so it does not " +
+                    "conflict with preferring process over window title below",
                 "executable — exe name/path (\"notepad.exe\")",
                 "path — explicit path; non-exe files (e.g. .uproject) open " +
                     "via the registered file association",
@@ -227,15 +306,17 @@ public static class InbriskResources
                 "process | none; timeoutMs default 10000",
             idempotent = "a running app is reused (launchState:" +
                 "AlreadyRunning) unless newInstance:true — the bound window " +
-                "is the user-facing one, never a helper process",
+                "is the user-facing one, never a helper process. Every result " +
+                "carries ownership (\"agent\"|\"user\") + ownershipReason: " +
+                "\"agent\" only when THIS call created the window (new pid + " +
+                "new hwnd + start time after the pre-launch snapshot), " +
+                "\"user\" for every reuse — check it before writing into or " +
+                "closing the returned window.",
             security = "mutating computer action — denied while " +
                 "emergency-stopped, never a shell: arguments are a " +
                 "structured array and interpreters (cmd/powershell/mshta/" +
                 "rundll32/…) are refused with PolicyDenied",
-            ambiguity = "a friendly name matching several DISTINCT apps " +
-                "returns AmbiguousApplication + candidates — pick one and " +
-                "call computer_launch again immediately with its " +
-                "identifier; do not narrate intermediate steps",
+            ambiguity = AmbiguityWarning,
             runBinding = "computer_run step action:\"launch\" takes the same " +
                 "fields plus as:\"name\" → the app's top-level hwnd binds to " +
                 "$name for within:/wait_for scoping",
@@ -259,9 +340,19 @@ public static class InbriskResources
             "to interact with an app that may not be running, use " +
                 "computer_launch (or a computer_run launch step) — never " +
                 "shell/PowerShell to locate or start it",
+            OwnershipSummary,
+            AmbiguityWarning,
+            "computer_batch step fields are exactly: do|t|v|role|hwnd|ms|" +
+                "submit|keys|continueOnError (aliases action,target," +
+                "text,value,waitFor). An unknown field is NOT ignored — the " +
+                "whole batch is rejected Malformed and nothing runs",
             "act directly on a known semantic target — find/observe are for discovery",
             "prefer elementIds over coordinates",
-            "prefer process over window (titles are localized)",
+            "when TARGETING a window prefer process over window title " +
+                "(titles are localized). This is about window targeting, not " +
+                "about computer_launch: launch's app:\"Notepad\" is a friendly " +
+                "APPLICATION name resolved through app registration, and is " +
+                "the preferred launch identifier",
             "coordinates: image-space only, always with frameId + observationId",
             "check status + evidence in every action result",
             "re-observe after Stale/StaleFrame",
@@ -277,7 +368,8 @@ public static class InbriskResources
     /// as the full schema minus per-action field tables. ~6x smaller;
     /// computer_capabilities{detail:"full"} returns the complete schema.</summary>
     internal static string CapabilitiesJsonSlim(
-        ComputerControlActivityService? activity = null) => JsonSerializer.Serialize(new
+        ComputerControlActivityService? activity = null,
+        SessionDesktop? sessionDesktop = null) => JsonSerializer.Serialize(new
     {
         server = "inbrisk",
         version = typeof(InbriskResources).Assembly
@@ -285,6 +377,7 @@ public static class InbriskResources
             ?.InformationalVersion
             ?? typeof(InbriskResources).Assembly.GetName().Version?.ToString(),
         controlState = EmergencyControl.Process.State.ToString(),
+        sessionDesktop = sessionDesktop == null ? null : SessionDesktops.ToWire(sessionDesktop.Value),
         emergencyHotkey = EmergencyControl.Process.PanicHotkey,
         resumeHotkey = EmergencyControl.Process.ResumeHotkey,
         outputDetail =
@@ -322,10 +415,29 @@ public static class InbriskResources
             "find{as:\"x\"}/launch{as:\"x\"} → later steps use " +
             "elementId:\"$x\" or target:{within:\"$x\"}",
         coordinateSpace = "image-space only — always pass frameId + observationId",
+        // ownership is policy, not a nice-to-have: it must not depend on
+        // detail:"full". Slim carries the condensed ownership summary plus
+        // the two warnings that were missing from it entirely (ambiguous
+        // app names, batch field whitelist); the six numbered rules stay
+        // in full, which is what the agent side parses.
+        ownership = OwnershipSummary,
+        ambiguity = AmbiguityWarning,
+        batchStepFields =
+            "do(action)|t(target)|v(text,value)|role|hwnd|ms(waitFor)|" +
+            "submit|keys|continueOnError — an unknown field is NOT ignored, " +
+            "the whole batch is rejected Malformed and nothing runs",
         errors = ErrorVocabulary,
         usage = new[]
         {
-            "prefer elementIds over coordinates; prefer process over window title",
+            // the old line read "prefer process over window title", which
+            // collided head-on with launch's "app: friendly name —
+            // preferred". Scope the rule to window targeting and name the
+            // launch identifier as a different thing.
+            "prefer elementIds over coordinates; when TARGETING a window " +
+                "prefer process over window title (titles are localized) — " +
+                "computer_launch's app:\"Notepad\" is a friendly APPLICATION " +
+                "name (resolved via app registration, not the window title) " +
+                "and IS the preferred launch identifier",
             "verified actions return post-state — do not re-observe to confirm",
             "re-observe after Stale/StaleFrame",
             "full schema: computer_capabilities{detail:\"full\"} " +

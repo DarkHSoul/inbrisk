@@ -633,4 +633,15 @@ and drives it with the ghost agent's own mouse and keyboard.
   (multi-step plans executed inside the ghost session),
   `computer_ghost_control`, and `computer_ghost_stop`. Ghost actions never
   touch the interactive user's physical input.
+- **Session desktop mode** — which desktop a session drives is session state
+  (`McpSession.Desktop`, `SessionDesktop.Interactive | Ghost`), not a flag
+  repeated on every tool. `computer_session({mode})` sets it; the server flag
+  `--ghost` / `INBRISK_GHOST=1` sets it at startup. The per-call `ghost`
+  parameter that ghost-capable tools still accept is a one-call *override*
+  (`null` = follow the session), resolved by `McpSession.ResolveGhost`.
+  Switching drops every desktop-scoped handle — element ids, frame and
+  observation ids, find/inspect snapshots, the scope window, paused runs and
+  the delta baseline — and releases held input, because a handle minted on one
+  desktop names nothing on the other. Switching routes only; it never starts
+  the background session, so `computer_session` reports reachability.
 

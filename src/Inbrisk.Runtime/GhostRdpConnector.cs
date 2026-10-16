@@ -43,7 +43,7 @@ public class GhostRdpConnector
     /// <param name="width">Screen width in pixels (default: 1920).</param>
     /// <param name="height">Screen height in pixels (default: 1080).</param>
     /// <returns>The target file path.</returns>
-    public static string GenerateRdpConfig(string targetPath, int width = 1920, int height = 1080, string username = "InbriskAgent")
+    public static string GenerateRdpConfig(string targetPath, int width = 1920, int height = 1080, string username = "InbriskAgent", string? pathToInbrisk = null)
     {
         if (string.IsNullOrWhiteSpace(targetPath))
         {
@@ -56,13 +56,16 @@ public class GhostRdpConnector
             Directory.CreateDirectory(dir);
         }
 
+        pathToInbrisk ??= Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? Path.Combine(AppContext.BaseDirectory, "inbrisk.exe");
+        var workDir = Path.GetDirectoryName(pathToInbrisk) ?? string.Empty;
+
         var sb = new StringBuilder();
         sb.AppendLine("screen mode id:i:1");
         sb.AppendLine("use multimon:i:0");
         sb.AppendLine($"desktopwidth:i:{width}");
         sb.AppendLine($"desktopheight:i:{height}");
         sb.AppendLine("session bpp:i:32");
-        sb.AppendLine($"winposstr:s:0,1,0,0,{width},{height}");
+        sb.AppendLine($"winposstr:s:0,1,100,100,{Math.Min(width + 100, 1380)},{Math.Min(height + 100, 820)}");
         sb.AppendLine($"full address:s:{DefaultLoopbackAddress}:{DefaultRdpPort}");
         sb.AppendLine($"username:s:{username}");
         sb.AppendLine("compression:i:1");
@@ -80,15 +83,15 @@ public class GhostRdpConnector
         sb.AppendLine("negotiate security layer:i:1");
         sb.AppendLine("remoteapplicationmode:i:0");
         sb.AppendLine("allow font smoothing:i:1");
-        sb.AppendLine("alternate shell:s:");
-        sb.AppendLine("shell working directory:s:");
+        sb.AppendLine($"alternate shell:s:{pathToInbrisk} ghost-worker");
+        sb.AppendLine($"shell working directory:s:{workDir}");
         sb.AppendLine("gatewayhostname:s:");
         sb.AppendLine("gatewayusagemethod:i:0");
         sb.AppendLine("gatewaycredentialssource:i:4");
         sb.AppendLine("gatewayprofileusagemethod:i:0");
         sb.AppendLine("promptcredentialonce:i:0");
         sb.AppendLine("dvc_gfx:i:1");
-        sb.AppendLine("smart sizing:i:0");
+        sb.AppendLine("smart sizing:i:1");
 
         File.WriteAllText(targetPath, sb.ToString(), Encoding.ASCII);
         return targetPath;
@@ -232,12 +235,15 @@ public class GhostRdpConnector
             SetLoopbackCredentials(username, password);
         }
 
-        // 2. Check if user already has an active session
+        // 2. Check if user already has an active session AND client process is running
         var existing = GhostWtsInterop.FindSessionByUsername(username);
         if (existing != null && (existing.State == WTS_CONNECTSTATE_CLASS.WTSActive || existing.State == WTS_CONNECTSTATE_CLASS.WTSConnected))
         {
-            GhostTelemetry.RecordSessionStart();
-            return new GhostRdpSession(existing.SessionId, ProcessId: 0, Username: username);
+            if (TrackedProcesses.TryGetValue(existing.SessionId, out var p) && !p.HasExited)
+            {
+                GhostTelemetry.RecordSessionStart();
+                return new GhostRdpSession(existing.SessionId, ProcessId: p.Id, Username: username);
+            }
         }
 
         // 3. Verify Remote Desktop service is listening on 127.0.0.1:3389
@@ -272,8 +278,8 @@ public class GhostRdpConnector
                     Arguments = $"/v:{DefaultLoopbackAddress}:{DefaultRdpPort} /u:\"{username}\" " +
                                 (string.IsNullOrEmpty(password) ? "" : $"/p:\"{password}\" ") +
                                 $"/size:{width}x{height} /bpp:32 /cert:ignore +auto-reconnect /kbd:0x00000409",
-                    CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Hidden,
+                    CreateNoWindow = false,
+                    WindowStyle = ProcessWindowStyle.Normal,
                     UseShellExecute = false
                 };
                 process = Process.Start(psi);
@@ -293,7 +299,7 @@ public class GhostRdpConnector
                 {
                     FileName = mstscPath,
                     Arguments = $"\"{rdpPath}\"",
-                    WindowStyle = ProcessWindowStyle.Minimized,
+                    WindowStyle = ProcessWindowStyle.Normal,
                     UseShellExecute = true
                 };
                 process = Process.Start(psi);

@@ -478,7 +478,14 @@ public sealed class LaunchIntegrationTests
             Assert.True(sawLease, "launch never held an activity lease");
             Assert.True(seenActive.Task.IsCompleted,
                 "indicator never showed Active");
-            Assert.Equal("Timeout", r.Error); // launched but no window
+            // where.exe runs and exits without ever opening a window. The
+            // committed early-exit detection (WaitReady) classifies this
+            // precisely as Failed/"process exited before becoming ready"
+            // rather than burning the full readiness budget and reporting a
+            // misleading "may still be initializing" timeout.
+            Assert.False(r.Success);
+            Assert.Equal("Failed", r.Error);
+            Assert.Contains("exited before becoming ready", r.ErrorDetail);
         }
         finally
         {
@@ -528,7 +535,19 @@ public sealed class LaunchMcpTests
         => string.Join("\n", r.Content.OfType<TextContentBlock>().Select(t => t.Text));
 
     private static JsonDocument Json(CallToolResult r)
-        => JsonDocument.Parse(Text(r));
+    {
+        var t = Text(r).Trim();
+        if (t.StartsWith("<untrusted_content") && t.EndsWith("</untrusted_content>"))
+        {
+            var start = t.IndexOf('>') + 1;
+            var end = t.LastIndexOf("</untrusted_content>", StringComparison.Ordinal);
+            if (start > 0 && end > start)
+            {
+                t = t.Substring(start, end - start).Trim();
+            }
+        }
+        return JsonDocument.Parse(t);
+    }
 
     [Fact]
     public async Task Tool_Listed_And_Validates()

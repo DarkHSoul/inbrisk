@@ -755,25 +755,38 @@ public sealed class PhaseFRound2Tests
     [Fact]
     public void LaunchReadiness_ProcessExitsBeforeReady_ReturnsFailure()
     {
-        var winService = new DummyWindowService();
-        using var buffer = new RecentEventBuffer();
-        var telemetry = new ScopedSubscriptionTelemetry();
+        // Do NOT resolve by name here: on machines where the Store notepad is
+        // registered under App Paths (HKCU), the resolved identifier lives
+        // under .../WindowsApps/ and the committed stub/alias exemption skips
+        // the early-exit detection this test exercises. A scratch .exe via
+        // path: keeps resolution machine-independent; SpawnReal never runs
+        // because Spawner is overridden, so the file needs no real PE content.
+        var fakeExe = Path.Combine(Path.GetTempPath(),
+            $"inbrisk_launchtest_{Guid.NewGuid():N}.exe");
+        File.WriteAllText(fakeExe, "not a real PE — spawn is overridden");
+        try
+        {
+            var winService = new DummyWindowService();
+            using var buffer = new RecentEventBuffer();
+            var telemetry = new ScopedSubscriptionTelemetry();
 
-        var appService = new AppService(
-            winService,
-            uiaProbe: _ => true,
-            isDeniedProcess: _ => false,
-            eventBuffer: buffer,
-            telemetry: telemetry);
+            var appService = new AppService(
+                winService,
+                uiaProbe: _ => true,
+                isDeniedProcess: _ => false,
+                eventBuffer: buffer,
+                telemetry: telemetry);
 
-        var spec = new LaunchSpec("notepad.exe", Executable: "notepad.exe", WaitFor: "window", TimeoutMs: 1500);
-        appService.ProcessAliveChecker = _ => false;
-        appService.Spawner = (app, args) => 99999;
+            var spec = new LaunchSpec(Path: fakeExe, WaitFor: "window", TimeoutMs: 1500);
+            appService.ProcessAliveChecker = _ => false;
+            appService.Spawner = (app, args) => 99999;
 
-        var res = appService.Launch(spec);
+            var res = appService.Launch(spec);
 
-        Assert.False(res.Success);
-        Assert.Equal("Failed", res.LaunchState);
+            Assert.False(res.Success);
+            Assert.Equal("Failed", res.LaunchState);
+        }
+        finally { try { File.Delete(fakeExe); } catch { } }
     }
 
     [Fact]

@@ -31,4 +31,9 @@ public interface ITaskRecipeStore
     TaskRecipeDefinition? Get(string name);
     IReadOnlyList<TaskRecipeDefinition> List();
     void RecordRun(string name, bool success);
+
+    /// <summary>On-disk path a recipe of this name occupies (after
+    /// sanitization), whether or not the file exists yet. Storage-agnostic
+    /// stores may return a synthetic/unused path.</summary>
+    string PathFor(string name);
 }

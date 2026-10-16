@@ -44,10 +44,12 @@ public class GhostPipInteractiveInputTests
         public int Y { get; private set; } = 100;
         public int Width { get; private set; } = 480;
         public int Height { get; private set; } = 270;
+        public bool HasValidFrame { get; set; }
 
         public event Action<int, int>? PositionChanged;
         public event Action<int, int, int, int>? BoundsChanged;
         public event Action<PipInputEventArgs>? OnInteractiveInput;
+        public event Action<IntPtr, int, int>? Paint;
 
         public void SetClickThrough(bool enabled) => ClickThrough = enabled;
         public void SetOpacity(byte alpha) => Opacity = alpha;
@@ -225,5 +227,48 @@ public class GhostPipInteractiveInputTests
 
         Assert.NotNull(lastBounds);
         Assert.Equal((50, 60, 500, 300), lastBounds.Value);
+    }
+
+    [Fact]
+    public void GhostPipWindowHost_HasValidFrame_DefaultsFalseAndCanBeSet()
+    {
+        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+        {
+            return;
+        }
+
+        using var host = new Inbrisk.Platform.Windows.GhostPipWindowHost(width: 320, height: 180, initialOpacity: 255, clickThrough: true, autoStart: true);
+        Assert.True(host.WaitForReady(3000));
+        Assert.False(host.HasValidFrame);
+
+        host.SetValidFrame(true);
+        Assert.True(host.HasValidFrame);
+
+        // Verify that WS_EX_LAYERED (0x80000) is present even when opaque (initialOpacity == 255)
+        long exStyle = Inbrisk.Platform.Windows.Native.NativeMethods.GetWindowLongPtr(host.Hwnd, -20 /* GWL_EXSTYLE */).ToInt64();
+        Assert.NotEqual(0, exStyle & 0x80000 /* WS_EX_LAYERED */);
+        Assert.NotEqual(0, exStyle & 0x20 /* WS_EX_TRANSPARENT */);
+
+        // Toggle click-through to false and verify WS_EX_LAYERED is preserved
+        host.SetClickThrough(false);
+        Thread.Sleep(50);
+        long exStyleInteractive = Inbrisk.Platform.Windows.Native.NativeMethods.GetWindowLongPtr(host.Hwnd, -20).ToInt64();
+        Assert.NotEqual(0, exStyleInteractive & 0x80000 /* WS_EX_LAYERED */);
+        Assert.Equal(0, exStyleInteractive & 0x20 /* WS_EX_TRANSPARENT */);
+
+        // Toggle click-through back to true and verify WS_EX_LAYERED is still present
+        host.SetClickThrough(true);
+        Thread.Sleep(50);
+        long exStyleClickThrough = Inbrisk.Platform.Windows.Native.NativeMethods.GetWindowLongPtr(host.Hwnd, -20).ToInt64();
+        Assert.NotEqual(0, exStyleClickThrough & 0x80000 /* WS_EX_LAYERED */);
+        Assert.NotEqual(0, exStyleClickThrough & 0x20 /* WS_EX_TRANSPARENT */);
+    }
+
+    [Fact]
+    public void GhostPipRenderer_Repaint_HandlesNullHdcGracefully()
+    {
+        using var renderer = new GhostPipRenderer();
+        bool repainted = renderer.Repaint(IntPtr.Zero, 320, 180);
+        Assert.False(repainted);
     }
 }

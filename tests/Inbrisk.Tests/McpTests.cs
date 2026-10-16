@@ -37,6 +37,11 @@ public sealed class McpTests
                 ["INBRISK_RESUME_HOTKEY"] = "Ctrl+Alt+Shift+F12",
                 ["INBRISK_EMERGENCY_STATE"] = Path.Combine(Path.GetTempPath(),
                     $"inbrisk-mcptest-{Guid.NewGuid():N}.flag"),
+                // harness opt-in (parity with CLI --yes): approve CONFIRM-class
+                // actions so end-to-end flows exercise verification logic, not
+                // a human consent surface the child server never had. Deny/
+                // dangerous classes remain gated.
+                ["INBRISK_AUTOCONFIRM"] = "1",
             },
         });
         return await McpClient.CreateAsync(transport);
@@ -46,7 +51,28 @@ public sealed class McpTests
         => string.Join("\n", r.Content.OfType<TextContentBlock>().Select(t => t.Text));
 
     private static JsonDocument Json(CallToolResult r)
-        => JsonDocument.Parse(Text(r));
+    {
+        // F03: every tool-result text block crossing the MCP wire is wrapped
+        // in <untrusted_content …> (and a separate trusted confirmation
+        // notice block may precede or follow it). Unwrap the envelope from
+        // the first wrapped block — FindFirst Envelope — instead of assuming
+        // the whole text starts and ends with the tags (LaunchTests.cs does
+        // the same single-block unwrap).
+        var block = r.Content?.OfType<TextContentBlock>()
+            .FirstOrDefault(b => (b.Text ?? "").Trim()
+                .StartsWith("<untrusted_content", StringComparison.Ordinal))
+            ?? r.Content?.OfType<TextContentBlock>().FirstOrDefault();
+        var t = (block?.Text ?? "").Trim();
+
+        if (t.StartsWith("<untrusted_content", StringComparison.Ordinal))
+        {
+            var open = t.IndexOf('>');
+            var close = t.IndexOf("</untrusted_content>", StringComparison.Ordinal);
+            if (open >= 0 && close > open)
+                t = t.Substring(open + 1, close - open - 1).Trim();
+        }
+        return JsonDocument.Parse(t);
+    }
 
     [Fact]
     public async Task Initialize_And_ToolsList()
@@ -197,6 +223,10 @@ public sealed class McpTests
     [Fact]
     public async Task SemanticTarget_TypeAppend_ReturnsPostState()
     {
+        // this test addresses the window by TITLE, not by fixture hwnd — the
+        // shared fixture must be materialized first or TestApp may not be
+        // running at all (resolution would rightly fail with TargetNotFound)
+        var _ensureApp = _fx.Hwnd;
         await using var client = await ConnectAsync();
 
         // one call: semantic target → resolve → foreground → set → verify

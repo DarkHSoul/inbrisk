@@ -45,6 +45,11 @@ public sealed class EndToEndAndEdgeCaseTests : IDisposable
                 ["INBRISK_RESUME_HOTKEY"] = "Ctrl+Alt+Shift+F12",
                 ["INBRISK_EMERGENCY_STATE"] = Path.Combine(Path.GetTempPath(),
                     $"inbrisk-e2etest-{Guid.NewGuid():N}.flag"),
+                // harness opt-in (parity with CLI --yes): approve CONFIRM-class
+                // actions so end-to-end flows exercise verification logic, not
+                // a human consent surface the child server never had. Deny/
+                // dangerous classes remain gated.
+                ["INBRISK_AUTOCONFIRM"] = "1",
             },
         });
         return await McpClient.CreateAsync(transport);
@@ -55,7 +60,23 @@ public sealed class EndToEndAndEdgeCaseTests : IDisposable
 
     private static JsonDocument Json(CallToolResult r)
     {
-        var text = Text(r);
+        // F03: tool-result text blocks crossing the MCP wire are wrapped in
+        // <untrusted_content …>; a trusted confirmation-notice block may
+        // accompany them. Unwrap the first envelope and parse its payload.
+        var block = r.Content?.OfType<TextContentBlock>()
+            .FirstOrDefault(b => (b.Text ?? "").Trim()
+                .StartsWith("<untrusted_content", StringComparison.Ordinal))
+            ?? r.Content?.OfType<TextContentBlock>().FirstOrDefault();
+        var text = (block?.Text ?? "").Trim();
+
+        if (text.StartsWith("<untrusted_content", StringComparison.Ordinal))
+        {
+            var open = text.IndexOf('>');
+            var close = text.IndexOf("</untrusted_content>", StringComparison.Ordinal);
+            if (open >= 0 && close > open)
+                text = text.Substring(open + 1, close - open - 1).Trim();
+        }
+
         try
         {
             return JsonDocument.Parse(text);

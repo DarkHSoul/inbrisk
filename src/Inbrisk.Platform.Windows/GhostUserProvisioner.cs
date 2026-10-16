@@ -85,6 +85,18 @@ public static class GhostUserProvisioner
     [DllImport("kernel32.dll")]
     private static extern IntPtr LocalFree(IntPtr hMem);
 
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool LogonUser(
+        string lpszUsername,
+        string? lpszDomain,
+        string lpszPassword,
+        int dwLogonType,
+        int dwLogonProvider,
+        out IntPtr phToken);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct USER_INFO_1
     {
@@ -123,11 +135,25 @@ public static class GhostUserProvisioner
     private const int CRYPTPROTECT_UI_FORBIDDEN = 0x1;
     private const int CRYPTPROTECT_LOCAL_MACHINE = 0x4;
 
-    private static string SecretFilePath =>
+    private const int LOGON32_LOGON_NETWORK = 3;
+    private const int LOGON32_PROVIDER_DEFAULT = 0;
+
+    private const string LegacyGhostPasswordV2 = "Inbrisk#2026!G";
+    private const string LegacyGhostPasswordV1 = "InbriskGhost!2026#Agent";
+
+    public static string MachineSecretFilePath =>
         Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
             "Inbrisk",
             "ghost-user.cred");
+
+    public static string UserSecretFilePath =>
+        Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Inbrisk",
+            "ghost-user.cred");
+
+    private static string SecretFilePath => MachineSecretFilePath;
 
     /// <summary>
     /// Checks whether the specified local user account exists on the machine.
@@ -213,6 +239,53 @@ public static class GhostUserProvisioner
     }
 
     /// <summary>
+    /// Checks whether the current process is running with administrative privileges.
+    /// </summary>
+    public static bool IsAdministrator()
+    {
+        try
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            var principal = new WindowsPrincipal(identity);
+            return principal.IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Verifies whether the specified credentials authenticate successfully against the local machine.
+    /// Uses LogonUser with LOGON32_LOGON_NETWORK without requiring administrative privileges.
+    /// </summary>
+    public static bool VerifyUserCredential(string username, string password)
+    {
+        if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(password))
+        {
+            return false;
+        }
+
+        IntPtr token = IntPtr.Zero;
+        try
+        {
+            string cleanName = CleanUsername(username);
+            return LogonUser(cleanName, ".", password, LOGON32_LOGON_NETWORK, LOGON32_PROVIDER_DEFAULT, out token);
+        }
+        catch
+        {
+            return false;
+        }
+        finally
+        {
+            if (token != IntPtr.Zero)
+            {
+                CloseHandle(token);
+            }
+        }
+    }
+
+    /// <summary>
     /// Ensures that the local ghost user account exists, creating it if necessary.
     /// Account creation and password assignment go through NetUserAdd/NetUserSetInfo
     /// (netapi32) so the credential never appears on any process command line.
@@ -232,7 +305,22 @@ public static class GhostUserProvisioner
             // after the credential file was lost), so stored secret and account never diverge.
             if (!string.IsNullOrEmpty(password) || _secretWasRegenerated)
             {
-                return await Task.Run(() => SetUserPassword(cleanName, effectivePassword)).ConfigureAwait(false);
+                // When running as a non-administrator, NetUserSetInfo is guaranteed to fail with Access Denied (status 5).
+                // Do not fail account verification if the account already exists and we lack privileges.
+                if (!IsAdministrator())
+                {
+                    GhostLogger.Warn(
+                        $"[GhostUserProvisioner] Account '{cleanName}' already exists, but running without administrative privileges. " +
+                        "Skipping password reset to prevent Access Denied.");
+                    return true;
+                }
+
+                bool passwordSet = await Task.Run(() => SetUserPassword(cleanName, effectivePassword)).ConfigureAwait(false);
+                if (passwordSet)
+                {
+                    _secretWasRegenerated = false;
+                }
+                return passwordSet;
             }
             return true;
         }
@@ -267,9 +355,18 @@ public static class GhostUserProvisioner
 
             try
             {
-                if (File.Exists(SecretFilePath))
+                if (File.Exists(MachineSecretFilePath))
                 {
-                    File.Delete(SecretFilePath);
+                    File.Delete(MachineSecretFilePath);
+                }
+            }
+            catch { }
+
+            try
+            {
+                if (File.Exists(UserSecretFilePath))
+                {
+                    File.Delete(UserSecretFilePath);
                 }
             }
             catch { }
@@ -304,6 +401,11 @@ public static class GhostUserProvisioner
             }
             if (status == NERR_UserExists)
             {
+                if (!IsAdministrator())
+                {
+                    GhostLogger.Info($"[GhostUserProvisioner] User '{username}' already exists. Skipping password reset (non-administrator).");
+                    return true;
+                }
                 return SetUserPassword(username, password);
             }
 
@@ -327,7 +429,14 @@ public static class GhostUserProvisioner
             {
                 return true;
             }
-            GhostLogger.Warn($"[GhostUserProvisioner] NetUserSetInfo(password) failed for '{username}'. Status: {status}");
+            if (status == 5 /* ERROR_ACCESS_DENIED */)
+            {
+                GhostLogger.Warn($"[GhostUserProvisioner] NetUserSetInfo(password) failed for '{username}': Access Denied (status 5). Administrative privileges are required.");
+            }
+            else
+            {
+                GhostLogger.Warn($"[GhostUserProvisioner] NetUserSetInfo(password) failed for '{username}'. Status: {status}");
+            }
             return false;
         }
         catch (Exception ex)
@@ -444,17 +553,32 @@ public static class GhostUserProvisioner
         {
             bool existed = DoesUserExist(cleanName);
             bool ensured = await EnsureUserExistsAsync(cleanName).ConfigureAwait(false);
+
+            string groupName = GetRemoteDesktopGroupName();
+            bool isRdpMember = await Task.Run(() => IsUserInRemoteDesktopGroup(cleanName, groupName)).ConfigureAwait(false);
+
             if (!ensured)
             {
-                return GhostUserProvisionResult.Fail(
-                    cleanName,
-                    existed
-                        ? $"Failed to synchronize credentials for existing user '{cleanName}'. Administrative privileges may be required."
-                        : $"Failed to create local user account '{cleanName}'. Administrative privileges may be required.");
+                // Gracefully handle existing users: if the user already exists and is already
+                // in Remote Desktop Users, do not fail provisioning due to credential sync limitations.
+                if (existed && isRdpMember)
+                {
+                    GhostLogger.Info(
+                        $"[GhostUserProvisioner] User '{cleanName}' already exists and is a member of '{groupName}'. " +
+                        "Proceeding despite credential sync limitation.");
+                }
+                else
+                {
+                    return GhostUserProvisionResult.Fail(
+                        cleanName,
+                        existed
+                            ? $"Failed to synchronize credentials for existing user '{cleanName}'. Administrative privileges may be required."
+                            : $"Failed to create local user account '{cleanName}'. Administrative privileges may be required.");
+                }
             }
             bool createdNew = !existed;
 
-            bool rdpOk = await EnsureRemoteDesktopGroupAsync(cleanName).ConfigureAwait(false);
+            bool rdpOk = isRdpMember || await EnsureRemoteDesktopGroupAsync(cleanName).ConfigureAwait(false);
             if (!rdpOk)
             {
                 return GhostUserProvisionResult.Fail(
@@ -481,8 +605,8 @@ public static class GhostUserProvisioner
 
     /// <summary>
     /// Returns the per-machine ghost account password, generating and securely persisting
-    /// it on first use. Falls back to an in-memory-only secret when the credential store
-    /// is unavailable (provisioning itself requires elevation anyway).
+    /// it on first use. Falls back to user credential store or in-memory secret when the
+    /// machine credential store is unavailable.
     /// </summary>
     private static string GetOrCreateGhostPassword()
     {
@@ -494,6 +618,60 @@ public static class GhostUserProvisioner
             }
 
             string? stored = TryReadStoredPassword();
+            bool accountExists = DoesUserExist(DefaultGhostUsername);
+
+            if (accountExists)
+            {
+                // 1. If stored password exists and verifies against the existing Windows account, use it
+                if (!string.IsNullOrEmpty(stored) && VerifyUserCredential(DefaultGhostUsername, stored))
+                {
+                    _cachedGhostPassword = stored;
+                    GhostLogger.RegisterSecret(stored);
+                    return stored;
+                }
+
+                // 2. If stored secret was missing or out of sync, check known legacy default passwords
+                if (VerifyUserCredential(DefaultGhostUsername, LegacyGhostPasswordV2))
+                {
+                    GhostLogger.Info("[GhostUserProvisioner] Synchronized with existing ghost account credentials (legacy v2).");
+                    _cachedGhostPassword = LegacyGhostPasswordV2;
+                    GhostLogger.RegisterSecret(LegacyGhostPasswordV2);
+                    TryStorePassword(LegacyGhostPasswordV2);
+                    return LegacyGhostPasswordV2;
+                }
+
+                if (VerifyUserCredential(DefaultGhostUsername, LegacyGhostPasswordV1))
+                {
+                    GhostLogger.Info("[GhostUserProvisioner] Synchronized with existing ghost account credentials (legacy v1).");
+                    _cachedGhostPassword = LegacyGhostPasswordV1;
+                    GhostLogger.RegisterSecret(LegacyGhostPasswordV1);
+                    TryStorePassword(LegacyGhostPasswordV1);
+                    return LegacyGhostPasswordV1;
+                }
+
+                // 3. If stored password exists and we are Administrator, enforce it on the account
+                if (!string.IsNullOrEmpty(stored) && IsAdministrator())
+                {
+                    if (SetUserPassword(DefaultGhostUsername, stored))
+                    {
+                        _cachedGhostPassword = stored;
+                        GhostLogger.RegisterSecret(stored);
+                        return stored;
+                    }
+                }
+            }
+            else
+            {
+                // Account does not exist yet; if we already have a stored secret, preserve and use it
+                if (!string.IsNullOrEmpty(stored))
+                {
+                    _cachedGhostPassword = stored;
+                    GhostLogger.RegisterSecret(stored);
+                    return stored;
+                }
+            }
+
+            // Fallback: If stored password exists, return it
             if (!string.IsNullOrEmpty(stored))
             {
                 _cachedGhostPassword = stored;
@@ -533,10 +711,29 @@ public static class GhostUserProvisioner
 
     private static string? TryReadStoredPassword()
     {
+        // 1. Primary: machine-wide store (%ProgramData%)
+        string? stored = TryReadSecretFile(MachineSecretFilePath);
+        if (!string.IsNullOrEmpty(stored))
+        {
+            return stored;
+        }
+
+        // 2. Fallback: per-user store (%LOCALAPPDATA%)
+        stored = TryReadSecretFile(UserSecretFilePath);
+        if (!string.IsNullOrEmpty(stored))
+        {
+            return stored;
+        }
+
+        return null;
+    }
+
+    private static string? TryReadSecretFile(string path)
+    {
         try
         {
-            if (!File.Exists(SecretFilePath)) return null;
-            byte[] blob = File.ReadAllBytes(SecretFilePath);
+            if (!File.Exists(path)) return null;
+            byte[] blob = File.ReadAllBytes(path);
             byte[] plain = UnprotectBytes(blob);
             if (plain.Length == 0) return null;
             string password = Encoding.UTF8.GetString(plain);
@@ -555,7 +752,23 @@ public static class GhostUserProvisioner
             byte[] blob = ProtectBytes(Encoding.UTF8.GetBytes(password));
             if (blob.Length == 0) return;
 
-            string? dir = Path.GetDirectoryName(SecretFilePath);
+            // 1. Primary: Attempt machine-wide store in %ProgramData%
+            bool machineSuccess = TryStoreMachineSecret(blob);
+
+            // 2. Fallback: If machine store write fails (e.g. non-admin), persist to user store in %LOCALAPPDATA%
+            if (!machineSuccess)
+            {
+                TryStoreUserSecret(blob);
+            }
+        }
+        catch { }
+    }
+
+    private static bool TryStoreMachineSecret(byte[] blob)
+    {
+        try
+        {
+            string? dir = Path.GetDirectoryName(MachineSecretFilePath);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
             {
                 Directory.CreateDirectory(dir);
@@ -571,9 +784,14 @@ public static class GhostUserProvisioner
                 new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
                 FileSystemRights.FullControl,
                 AccessControlType.Allow));
+            // Grant Authenticated Users Read access so non-elevated Inbrisk instances can decrypt DPAPI LocalMachine secret
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null),
+                FileSystemRights.Read,
+                AccessControlType.Allow));
 
             using var stream = System.IO.FileSystemAclExtensions.Create(
-                new FileInfo(SecretFilePath),
+                new FileInfo(MachineSecretFilePath),
                 FileMode.Create,
                 FileSystemRights.FullControl,
                 FileShare.None,
@@ -581,8 +799,31 @@ public static class GhostUserProvisioner
                 FileOptions.None,
                 security);
             stream.Write(blob, 0, blob.Length);
+            return true;
         }
-        catch { }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryStoreUserSecret(byte[] blob)
+    {
+        try
+        {
+            string? dir = Path.GetDirectoryName(UserSecretFilePath);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            File.WriteAllBytes(UserSecretFilePath, blob);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static byte[] ProtectBytes(byte[] data)
@@ -595,25 +836,45 @@ public static class GhostUserProvisioner
         try
         {
             Marshal.Copy(data, 0, inBlob.pbData, data.Length);
-            if (!CryptProtectData(ref inBlob, "InbriskGhostUser", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+            // 1. Primary: DPAPI with Machine scope
+            if (CryptProtectData(ref inBlob, "InbriskGhostUser", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
                     CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN, out var outBlob))
             {
-                return Array.Empty<byte>();
-            }
-
-            try
-            {
-                var result = new byte[outBlob.cbData];
-                Marshal.Copy(outBlob.pbData, result, 0, outBlob.cbData);
-                return result;
-            }
-            finally
-            {
-                if (outBlob.pbData != IntPtr.Zero)
+                try
                 {
-                    LocalFree(outBlob.pbData);
+                    var result = new byte[outBlob.cbData];
+                    Marshal.Copy(outBlob.pbData, result, 0, outBlob.cbData);
+                    return result;
+                }
+                finally
+                {
+                    if (outBlob.pbData != IntPtr.Zero)
+                    {
+                        LocalFree(outBlob.pbData);
+                    }
                 }
             }
+
+            // 2. Fallback: DPAPI with CurrentUser scope if machine scope is unavailable
+            if (CryptProtectData(ref inBlob, "InbriskGhostUser", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero,
+                    CRYPTPROTECT_UI_FORBIDDEN, out outBlob))
+            {
+                try
+                {
+                    var result = new byte[outBlob.cbData];
+                    Marshal.Copy(outBlob.pbData, result, 0, outBlob.cbData);
+                    return result;
+                }
+                finally
+                {
+                    if (outBlob.pbData != IntPtr.Zero)
+                    {
+                        LocalFree(outBlob.pbData);
+                    }
+                }
+            }
+
+            return Array.Empty<byte>();
         }
         finally
         {

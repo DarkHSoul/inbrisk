@@ -17,7 +17,9 @@ public class TopologyTests
         Assert.NotNull(w);
         Assert.Equal(_fx.TestApp.Id, w.Pid);
         Assert.True(w.Bounds.Width > 0);
-        Assert.False(w.IsElevated);
+        // TestApp never elevates on its own; it mirrors the token of the
+        // test host, which may itself be running from an elevated shell
+        Assert.Equal(Environment.IsPrivilegedProcess, w.IsElevated);
         Assert.True(w.OnCurrentVirtualDesktop);
     }
 

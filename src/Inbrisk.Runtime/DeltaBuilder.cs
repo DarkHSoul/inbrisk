@@ -23,6 +23,16 @@ public static class DeltaBuilder
         var offscreen = new List<ObsElement>();
         var prunedByBudget = new List<ObsElement>();
 
+        // Pixel-derived elements (OCR words, vision detections) are
+        // re-recognized every pass. Recognition flickers on identical pixels
+        // whenever a caret blinks inside the frame — one pass finds the word,
+        // the next does not — so their transient absence/presence must not
+        // surface as Added/Removed loop noise. find/click keeps addressing
+        // them straight from the element list.
+        static bool PixelDerived(ObsElement e) =>
+            e.Source is "Ocr" or "Vision" ||
+            e.Id.StartsWith("ocr_", StringComparison.Ordinal);
+
         Dictionary<string, UiElement>? rawByKey = null;
         if (rawCurrent != null)
         {
@@ -34,7 +44,8 @@ public static class DeltaBuilder
 
         foreach (var (k, e) in curByKey)
         {
-            if (!prevByKey.TryGetValue(k, out var p)) { added.Add(e); continue; }
+            if (!prevByKey.TryGetValue(k, out var p))
+            { if (!PixelDerived(e)) added.Add(e); continue; }
             if (p.Name != e.Name || p.Value != e.Value || p.State != e.State
                 || !p.Bounds.Equals(e.Bounds))
                 changed.Add(e);
@@ -43,6 +54,7 @@ public static class DeltaBuilder
         foreach (var (k, e) in prevByKey)
         {
             if (curByKey.ContainsKey(k)) continue;
+            if (PixelDerived(e)) continue; // volatile pixel readback — not a real removal
 
             if (rawByKey != null && rawByKey.TryGetValue(k, out var rawEl))
             {

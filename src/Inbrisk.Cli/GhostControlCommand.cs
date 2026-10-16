@@ -70,7 +70,7 @@ public sealed record GhostControlOptions(
     byte? Opacity = null,
     float? Scale = null,
     int TargetFps = 60,
-    bool StartSession = true,
+    bool StartSession = false,
     bool ExtraSession = false,
     string Username = "InbriskAgent",
     string ControlPipeName = GhostControlCommand.DefaultControlPipeName,
@@ -90,7 +90,7 @@ public sealed record GhostControlOptions(
         byte? opacity = null;
         float? scale = null;
         int targetFps = 60;
-        bool startSession = true;
+        bool startSession = false;
         bool extraSession = false;
         string username = "InbriskAgent";
         string controlPipeName = GhostControlCommand.DefaultControlPipeName;
@@ -355,6 +355,13 @@ public sealed record GhostControlOptions(
             else if (a.Equals("--no-session", StringComparison.OrdinalIgnoreCase))
             {
                 startSession = false;
+            }
+
+            // Explicitly enable RDP session provisioning / connect
+            else if (a.Equals("--session", StringComparison.OrdinalIgnoreCase) ||
+                     a.Equals("--start-session", StringComparison.OrdinalIgnoreCase))
+            {
+                startSession = true;
             }
 
             // Allow explicit multi-session creation
@@ -671,7 +678,8 @@ public static class GhostControlCommand
         writer.WriteLine("  --fps <n>               Target frame refresh rate for rendering (default: 60)");
         writer.WriteLine();
         writer.WriteLine("General Options:");
-        writer.WriteLine("  --no-session            Launch PiP and System Tray without starting a new RDP session");
+        writer.WriteLine("  --session               Launch secondary RDP session (default: off to avoid single-session kick)");
+        writer.WriteLine("  --no-session            Launch PiP and System Tray without starting a new RDP session (default)");
         writer.WriteLine("  --extra-session         Force creating an additional secondary RDP session even if a desktop session is already running");
         writer.WriteLine("  --user <name>           Ghost desktop username (default: InbriskAgent)");
         writer.WriteLine("  --json                  Output status and responses formatted as JSON");
@@ -774,10 +782,10 @@ public static class GhostControlCommand
                 }
             }
 
-            // 1b. Secondary RDP Session (if explicitly requested via --extra-session)
-            if (options.ExtraSession && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            // 1b. Secondary RDP Session (enabled by default via StartSession, or explicitly via --extra-session)
+            if ((options.StartSession || options.ExtraSession) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                LogInfo($"Explicit secondary session requested (--extra-session). Checking Ghost desktop account ({options.Username})...", options);
+                LogInfo($"Starting Ghost OS session for account ({options.Username})...", options);
                 sessionManager = new GhostSessionManager();
 
                 try

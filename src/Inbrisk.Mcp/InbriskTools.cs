@@ -102,6 +102,17 @@ public sealed class InbriskTools
         $"computer control stopped by local hotkey; only the local user can " +
         $"resume with {_s.Control.ResumeHotkey}";
 
+    /// <summary>Schema text for the per-call desktop override. Kept as an
+    /// override, not the mechanism: the session picks its desktop once via
+    /// computer_session({mode}), and every tool follows it silently.</summary>
+    private const string GhostOverrideDoc =
+        "override the session desktop for this call only — omit to follow " +
+        "computer_session({mode:\"interactive\"|\"ghost\"})";
+
+    /// <summary>Effective ghost routing for one call: an explicit per-call
+    /// value wins, otherwise the session's desktop decides.</summary>
+    private bool GhostOn(bool? perCall) => _s.ResolveGhost(perCall);
+
     // ------------------------------------------------------------ perception
 
     [McpServerTool(Name = "computer_observe"), Description(
@@ -123,8 +134,14 @@ public sealed class InbriskTools
         [Description("draw numbered marks on attached frames at clickable element centers; mark i = the i-th element in the printed list")] bool? marks = null,
         [Description("collapse passive UIA nodes (unnamed, non-actionable panes/groups/images) — default on for slim, off for full")] bool? prune = null,
         [Description("append an OCR word overlay for the observed window: ocr:<hwnd>:<idx> ids usable as elementIds in find/click — for UIA-less windows (games, canvas apps)")] bool? ocr = null,
+        [Description(GhostOverrideDoc)] bool? ghost = null,
         CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            return await _s.GhostCoordinator.ObserveAsync(mode, hwnd, detail, maxElements, ct).ConfigureAwait(false);
+        }
+
         if (BadDetail(detail) is { } bd) return bd;
         if (_s.PrevOutcome?.Kind == OutcomeKind.Verified)
         {
@@ -202,6 +219,10 @@ public sealed class InbriskTools
                 sb.AppendLine($"⚠️ MODAL / SYSTEM POPUP ACTIVE: 0x{blocker.Hwnd:X} \"{blocker.Title}\" ({blocker.ProcessName})");
                 sb.AppendLine($"   The desktop is currently BLOCKED by this popup/flyout! Dismiss it first (e.g. press Escape via computer_hotkey 'Escape' or click its controls) before interacting with background windows.");
             }
+            // orientation header is always emitted — clients (and the
+            // end-to-end tests) key on the active window's identity, and a
+            // modal blocker line above still reads correctly with it present
+            sb.AppendLine($"active window: 0x{o.ActiveWindow.Hwnd:X} \"{o.ActiveWindow.Title}\" ({o.ActiveWindow.Process})");
         }
         else sb.AppendLine("active window: (none)");
 
@@ -358,8 +379,15 @@ public sealed class InbriskTools
         "not [minimized], and assigned to a visible monitor, prefer non-disruptive inspection (computer_inspect, computer_find, " +
         "or computer_screenshot with monitor index) without stealing user focus. " +
         "Windows matching the input-blocking signature are marked [INPUT-BLOCKING]; modal popups/dialogs and blocked windows are explicitly flagged.")]
-    public CallToolResult Windows(CancellationToken ct = default)
+    public CallToolResult Windows(
+        [Description(GhostOverrideDoc)] bool? ghost = null,
+        CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            return _s.GhostCoordinator.WindowsAsync(ct).GetAwaiter().GetResult();
+        }
+
         if (_s.Deduplicator.TryDeduplicateRead("computer_windows", "", 0, _s.Rt.MutationVersion, _s.Telemetry) is { } cachedWin)
             return cachedWin;
 
@@ -466,8 +494,23 @@ public sealed class InbriskTools
                 return true;
             }
         }
-        if (_s.Rt.Provenance.CanAgentClose(win.Hwnd, out _))
+
+        // Untracked-but-relevant window: this is an OWNERSHIP probe (used for
+        // selection/adopt/cleanup hints), NOT the close policy gate — every
+        // close site checks IsWindowProtected separately, so do not channel
+        // CanAgentClose (protection + ownership merged) through this predicate.
+        // Same strict evidence CanAgentClose accepts for ownership:
+        //   1. the exact hwnd named by a verified agent launch, or
+        //   2. a window whose live PID is a VERIFIED agent launch (a
+        //      replacement window of a process the agent spawned — pre-existing
+        //      apps with the same name are never matched).
+        if (_s.Rt.Provenance.GetStrictWindowOwnership(win.Hwnd) == StrictWindowOwnership.Agent)
             return true;
+        if (_s.Rt.Provenance.TryGetVerifiedAgentProcessForHwnd(win.Hwnd, out var hwndOwner) &&
+            hwndOwner != null)
+        {
+            return true;
+        }
         return false;
     }
 
@@ -1210,14 +1253,46 @@ public sealed class InbriskTools
         var wins = _s.Rt.Windows();
         var fgHwnd = _s.Rt.ForegroundWindow()?.Hwnd;
 
-        return wins
+        var byProc = wins
             .Select(w => (Window: w, Score: ScoreProcessMatch(w.ProcessName, process)))
             .Where(x => x.Score > 0)
             .OrderByDescending(x => x.Score)
             .ThenByDescending(x => x.Window.Hwnd == fgHwnd ? 1 : 0)
             .ThenByDescending(x => !string.IsNullOrWhiteSpace(x.Window.Title) ? 1 : 0)
-            .Select(x => x.Window)
+            .Select(x => (WindowInfo?)x.Window)
             .FirstOrDefault();
+        if (byProc != null) return byProc;
+
+        // Host-managed apps report the host runtime as the process name of
+        // every window they open (dotnet host → "dotnet", python host →
+        // "python"). The app identity callers name — the managed assembly
+        // ("Inbrisk.TestApp") — is not in any ProcessName; it lives in the
+        // window title. Fall back to normalized title-identity matching so
+        // process-scoped targets still resolve for those apps.
+        var normQuery = NormalizeAppIdentity(process);
+        if (normQuery.Length == 0) return null;
+        return wins
+            .Where(w => !string.IsNullOrWhiteSpace(w.Title))
+            .Select(w => (Window: w, Score: ScoreAppIdentity(w.Title, normQuery)))
+            .Where(x => x.Score > 0)
+            .OrderByDescending(x => x.Score)
+            .ThenByDescending(x => x.Window.Hwnd == fgHwnd ? 1 : 0)
+            .Select(x => (WindowInfo?)x.Window)
+            .FirstOrDefault();
+    }
+
+    /// <summary>App identity normalization: letters/digits only, lowercased —
+    /// "Inbrisk.TestApp", "Inbrisk-TestApp" and "InbriskTestApp" all collapse
+    /// to the same token.</summary>
+    private static string NormalizeAppIdentity(string s)
+        => new(s.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
+
+    private static int ScoreAppIdentity(string title, string normQuery)
+    {
+        var normTitle = NormalizeAppIdentity(title);
+        return normTitle.Length > 0 && normTitle.Contains(normQuery, StringComparison.Ordinal)
+            ? 70
+            : 0;
     }
 
     [McpServerTool(Name = "computer_reset_input"), Description(
@@ -1272,8 +1347,12 @@ public sealed class InbriskTools
             }
             catch (TimeoutException)
             {
-                // Timed out waiting for active lease: classify as hung and proceed with recovery sweep
-                arbiter.CancelTask(activePhysical.OwnerId, "reset_input timed out waiting for physical lease");
+                // Do NOT cancel the owner. A lease that has not expired and is
+                // still marked active is a HEALTHY operation that merely runs
+                // longer than our 5s wait; cancelling it is a denial-of-service
+                // lever for any caller of reset_input. Proceed with the
+                // release-only sweep without holding a lease instead.
+                Debug.WriteLine("reset_input timed out waiting for a healthy physical lease; proceeding without cancelling it.");
                 isRecoveryBypass = true;
             }
         }
@@ -1507,8 +1586,15 @@ public sealed class InbriskTools
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         [Description("optional specialist adapter to wire at launch — \"blender\" force-enables the bpy socket bridge injection; \"none\" disables auto-injection")] string? adapter = null,
         [Description("auto-inject the adapter bridge script when a supported app is detected (default true for Blender); false launches plain")] bool? bridge = null,
+        [Description(GhostOverrideDoc)] bool? ghost = null,
         CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            return await _s.GhostCoordinator.LaunchAsync(
+                app, search, executable, path, aumid, uri, arguments, workingDir: null, ct).ConfigureAwait(false);
+        }
+
         var normArgs = $"{app}|{search}|{executable}|{path}|{aumid}|{uri}|{string.Join(",", arguments ?? Array.Empty<string>())}|{newInstance}|{waitFor}|{timeoutMs}|{debugPort}|{then?.Length}|{adapter}|{bridge}";
         if (_s.Deduplicator.TryDeduplicateMutation(operationId, "computer_launch", normArgs, _s.Telemetry, out var conflictError) is { } deduped)
             return deduped;
@@ -1708,6 +1794,24 @@ public sealed class InbriskTools
         );
         bool alreadyRunning = !agentOwned || r.LaunchState == "AlreadyRunning";
 
+        // Who owns the window the caller is about to interact with.
+        // "agent" means THIS call created it (positive creation
+        // evidence: new pid + new hwnd + start time after the pre-launch
+        // snapshot). "user" covers every other case — most importantly a
+        // reused ExistingInstance window, which may hold unsaved user
+        // content. Without this field the caller had to re-derive it from
+        // `method`/`launchState`, and the two are not equivalent: a
+        // non-AlreadyRunning launch can still fail the evidence check.
+        var ownership = agentOwned && r.LaunchState != "AlreadyRunning" ? "agent" : "user";
+        var ownershipReason = ownership == "agent"
+            ? "created by this launch call"
+            : r.LaunchState == "AlreadyRunning" || r.Method == LaunchMethod.ExistingInstance
+                ? $"reused a running window via {r.Method} — it predates this " +
+                  "task and may hold unsaved user content; treat it as " +
+                  "read-mostly, do not overwrite what is there, and do not close it"
+                : "creation evidence was not conclusive — treated as a " +
+                  "pre-existing user window";
+
         IAsyncDisposable? targetBarrier = null;
         if (targetPid > 0 && _s?.Rt?.ReadScheduler != null)
         {
@@ -1723,6 +1827,10 @@ public sealed class InbriskTools
         {
             if (targetHwnd != 0)
             {
+                if (!GhostOn(ghost))
+                {
+                    _s.Rt.Focus(targetHwnd);
+                }
                 _s.ScopeHwnd = targetHwnd;
                 _s.LastLaunchTimestamp = DateTimeOffset.UtcNow;
                 _s.LastLaunchedHwnd = targetHwnd;
@@ -1849,13 +1957,16 @@ public sealed class InbriskTools
             ["continuation"] = continuationOutcome,
             ["launchState"] = r.LaunchState,
             ["alreadyRunning"] = r.LaunchState == "AlreadyRunning",
+            ["ownership"] = ownership,
+            ["ownershipReason"] = ownershipReason,
             // injected --python only takes effect when a new process was
             // actually spawned — a reused AlreadyRunning window never saw
             // the args, so don't claim the bridge is live there
             ["adapterBridge"] = r.LaunchState == "AlreadyRunning"
                 ? null : adapterBridge,
             ["note"] = r.LaunchState == "AlreadyRunning"
-                ? "already open — reused the running window" : null,
+                ? "already open — reused the running window (ownership: user)"
+                : null,
             ["durationMs"] = r.LaunchMs + r.ReadyMs,
             ["launchMs"] = r.LaunchMs,
             ["readyMs"] = r.ReadyMs,
@@ -2594,8 +2705,14 @@ public sealed class InbriskTools
         [Description("output verbosity: slim|full — default from INBRISK_DETAIL or settings.json outputDetail")] string? detail = null,
         [Description("group rows/items relationally with their child actions and labels — ideal for lists/tables")] bool relational = false,
         [Description("batch list of window handles to inspect in one call (max 16)")] string[]? hwnds = null,
+        [Description(GhostOverrideDoc)] bool? ghost = null,
         CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            return await _s.GhostCoordinator.InspectAsync(hwnd, elementId, detail, maxElements, ct).ConfigureAwait(false);
+        }
+
         if (target.HasValue)
         {
             if (target.Value.ValueKind == JsonValueKind.String)
@@ -3036,8 +3153,18 @@ public sealed class InbriskTools
         [Description("window-relative y (see rx)")] int? ry = null,
         [Description("coordinate space for x,y: \"screen\" (default, absolute desktop px) | \"window\" (x,y are offsets from the anchor window's top-left)")] string? relativeTo = null,
         [Description("deliver via background window message instead of synthesized input — no focus theft, works on unfocused windows. Requires a control element target; coordinate/OCR-point and unsupported kinds fail NotSupported — never a SendInput fallback")] bool? silent = null,
+        [Description(GhostOverrideDoc)] bool? ghost = null,
         CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            int? clickX = rx ?? x ?? target?.X;
+            int? clickY = ry ?? y ?? target?.Y;
+            bool isDouble = string.Equals(button, "double", StringComparison.OrdinalIgnoreCase);
+            return await _s.GhostCoordinator.ClickAsync(
+                clickX, clickY, button, isDouble, elementId, target, ct).ConfigureAwait(false);
+        }
+
         _s.Telemetry.IncSequentialSingleAction();
         Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
 
@@ -3207,8 +3334,14 @@ public sealed class InbriskTools
         [Description("piggyback scoped observation of the resulting UI state (zero-turn feedback)")] bool observe = false,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         [Description("deliver the text via window message (WM_SETTEXT/EM_REPLACESEL) instead of keystrokes — no focus theft. Requires an element target and mode replace|append; caret-level insert and submit have no message-only equivalent and fail NotSupported")] bool? silent = null,
+        [Description(GhostOverrideDoc)] bool? ghost = null,
         CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            return await _s.GhostCoordinator.TypeAsync(text, submit, ct).ConfigureAwait(false);
+        }
+
         _s.Telemetry.IncSequentialSingleAction();
         Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
         var normArgs = $"{text}|{elementId}|{target?.ToString()}|{mode}|{position}|{submit}|{observe}|{silent}";
@@ -3434,8 +3567,15 @@ public sealed class InbriskTools
         [Description("snake_case alias of enableReflex")] bool? enable_reflex = null,
         [Description("auto-dismiss policy for save-confirmation modals: off|save|discard|closeOnly (default closeOnly)")] string? autoDismissModals = null,
         [Description("snake_case alias of autoDismissModals")] string? auto_dismiss_modals = null,
+        [Description(GhostOverrideDoc)] bool? ghost = null,
         CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            return await _s.GhostCoordinator.ComputerDoAsync(
+                app, click, type, hotkey, submit, target, waitMs, ct).ConfigureAwait(false);
+        }
+
         _s.Telemetry.ResetSequentialSingleAction();
         var recipeName = saveAsRecipe ?? save_as_recipe;
         var reflexOn = enableReflex ?? enable_reflex;
@@ -3538,8 +3678,17 @@ public sealed class InbriskTools
         [Description("auto-dismiss policy for save-confirmation modals: off|save|discard|closeOnly (default closeOnly)")] string? autoDismissModals = null,
         [Description("snake_case alias of autoDismissModals")] string? auto_dismiss_modals = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
+        [Description(GhostOverrideDoc)] bool? ghost = null,
         CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            return await _s.GhostCoordinator.BatchAsync(
+                steps, set, until, read, detail, failFast ?? fail_fast,
+                autoDismissModals ?? auto_dismiss_modals,
+                timeoutMs: null, operationId, ct).ConfigureAwait(false);
+        }
+
         _s.Telemetry.ResetSequentialSingleAction();
         var reflexOn = enableReflex ?? enable_reflex;
         var dismissModals = autoDismissModals ?? auto_dismiss_modals;
@@ -4175,6 +4324,10 @@ public sealed class InbriskTools
     {
         if (string.IsNullOrWhiteSpace(name))
             return Task.FromResult(Error(OutcomeKind.Malformed, "recipe name is required"));
+        if (TaskRecipeStore.SanitizeName(name) is null)
+            return Task.FromResult(Error(OutcomeKind.Malformed,
+                $"recipe name '{name}' has no filename-usable characters — " +
+                $"disambiguate it (e.g. 'spotify_add_to_playlist') and retry"));
 
         // F11: persisting recipes mutates user state — honour the latched
         // emergency stop like every other mutating tool.
@@ -8399,6 +8552,65 @@ public sealed class InbriskTools
         CancellationToken ct = default)
         => Act(new AgentAction(AgentActionKind.WaitForStable, Ms: ms), ct);
 
+    [McpServerTool(Name = "computer_session"), Description(
+        "Read or switch the desktop this session drives. mode:\"ghost\" routes the " +
+        "ghost-capable computer_* tools to the isolated background desktop " +
+        "(Session 2 / PiP) — no focus theft, no physical cursor movement; " +
+        "mode:\"interactive\" (the default) drives the user's live desktop. Omit " +
+        "mode to just read the current one. The mode is honored by " +
+        "computer_observe, computer_windows, computer_launch, computer_inspect, " +
+        "computer_click, computer_type, computer_do, computer_batch and " +
+        "computer_screenshot; every other tool (computer_run, computer_hotkey, " +
+        "computer_key, computer_find, computer_read, computer_scroll, " +
+        "computer_drag, browser_*) still acts on the interactive desktop — " +
+        "compose those steps into computer_batch or computer_do, which are routed. " +
+        "Switching invalidates desktop-scoped state (element ids, frame ids, " +
+        "find/inspect snapshots, scope window, paused runs) and releases held input, " +
+        "so re-observe after switching. Switching does NOT start the ghost desktop — " +
+        "the returned ghostSession block reports whether it is actually reachable.")]
+    public async Task<CallToolResult> Session(
+        [Description("interactive|ghost — target desktop for the rest of the session; omit to read the current mode")] string? mode = null,
+        CancellationToken ct = default)
+    {
+        var previous = _s.Desktop;
+        if (!string.IsNullOrWhiteSpace(mode))
+        {
+            if (!SessionDesktops.TryParse(mode, out var target))
+                return Error(OutcomeKind.Malformed,
+                    $"unknown session desktop '{mode}' — use \"interactive\" or \"ghost\"");
+            _s.SetDesktop(target);
+        }
+
+        var report = new Dictionary<string, object?>
+        {
+            ["sessionId"] = _s.SessionId,
+            ["desktop"] = SessionDesktops.ToWire(_s.Desktop),
+            ["changed"] = _s.Desktop != previous,
+            ["previous"] = SessionDesktops.ToWire(previous),
+        };
+        if (_s.OnGhostDesktop)
+        {
+            // Reachability is the one thing the caller cannot infer: the
+            // switch only routes, it never starts the background session.
+            try
+            {
+                var status = await _s.GhostBridge.GetSessionStatusAsync(ct).ConfigureAwait(false);
+                report["ghostSession"] = new
+                {
+                    active = status.IsActive,
+                    state = status.State,
+                    sessionId = status.SessionId,
+                    uptimeSeconds = (long)status.Uptime.TotalSeconds,
+                };
+            }
+            catch (Exception ex)
+            {
+                report["ghostSession"] = new { active = false, state = "Unreachable", error = ex.Message };
+            }
+        }
+        return Text(JsonSerializer.Serialize(report));
+    }
+
     [McpServerTool(Name = "computer_capabilities"), Description(
         "Machine-readable Inbrisk reference: every tool's contract, the " +
         "computer_run step schema with per-action fields and aliases, the " +
@@ -8412,8 +8624,8 @@ public sealed class InbriskTools
     {
         if (BadDetail(detail) is { } bd) return bd;
         return Text(Slim(detail)
-            ? InbriskResources.CapabilitiesJsonSlim(_s.Rt.Activity)
-            : InbriskResources.CapabilitiesJson(_s.Rt.Activity));
+            ? InbriskResources.CapabilitiesJsonSlim(_s.Rt.Activity, _s.Desktop)
+            : InbriskResources.CapabilitiesJson(_s.Rt.Activity, _s.Desktop));
     }
 
     // ------------------------------------------------------------ Desktop Shell & UI
@@ -8527,6 +8739,7 @@ public sealed class InbriskTools
         [Description("friendly application name to restart (e.g. \"notepad\")")] string? app = null,
         [Description("process name of the app to restart")] string? process = null,
         [Description("explicitly restart the Inbrisk SERVER itself (default false)")] bool server = false,
+        [Description("force hard-kill the target if it will not close gracefully — only when the user explicitly asked to restart this app (default false)")] bool force = false,
         CancellationToken ct = default)
     {
         // P1/F11: restart closes and re-spawns processes — it must honour the
@@ -8574,7 +8787,10 @@ public sealed class InbriskTools
 
         var targetApp = app ?? process!;
         // Graceful close
-        await CloseWindow(process: targetApp, force: true, ct: ct);
+        // Do NOT force-kill by default: force hard-terminates a process the
+        // user may own. Only when the caller explicitly asked for a forced
+        // restart does this pass through to CloseWindow's force path.
+        await CloseWindow(process: targetApp, force: force, ct: ct);
         await Task.Delay(500, ct);
         // Relaunch
         return await Launch(app: targetApp, ct: ct);
@@ -8754,8 +8970,14 @@ public sealed class InbriskTools
         [Description("cap image width in px — wider captures are downscaled (bilinear); image-space coordinates still map back via frameId")] int? maxWidth = null,
         [Description("snake_case alias of maxWidth")] int? max_width = null,
         [Description("draw numbered marks at clickable element centers (window/element targets only); marks are listed in the result text")] bool marks = false,
+        [Description(GhostOverrideDoc)] bool? ghost = null,
         CancellationToken ct = default)
     {
+        if (GhostOn(ghost))
+        {
+            return _s.GhostCoordinator.ScreenshotAsync(ct).GetAwaiter().GetResult();
+        }
+
         try
         {
             if (_s.Control.ActionToken() == null)

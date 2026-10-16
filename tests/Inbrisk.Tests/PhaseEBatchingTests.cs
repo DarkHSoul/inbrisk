@@ -694,7 +694,7 @@ public class PhaseEBatchingTests
     [Fact]
     public void ToolsList_CatalogSize_WithinRound1Budget()
     {
-        Assert.Equal(25, McpHost.CoreTools.Count);
+        Assert.Equal(26, McpHost.CoreTools.Count);
         Assert.Contains("computer_read", McpHost.CoreTools);
 
         const int baselineBytes = 56499;

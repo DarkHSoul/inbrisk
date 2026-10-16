@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 namespace Inbrisk.Runtime;
@@ -101,6 +102,30 @@ public sealed class GhostPipRenderer : IDisposable
         [DllImport("user32.dll")]
         public static extern bool IsIconic(IntPtr hWnd);
 
+        [DllImport("user32.dll")]
+        public static extern bool InvalidateRect(IntPtr hWnd, IntPtr lpRect, bool bErase);
+
+        [DllImport("user32.dll")]
+        public static extern bool ValidateRect(IntPtr hWnd, IntPtr lpRect);
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern IntPtr OpenDesktopW(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool SetThreadDesktop(IntPtr hDesktop);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool CloseDesktop(IntPtr hDesktop);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+        public static extern IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        public static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
         [DllImport("gdi32.dll")]
         public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
 
@@ -124,6 +149,12 @@ public sealed class GhostPipRenderer : IDisposable
 
         [DllImport("gdi32.dll")]
         public static extern bool BitBlt(IntPtr hdc, int x, int y, int cx, int cy, IntPtr hdcSrc, int x1, int y1, uint rop);
+
+        [DllImport("gdi32.dll")]
+        public static extern bool StretchBlt(
+            IntPtr hdcDest, int xDest, int yDest, int wDest, int hDest,
+            IntPtr hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc,
+            uint rop);
 
         [DllImport("gdi32.dll", SetLastError = true)]
         public static extern int StretchDIBits(
@@ -202,6 +233,8 @@ public sealed class GhostPipRenderer : IDisposable
     private double _fps;
     private readonly Stopwatch _fpsStopwatch = Stopwatch.StartNew();
     private int _fpsCounter;
+    private volatile bool _forceRepaint;
+    private bool _lastRenderedInteractive;
 
     // Cached GDI offscreen resources for double-buffering
     private IntPtr _cachedHdcMem = IntPtr.Zero;
@@ -252,8 +285,11 @@ public sealed class GhostPipRenderer : IDisposable
             if (_isInteractive != value)
             {
                 _isInteractive = value;
-                _lastFrameIndex = -1;
-                DrawStandbyFrame();
+                _forceRepaint = true;
+                if (!RenderLatestFrameNow() && _totalRenderedFrames == 0)
+                {
+                    DrawStandbyFrame();
+                }
             }
         }
     }
@@ -373,6 +409,7 @@ public sealed class GhostPipRenderer : IDisposable
                 return false;
             }
 
+            _forceRepaint = true;
             EnsureSharedMemoryConnected();
             return TryRenderFrameFromSharedMemory();
         }
@@ -447,6 +484,10 @@ public sealed class GhostPipRenderer : IDisposable
 
     private void RenderLoop()
     {
+        // Ensure background render thread is bound to user interactive desktop (WinSta0\Default)
+        // so GetDC, StretchDIBits, and BitBlt operate seamlessly across isolated desktop sessions.
+        TrySwitchThreadDesktopToDefault();
+
         var intervalWatch = Stopwatch.StartNew();
 
         while (_isRunning)
@@ -492,12 +533,18 @@ public sealed class GhostPipRenderer : IDisposable
                 bool frameRendered = false;
                 if (_mappedView != IntPtr.Zero)
                 {
-                    frameRendered = TryRenderFrameFromSharedMemory();
+                    lock (_syncRoot)
+                    {
+                        frameRendered = TryRenderFrameFromSharedMemory();
+                    }
                 }
 
                 if (!frameRendered && _totalRenderedFrames == 0)
                 {
-                    DrawStandbyFrame();
+                    lock (_syncRoot)
+                    {
+                        DrawStandbyFrame();
+                    }
                 }
             }
             catch (ThreadInterruptedException)
@@ -578,8 +625,20 @@ public sealed class GhostPipRenderer : IDisposable
 
         long frameIndex = Marshal.ReadInt64(slotBase, 16);
 
-        // Ekran değişmediğinde gereksiz repaint yapmayan lastFrameIndex kontrolü
-        if (frameIndex == _lastFrameIndex)
+        // Detect if window geometry changed, interactive mode changed, or repaint was forced
+        bool sizeOrModeChanged = _forceRepaint || (_lastRenderedInteractive != _isInteractive);
+        if (!sizeOrModeChanged && _targetHwnd != IntPtr.Zero && Native.GetClientRect(_targetHwnd, out RECT rcWin))
+        {
+            int curW = rcWin.Right - rcWin.Left;
+            int curH = rcWin.Bottom - rcWin.Top;
+            if (curW > 2 && curH > 2 && (_cachedWidth != curW || _cachedHeight != curH))
+            {
+                sizeOrModeChanged = true;
+            }
+        }
+
+        // Ekran degismediginde ve geometri/mod degismediginde gereksiz repaint yapmayan lastFrameIndex kontrolu
+        if (frameIndex == _lastFrameIndex && !sizeOrModeChanged)
         {
             return false;
         }
@@ -593,7 +652,7 @@ public sealed class GhostPipRenderer : IDisposable
         // Torn-read / corruption guard: never let header values carry the
         // copy past the mapped slot (pixel data starts at slot offset 64).
         if (width <= 0 || height <= 0 || stride <= 0 || dataLength <= 0
-            || slotCapacity <= 64 || dataLength > slotCapacity - 64
+            || slotCapacity <= 0 || dataLength > slotCapacity
             || stride < (long)width * 4 || dataLength > (long)stride * height)
         {
             return false;
@@ -611,6 +670,8 @@ public sealed class GhostPipRenderer : IDisposable
         if (rendered && seq1 == seq2)
         {
             _lastFrameIndex = frameIndex;
+            _lastRenderedInteractive = _isInteractive;
+            _forceRepaint = false;
             return true;
         }
 
@@ -685,6 +746,8 @@ public sealed class GhostPipRenderer : IDisposable
 
             // Composite final frame atomically to window DC with zero flicker
             Native.BitBlt(hdcWin, 0, 0, destWidth, destHeight, _cachedHdcMem, 0, 0, SRCCOPY);
+            Native.ValidateRect(_targetHwnd, IntPtr.Zero);
+            TryNotifyHostValidFrame();
 
             // Update performance statistics
             Interlocked.Increment(ref _totalRenderedFrames);
@@ -871,6 +934,127 @@ public sealed class GhostPipRenderer : IDisposable
         _cachedHeight = 0;
     }
 
+    /// <summary>
+    /// Repaints the cached frame directly onto the target device context.
+    /// Used for WM_PAINT callbacks or external paint hooks.
+    /// </summary>
+    /// <param name="hdcDest">Target device context.</param>
+    /// <param name="width">Target width.</param>
+    /// <param name="height">Target height.</param>
+    /// <returns>True if frame was repainted; otherwise false.</returns>
+    public bool Repaint(IntPtr hdcDest, int width, int height)
+    {
+        if (hdcDest == IntPtr.Zero || width <= 0 || height <= 0)
+        {
+            return false;
+        }
+
+        lock (_syncRoot)
+        {
+            if (_cachedHdcMem != IntPtr.Zero && _cachedWidth > 0 && _cachedHeight > 0)
+            {
+                if (width == _cachedWidth && height == _cachedHeight)
+                {
+                    return Native.BitBlt(hdcDest, 0, 0, width, height, _cachedHdcMem, 0, 0, SRCCOPY);
+                }
+                else
+                {
+                    Native.SetStretchBltMode(hdcDest, HALFTONE);
+                    Native.SetBrushOrgEx(hdcDest, 0, 0, IntPtr.Zero);
+                    return Native.StretchBlt(hdcDest, 0, 0, width, height, _cachedHdcMem, 0, 0, _cachedWidth, _cachedHeight, SRCCOPY);
+                }
+            }
+
+            return false;
+        }
+    }
+
+    private static void TrySwitchThreadDesktopToDefault()
+    {
+        try
+        {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
+            IntPtr hDef = Native.OpenDesktopW("Default", 0, false, 0x01FF /* DESKTOP_ALL_ACCESS */);
+            if (hDef != IntPtr.Zero)
+            {
+                bool ok = Native.SetThreadDesktop(hDef);
+                if (!ok)
+                {
+                    Native.CloseDesktop(hDef);
+                }
+            }
+        }
+        catch { }
+    }
+
+    private const uint WmAppSetValidFrame = 0x8000 + 216; // WM_APP + 216
+
+    private void TryNotifyHostValidFrame()
+    {
+        if (_targetHwnd == IntPtr.Zero) return;
+        try
+        {
+            Native.PostMessageW(_targetHwnd, WmAppSetValidFrame, (IntPtr)1, IntPtr.Zero);
+        }
+        catch { }
+    }
+
+    private object? _attachedHostTarget;
+    private Action<IntPtr, int, int>? _attachedPaintHandler;
+
+    private void TryHookWindowHostPaint(IntPtr hwnd)
+    {
+        try
+        {
+            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows) || hwnd == IntPtr.Zero) return;
+            UnhookWindowHostPaint();
+
+            var sb = new StringBuilder(256);
+            if (Native.GetClassNameW(hwnd, sb, 256) > 0)
+            {
+                string cls = sb.ToString();
+                if (cls == "InbriskGhostPipWindowClass" || cls == "InbriskRuntimeNativePipWindowHost")
+                {
+                    IntPtr ptr = Native.GetWindowLongPtr(hwnd, -21 /* GWLP_USERDATA */);
+                    if (ptr != IntPtr.Zero)
+                    {
+                        var handle = GCHandle.FromIntPtr(ptr);
+                        if (handle.IsAllocated && handle.Target != null)
+                        {
+                            var target = handle.Target;
+                            var paintEvent = target.GetType().GetEvent("Paint");
+                            if (paintEvent != null)
+                            {
+                                _attachedPaintHandler = (hdc, w, h) => Repaint(hdc, w, h);
+                                _attachedHostTarget = target;
+                                paintEvent.AddEventHandler(target, _attachedPaintHandler);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private void UnhookWindowHostPaint()
+    {
+        try
+        {
+            if (_attachedHostTarget != null && _attachedPaintHandler != null)
+            {
+                var paintEvent = _attachedHostTarget.GetType().GetEvent("Paint");
+                paintEvent?.RemoveEventHandler(_attachedHostTarget, _attachedPaintHandler);
+            }
+        }
+        catch { }
+        finally
+        {
+            _attachedHostTarget = null;
+            _attachedPaintHandler = null;
+        }
+    }
+
     #endregion
 
     #region Shared Memory Connection Management
@@ -965,6 +1149,8 @@ public sealed class GhostPipRenderer : IDisposable
 
             // Blit to window
             Native.BitBlt(hdcWin, 0, 0, destWidth, destHeight, _cachedHdcMem, 0, 0, SRCCOPY);
+            Native.ValidateRect(_targetHwnd, IntPtr.Zero);
+            TryNotifyHostValidFrame();
         }
         catch { }
         finally

@@ -48,6 +48,7 @@ public sealed class WinEventService : IEventSource
         var hooks = _hooks; // avoid touching the list on the exit path
         try
         {
+            DesktopBridge.TrySwitchCurrentThread();
             _threadId = NativeMethods.GetCurrentThreadId();
             _callback = OnWinEvent; // must stay rooted for the hook's lifetime
             foreach (var ev in HookedEvents)

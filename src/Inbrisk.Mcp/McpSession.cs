@@ -52,7 +52,10 @@ public sealed class McpSession : IDisposable
     /// <summary>Default screenshot policy for computer_observe — sessions may
     /// differ; nothing process-global is mutated.</summary>
     public VisualAttachPolicy AttachPolicy { get; set; } = VisualAttachPolicy.Auto;
-    public TaskRecipeStore RecipeStore { get; } = new();
+    /// <summary>Recipe persistence. Settable so tests and embedded hosts can
+    /// inject an isolated store instead of writing into the real
+    /// %LocalAppData%\inbrisk\task-recipes directory.</summary>
+    public ITaskRecipeStore RecipeStore { get; set; } = new TaskRecipeStore();
     public ApplicationProfileStore ProfileStore { get; } = new();
     public DesktopStateMemory Memory { get; } = new();
     public ApplicationAdapterRegistry Adapters { get; } = new();
@@ -60,6 +63,72 @@ public sealed class McpSession : IDisposable
     public SessionTelemetry Telemetry { get; } = new();
     public RequestDeduplicator Deduplicator { get; } = new();
     public DynamicToolset.DynamicToolsetManager DynamicToolset { get; } = new();
+
+    /// <summary>
+    /// Ghost session coordinator for routing execution to the isolated background desktop session (Session 2 / background desktop).
+    /// </summary>
+    public GhostSessionCoordinator GhostCoordinator { get; }
+
+    /// <summary>
+    /// Direct bridge reference for Ghost MCP operations.
+    /// </summary>
+    public GhostMcpBridge GhostBridge => GhostCoordinator.Bridge;
+
+    /// <summary>
+    /// Desktop this session targets. Set once by computer_session (or the
+    /// server's --ghost flag) and every computer_* tool follows it — the
+    /// per-call ghost flag is an override, not the only way in.
+    /// </summary>
+    public SessionDesktop Desktop { get; private set; } = SessionDesktop.Interactive;
+
+    /// <summary>True when the session targets the isolated background desktop.</summary>
+    public bool OnGhostDesktop => Desktop == SessionDesktop.Ghost;
+
+    /// <summary>
+    /// Effective ghost routing for one call: an explicit per-call value wins,
+    /// otherwise the session's desktop decides. Null (the default on every
+    /// tool) means "use the session mode".
+    /// </summary>
+    public bool ResolveGhost(bool? perCall) => perCall ?? OnGhostDesktop;
+
+    /// <summary>
+    /// Switch the session's target desktop. Returns true when the mode
+    /// actually changed (setting the mode it already has is a no-op).
+    /// </summary>
+    public bool SetDesktop(SessionDesktop target)
+    {
+        if (Desktop == target) return false;
+        Desktop = target;
+        InvalidateDesktopScopedState();
+        return true;
+    }
+
+    /// <summary>
+    /// Everything cached here is bound to ONE desktop. Element ids, frame
+    /// ids, observation ids, find/inspect snapshots, the scope window and
+    /// the delta baseline all become wrong the moment the session targets a
+    /// different one — a uia_* id from the interactive desktop names nothing
+    /// on the ghost desktop. Held input is released too: keys or buttons
+    /// pressed on the desktop we just left would otherwise stay down.
+    /// </summary>
+    private void InvalidateDesktopScopedState()
+    {
+        try { Rt.Parts.Input.ReleaseAll(); } catch { }
+        InvalidateStaleHandles();
+        try { FindCache.InvalidateAll(); } catch { }
+        try { SnapshotCache.InvalidateAll(); } catch { }
+        try { lock (NegativeFindCache) NegativeFindCache.Clear(); } catch { }
+        // A paused run holds element bindings from the old desktop; resuming
+        // it would replay those ids against a desktop they never came from.
+        try { lock (Runs) Runs.Clear(); } catch { }
+        LastObservation = null;
+        PrevOutcome = null;
+        ScopeHwnd = null;
+        LastLaunchedHwnd = 0;
+        LastLaunchTimestamp = DateTimeOffset.MinValue;
+        LastAppsQueryTimestamp = DateTimeOffset.MinValue;
+        LastAppsQueryName = null;
+    }
 
     /// <summary>F04: session confirmation channel — the server-side
     /// approval gate wired to SafetyPolicy.Confirmer (CONFIRM classes) and
@@ -234,27 +303,39 @@ public sealed class McpSession : IDisposable
     private long _scopeHwndForMonitor;
     private readonly List<string> _recentRefs = new();
 
-    public McpSession(EmergencyControl control, string? telemetryPath = null, bool startEvents = true, IDesktopArbiter? arbiter = null)
+    public McpSession(EmergencyControl control, string? telemetryPath = null, bool startEvents = true, IDesktopArbiter? arbiter = null,
+        SessionDesktop initialDesktop = SessionDesktop.Interactive)
     {
         Control = control;
         if (arbiter != null) Arbiter = arbiter;
+        // Plain assignment (not SetDesktop) — there is no previous desktop
+        // to invalidate, and nothing has been observed yet.
+        Desktop = initialDesktop;
         FindCache = new SessionFindCache(() => Rt?.MutationVersion ?? 0, telemetry: Telemetry.FindCache);
         SnapshotCache = new SessionSnapshotCache(() => Rt?.MutationVersion ?? 0, telemetry: Telemetry.SnapshotCache);
         HwndMetadata = new HwndMetadataCache(telemetry: Telemetry.HwndMetadata);
         MonitorCache = new MonitorTopologyCache(telemetry: Telemetry.MonitorTopology);
         VdmHolder = new VirtualDesktopManagerHolder();
+        GhostCoordinator = new GhostSessionCoordinator(this);
 
-        // F04: AutoConfirm stays OFF for the MCP host — a CONFIRM-class
-        // action must not be satisfied by the tool call that requested it:
-        // the model supplies the call, so accepting it as consent is
-        // self-approval, not a human checkpoint. The gate is Confirm —
-        // Executor consults SafetyPolicy.Confirmer (CONFIRM classes) and
-        // SafetyPolicy.LocalConsent (dangerous classes), which approve
-        // only a pending request a LOCAL consent surface granted. Deny-
-        // classified actions (elevated targets, password fields, deny-
-        // listed processes, kill-switch) still refuse regardless.
+        // F04: AutoConfirm stays OFF for the MCP host by default — a
+        // CONFIRM-class action must not be satisfied by the tool call that
+        // requested it: the model supplies the call, so accepting it as
+        // consent is self-approval, not a human checkpoint. The gate is
+        // Confirm — Executor consults SafetyPolicy.Confirmer (CONFIRM
+        // classes) and SafetyPolicy.LocalConsent (dangerous classes), which
+        // approve only a pending request a LOCAL consent surface granted.
+        // Deny-classified actions (password fields, deny-listed processes,
+        // kill-switch) still refuse regardless.
+        //
+        // Operator opt-in parity with the CLI (`inbrisk --yes`): the
+        // INBRISK_AUTOCONFIRM environment variable — set by the operator or
+        // a test harness BEFORE the server starts, never by tool-call
+        // arguments — flips AutoConfirm on for this instance. It approves
+        // CONFIRM classes only; dangerous classes still demand LocalConsent.
         Confirm = new ConfirmChannel(SessionId);
-        Rt = new InbriskRuntime(new InbriskOptions(AutoConfirm: false,
+        Rt = new InbriskRuntime(new InbriskOptions(AutoConfirm:
+            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("INBRISK_AUTOCONFIRM")),
             StartEvents: startEvents,
             // F32: audit trail lives under %ProgramData%\Inbrisk\audit
             // (ACL'd, hash-chained); the data-dir copy is a readable mirror.
@@ -655,6 +736,7 @@ public sealed class McpSession : IDisposable
         try { DynamicToolset.Dispose(); } catch { }
         try { FindCache.Dispose(); } catch { }
         try { SnapshotCache.Dispose(); } catch { }
+        try { GhostCoordinator.Dispose(); } catch { }
         try { HwndMetadata.Dispose(); } catch { }
         try { MonitorCache.Dispose(); } catch { }
         try { VdmHolder.Dispose(); } catch { }

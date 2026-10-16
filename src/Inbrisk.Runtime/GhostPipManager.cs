@@ -101,6 +101,12 @@ public interface IGhostPipWindowHost : IDisposable
     /// <summary>Raised when an interactive mouse or input event occurs in the PiP client area.</summary>
     event Action<PipInputEventArgs>? OnInteractiveInput;
 
+    /// <summary>Raised during WM_PAINT so custom renderers can paint directly.</summary>
+    event Action<IntPtr, int, int>? Paint;
+
+    /// <summary>Gets or sets whether a valid frame has been rendered.</summary>
+    bool HasValidFrame { get; set; }
+
     /// <summary>Toggles window between compact and expanded scale.</summary>
     void ToggleExpand();
 }
@@ -393,6 +399,11 @@ public class GhostPipManager : IDisposable
 
             if (_windowHost != null)
             {
+                _windowHost.Paint += (hdc, width, height) =>
+                {
+                    _renderer?.Repaint(hdc, width, height);
+                };
+
                 _windowHost.PositionChanged += (newX, newY) =>
                 {
                     lock (_gate)
@@ -715,6 +726,7 @@ public class GhostPipManager : IDisposable
         private readonly PropertyInfo? _yProp;
         private readonly PropertyInfo? _widthProp;
         private readonly PropertyInfo? _heightProp;
+        private readonly PropertyInfo? _hasValidFrameProp;
         private readonly MethodInfo? _setClickThroughMethod;
         private readonly MethodInfo? _setOpacityMethod;
         private readonly MethodInfo? _setPosSizeMethod;
@@ -731,6 +743,7 @@ public class GhostPipManager : IDisposable
             _yProp = t.GetProperty("Y");
             _widthProp = t.GetProperty("Width");
             _heightProp = t.GetProperty("Height");
+            _hasValidFrameProp = t.GetProperty("HasValidFrame");
             _setClickThroughMethod = t.GetMethod("SetClickThrough", new[] { typeof(bool) });
             _setOpacityMethod = t.GetMethod("SetOpacity", new[] { typeof(byte) });
             _setPosSizeMethod = t.GetMethod("SetPositionAndSize", new[] { typeof(int), typeof(int), typeof(int), typeof(int) });
@@ -758,6 +771,13 @@ public class GhostPipManager : IDisposable
                     Action<PipInputEventArgs> handler = (args) => OnInteractiveInput?.Invoke(args);
                     inputEv.AddEventHandler(_instance, handler);
                 }
+
+                var paintEv = t.GetEvent("Paint");
+                if (paintEv != null)
+                {
+                    Action<IntPtr, int, int> handler = (hdc, w, h) => Paint?.Invoke(hdc, w, h);
+                    paintEv.AddEventHandler(_instance, handler);
+                }
             }
             catch { }
         }
@@ -766,6 +786,13 @@ public class GhostPipManager : IDisposable
         public event Action<int, int>? PositionChanged;
         public event Action<int, int, int, int>? BoundsChanged;
         public event Action<PipInputEventArgs>? OnInteractiveInput;
+        public event Action<IntPtr, int, int>? Paint;
+
+        public bool HasValidFrame
+        {
+            get => (bool)(_hasValidFrameProp?.GetValue(_instance) ?? false);
+            set => _hasValidFrameProp?.SetValue(_instance, value);
+        }
 
         public IntPtr Hwnd => (IntPtr)(_hwndProp?.GetValue(_instance) ?? IntPtr.Zero);
         public bool IsRunning => (bool)(_isRunningProp?.GetValue(_instance) ?? false);
@@ -853,6 +880,12 @@ public class GhostPipManager : IDisposable
 
         private static class Native
         {
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
+
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern bool SetThreadDesktop(IntPtr hDesktop);
+
             [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
             public static extern ushort RegisterClassExW(ref WNDCLASSEXW lpwcx);
 
@@ -952,6 +985,16 @@ public class GhostPipManager : IDisposable
 
         private void Pump()
         {
+            try
+            {
+                var hDef = Native.OpenDesktop("Default", 0, false, 0x01FF);
+                if (hDef != IntPtr.Zero)
+                {
+                    Native.SetThreadDesktop(hDef);
+                }
+            }
+            catch { }
+
             lock (ClassLock)
             {
                 if (!_classRegistered)
@@ -1061,8 +1104,10 @@ public class GhostPipManager : IDisposable
                     long style = Native.GetWindowLongPtr64(_hwnd, GWL_EXSTYLE).ToInt64();
                     if (enabled) style |= WS_EX_TRANSPARENT;
                     else style &= ~WS_EX_TRANSPARENT;
+                    style |= WS_EX_LAYERED;
                     Native.SetWindowLongPtr64(_hwnd, GWL_EXSTYLE, new IntPtr(style));
                     Native.SetWindowPos(_hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    Native.SetLayeredWindowAttributes(_hwnd, 0, _opacity, LWA_ALPHA);
                 }
                 catch { }
             }
@@ -1073,7 +1118,16 @@ public class GhostPipManager : IDisposable
             _opacity = alpha;
             if (_hwnd != IntPtr.Zero)
             {
-                try { Native.SetLayeredWindowAttributes(_hwnd, 0, alpha, LWA_ALPHA); } catch { }
+                try
+                {
+                    long style = Native.GetWindowLongPtr64(_hwnd, GWL_EXSTYLE).ToInt64();
+                    if ((style & WS_EX_LAYERED) == 0)
+                    {
+                        Native.SetWindowLongPtr64(_hwnd, GWL_EXSTYLE, new IntPtr(style | WS_EX_LAYERED));
+                    }
+                    Native.SetLayeredWindowAttributes(_hwnd, 0, alpha, LWA_ALPHA);
+                }
+                catch { }
             }
         }
 
@@ -1096,6 +1150,8 @@ public class GhostPipManager : IDisposable
         public event Action<int, int>? PositionChanged;
         public event Action<int, int, int, int>? BoundsChanged;
         public event Action<PipInputEventArgs>? OnInteractiveInput;
+        public event Action<IntPtr, int, int>? Paint;
+        public bool HasValidFrame { get; set; }
 
         public void ToggleExpand()
         {

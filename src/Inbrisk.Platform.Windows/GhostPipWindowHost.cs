@@ -30,6 +30,7 @@ public sealed class GhostPipWindowHost : IDisposable
     private const uint WmAppSetVisible = NativeMethods.WM_APP + 213;
     private const uint WmAppInvalidate = NativeMethods.WM_APP + 214;
     private const uint WmAppToggleExpand = NativeMethods.WM_APP + 215;
+    private const uint WmAppSetValidFrame = NativeMethods.WM_APP + 216;
 
     private static readonly IntPtr HwndTopmost = new(-1);
     private static readonly object ClassGate = new();
@@ -50,6 +51,7 @@ public sealed class GhostPipWindowHost : IDisposable
     private volatile int _width;
     private volatile int _height;
     private volatile bool _visible = true;
+    private volatile bool _hasValidFrame;
     private volatile bool _disposed;
 
     private int _savedCompactWidth = 320;
@@ -146,6 +148,28 @@ public sealed class GhostPipWindowHost : IDisposable
     /// Gets whether the window is currently visible.
     /// </summary>
     public bool Visible => _visible;
+
+    /// <summary>
+    /// Gets or sets whether a valid rendered frame exists on the window surface.
+    /// When true, WM_PAINT will not overwrite the surface with the default dark background fill.
+    /// </summary>
+    public bool HasValidFrame
+    {
+        get => _hasValidFrame;
+        set => _hasValidFrame = value;
+    }
+
+    /// <summary>
+    /// Marks that a valid frame has been rendered onto the window surface, preventing default dark fills on WM_PAINT.
+    /// </summary>
+    public void SetValidFrame(bool valid = true)
+    {
+        _hasValidFrame = valid;
+        if (_threadId != 0 && Thread.CurrentThread.ManagedThreadId != _thread?.ManagedThreadId)
+        {
+            NativeMethods.PostThreadMessageW(_threadId, WmAppSetValidFrame, valid ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero);
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="GhostPipWindowHost"/> class.
@@ -398,6 +422,10 @@ public sealed class GhostPipWindowHost : IDisposable
                 {
                     ToggleExpandCore();
                 }
+                else if (msg.Message == WmAppSetValidFrame)
+                {
+                    _hasValidFrame = msg.WParam != IntPtr.Zero;
+                }
 
                 NativeMethods.TranslateMessage(ref msg);
                 NativeMethods.DispatchMessageW(ref msg);
@@ -483,7 +511,9 @@ public sealed class GhostPipWindowHost : IDisposable
         {
             NativeMethods.SetWindowLongPtr(_hwnd, GwlpUserdata, GCHandle.ToIntPtr(_hwndHandle));
 
-            // Apply layered attributes (alpha)
+            // Layered window attributes must ALWAYS be configured (even when fully opaque at alpha = 255)
+            // so DWM maintains a permanent redirection surface. This ensures toggling WS_EX_TRANSPARENT
+            // or changing opacity never discards the surface or blanks the window.
             NativeMethods.SetLayeredWindowAttributes(_hwnd, 0, _opacity, NativeMethods.LWA_ALPHA);
 
             // Position as topmost without activation
@@ -532,6 +562,9 @@ public sealed class GhostPipWindowHost : IDisposable
             newExStyle &= ~NativeMethods.WS_EX_NOACTIVATE;
         }
 
+        // WS_EX_LAYERED must always be preserved so DWM never discards or recreates the window surface
+        newExStyle |= NativeMethods.WS_EX_LAYERED;
+
         if (newExStyle != curExStyle)
         {
             NativeMethods.SetWindowLongPtr(_hwnd, NativeMethods.GWL_EXSTYLE, new IntPtr(newExStyle));
@@ -539,7 +572,10 @@ public sealed class GhostPipWindowHost : IDisposable
                 _hwnd,
                 HwndTopmost,
                 0, 0, 0, 0,
-                NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_FRAMECHANGED);
+                NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_NOZORDER | NativeMethods.SWP_FRAMECHANGED);
+
+            // Re-apply layered window attributes to ensure DWM composition state remains consistent
+            NativeMethods.SetLayeredWindowAttributes(_hwnd, 0, _opacity, NativeMethods.LWA_ALPHA);
         }
     }
 
@@ -548,6 +584,11 @@ public sealed class GhostPipWindowHost : IDisposable
         _opacity = alpha;
         if (_hwnd != IntPtr.Zero)
         {
+            var curExStyle = NativeMethods.GetWindowLongPtr(_hwnd, NativeMethods.GWL_EXSTYLE).ToInt64();
+            if ((curExStyle & NativeMethods.WS_EX_LAYERED) == 0)
+            {
+                NativeMethods.SetWindowLongPtr(_hwnd, NativeMethods.GWL_EXSTYLE, new IntPtr(curExStyle | NativeMethods.WS_EX_LAYERED));
+            }
             NativeMethods.SetLayeredWindowAttributes(_hwnd, 0, alpha, NativeMethods.LWA_ALPHA);
         }
     }
@@ -1010,6 +1051,10 @@ public sealed class GhostPipWindowHost : IDisposable
                 }
                 break;
 
+            case WmAppSetValidFrame:
+                _hasValidFrame = wParam != IntPtr.Zero;
+                return IntPtr.Zero;
+
             case NativeMethods.WM_PAINT:
                 var ps = new NativeMethods.PAINTSTRUCT();
                 var hdc = NativeMethods.BeginPaint(hWnd, out ps);
@@ -1018,10 +1063,12 @@ public sealed class GhostPipWindowHost : IDisposable
                     if (Paint != null)
                     {
                         Paint.Invoke(hdc, _width, _height);
+                        _hasValidFrame = true;
                     }
-                    else
+                    else if (!_hasValidFrame)
                     {
                         // Default background fill: clean modern dark canvas (#18181B)
+                        // ONLY perform initial dark fill if no valid frame has ever been rendered.
                         var rect = ps.RcPaint;
                         if (rect.Right > 0 && rect.Bottom > 0)
                         {
@@ -1036,6 +1083,8 @@ public sealed class GhostPipWindowHost : IDisposable
                             }
                         }
                     }
+                    // When _hasValidFrame is true and Paint is null, do NOT erase or fill with dark canvas.
+                    // The valid frame rendered directly to the window DC via GetDC/BitBlt is preserved.
                 }
                 finally
                 {

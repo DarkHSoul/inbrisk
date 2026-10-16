@@ -114,6 +114,10 @@ public sealed class InbriskRuntime : IDisposable
         _uiaReadScheduler = new UiaReadScheduler();
         _windows = new WindowService(opt.HwndMetadataCache, opt.MonitorTopologyCache, opt.VdmHolder);
         _provenance = new ProcessProvenanceService(_windows);
+        // The policy may treat text entry into a window this agent opened as
+        // ordinary work instead of a confirmation-gated action. Null stays
+        // safe (no exemption), so wiring is what enables the narrower class.
+        _policy.Provenance = _provenance;
         try
         {
             foreach (var w in _windows.ListWindows())

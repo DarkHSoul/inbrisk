@@ -13,6 +13,13 @@ public sealed class MonitorTopologyCache : IDisposable
     private readonly object _lock = new();
     private IReadOnlyList<MonitorInfo>? _cachedMonitors;
     private RectPx? _cachedVirtualDesktopBounds;
+    private int _disposed;
+
+    /// <summary>Guard against the dispose race: a session's warm-up runs on
+    /// a background thread and may still be in flight while Dispose clears
+    /// the cache — a late-completed monitor query must not insert into a
+    /// disposed cache or the test-invisible leak returns.</summary>
+    private bool Disposed => Volatile.Read(ref _disposed) != 0;
 
     public CacheTelemetry Telemetry { get; }
 
@@ -47,6 +54,13 @@ public sealed class MonitorTopologyCache : IDisposable
 
         lock (_lock)
         {
+            // skip insert after dispose — a warm-up thread that lost the race
+            // must not resurrect entries Invalidate() just cleared
+            if (Disposed)
+            {
+                Telemetry.IncMiss();
+                return monitors;
+            }
             _cachedMonitors = monitors;
             Telemetry.IncInsert();
             return _cachedMonitors;
@@ -71,6 +85,7 @@ public sealed class MonitorTopologyCache : IDisposable
 
         lock (_lock)
         {
+            if (Disposed) return bounds; // late warm-up insert after dispose
             _cachedVirtualDesktopBounds = bounds;
             Telemetry.IncInsert();
             return _cachedVirtualDesktopBounds.Value;
@@ -91,6 +106,7 @@ public sealed class MonitorTopologyCache : IDisposable
 
     public void Dispose()
     {
+        Volatile.Write(ref _disposed, 1);
         Invalidate();
     }
 }

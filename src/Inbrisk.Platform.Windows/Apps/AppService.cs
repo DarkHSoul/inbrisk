@@ -3,6 +3,7 @@ using System.Runtime.InteropServices;
 using Inbrisk.Core;
 using Microsoft.Win32;
 using Windows.Win32;
+using Inbrisk.Platform.Windows.Native;
 
 namespace Inbrisk.Platform.Windows.Apps;
 
@@ -1700,19 +1701,106 @@ public sealed class AppService : IAppService, IDisposable
             case LaunchMethod.Aumid:
                 return ActivateAumid(app.Identifier);
             case LaunchMethod.Protocol:
-                Process.Start(new ProcessStartInfo(app.Identifier)
-                    { UseShellExecute = true });
+                DesktopBridge.RunOnDefaultDesktop(() =>
+                {
+                    Process.Start(new ProcessStartInfo(app.Identifier)
+                        { UseShellExecute = true });
+                });
                 return null;
             default:
             {
-                var psi = new ProcessStartInfo(app.Identifier)
-                { UseShellExecute = true };
-                if (args != null)
-                    foreach (var a in args) psi.ArgumentList.Add(a);
-                var p = Process.Start(psi);
-                try { return p?.Id; } catch { return null; }
+                if (app.Identifier.Contains(@"\Program Files\WindowsApps\", StringComparison.OrdinalIgnoreCase))
+                {
+                    return SpawnWindowsApp(app, args);
+                }
+
+                return DesktopBridge.CreateProcessOnDefaultDesktop(app.Identifier, args);
             }
         }
+    }
+
+    private int? SpawnWindowsApp(ResolvedApp app, IReadOnlyList<string>? args)
+    {
+        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var aliasDir = Path.Combine(localAppData, @"Microsoft\WindowsApps");
+        var exeName = Path.GetFileName(app.Identifier);
+
+        // 1. Try execution alias in %LOCALAPPDATA%\Microsoft\WindowsApps (e.g. notepad.exe, mspaint.exe)
+        var candidates = new List<string> { exeName };
+        if (exeName.Contains("paint", StringComparison.OrdinalIgnoreCase) ||
+            app.DisplayName.Contains("paint", StringComparison.OrdinalIgnoreCase))
+        {
+            candidates.Add("mspaint.exe");
+            candidates.Add("pbrush.exe");
+        }
+        else if (exeName.Contains("notepad", StringComparison.OrdinalIgnoreCase) ||
+                 app.DisplayName.Contains("notepad", StringComparison.OrdinalIgnoreCase))
+        {
+            candidates.Add("notepad.exe");
+        }
+        foreach (var hint in app.ExeHints)
+        {
+            if (!string.IsNullOrEmpty(hint))
+            {
+                candidates.Add(hint.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? hint : hint + ".exe");
+            }
+        }
+
+        foreach (var candidate in candidates.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var aliasPath = Path.Combine(aliasDir, candidate);
+            if (File.Exists(aliasPath))
+            {
+                return DesktopBridge.CreateProcessOnDefaultDesktop(aliasPath, args);
+            }
+        }
+
+        // 2. Try AUMID resolution from package directory manifest
+        var aumid = TryResolveAumidFromWindowsAppsPath(app.Identifier);
+        if (aumid != null)
+        {
+            return ActivateAumid(aumid);
+        }
+
+        // 3. Fallback to package search
+        var pkg = (PackageEnumerator ?? EnumeratePackages)()
+            .FirstOrDefault(p => app.ExeHints.Any(h => p.ExeHints.Contains(h, StringComparer.OrdinalIgnoreCase)) ||
+                                 string.Equals(p.DisplayName, app.DisplayName, StringComparison.OrdinalIgnoreCase));
+        if (pkg != null)
+        {
+            return ActivateAumid(pkg.Identifier);
+        }
+
+        return DesktopBridge.CreateProcessOnDefaultDesktop(app.Identifier, args);
+    }
+
+    private static string? TryResolveAumidFromWindowsAppsPath(string path)
+    {
+        try
+        {
+            var marker = @"\Program Files\WindowsApps\";
+            var idx = path.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return null;
+            var sub = path.Substring(idx + marker.Length);
+            var packageDirName = sub.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)[0];
+            var rootDir = path.Substring(0, idx + marker.Length);
+            var manifestPath = Path.Combine(rootDir, packageDirName, "AppxManifest.xml");
+            if (File.Exists(manifestPath))
+            {
+                var parts = packageDirName.Split('_');
+                if (parts.Length >= 2)
+                {
+                    var pfn = $"{parts[0]}_{parts[^1]}";
+                    var appId = ReadAppId(manifestPath);
+                    if (!string.IsNullOrEmpty(appId))
+                    {
+                        return $"{pfn}!{appId}";
+                    }
+                }
+            }
+        }
+        catch { }
+        return null;
     }
 
     /// <summary>Packaged-app activation via IApplicationActivationManager;
@@ -1720,19 +1808,51 @@ public sealed class AppService : IAppService, IDisposable
     /// a command line.</summary>
     private static int? ActivateAumid(string aumid)
     {
-        try
+        return DesktopBridge.RunOnDefaultDesktop(() =>
         {
-            var mgr = (IApplicationActivationManager)
-                Activator.CreateInstance(
-                    Type.GetTypeFromCLSID(new Guid(
-                        "45BA127D-10A8-46EA-8AB7-56EA9078943C"))!)!;
-            var hr = mgr.ActivateApplication(aumid, null, 0, out var pid);
-            if (hr >= 0 && pid > 0) return pid;
-        }
-        catch { }
-        Process.Start(new ProcessStartInfo("explorer.exe",
-            $"shell:AppsFolder\\{aumid}") { UseShellExecute = true });
-        return null;
+            try
+            {
+                var mgr = (IApplicationActivationManager)
+                    Activator.CreateInstance(
+                        Type.GetTypeFromCLSID(new Guid(
+                            "45BA127D-10A8-46EA-8AB7-56EA9078943C"))!)!;
+                var hr = mgr.ActivateApplication(aumid, null, 0, out var pid);
+                if (hr >= 0 && pid > 0) return (int?)pid;
+            }
+            catch { }
+            Process.Start(new ProcessStartInfo("explorer.exe",
+                $"shell:AppsFolder\\{aumid}") { UseShellExecute = true });
+            return null;
+        });
+    }
+
+    private static bool IsLauncherOrStub(ResolvedApp app, string? spawnedName)
+    {
+        if (app.Method == LaunchMethod.Aumid) return true;
+
+        var id = app.Identifier ?? "";
+        if (id.Contains(@"\Microsoft\WindowsApps\", StringComparison.OrdinalIgnoreCase) ||
+            id.Contains(@"\Program Files\WindowsApps\", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (id.Contains("launcher", StringComparison.OrdinalIgnoreCase) ||
+            id.Contains("stub", StringComparison.OrdinalIgnoreCase) ||
+            id.Contains("bootstrapper", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var disp = app.DisplayName ?? "";
+        if (disp.Contains("launcher", StringComparison.OrdinalIgnoreCase) ||
+            disp.Contains("stub", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (spawnedName != null && (spawnedName.Contains("launcher") || spawnedName.Contains("stub")))
+            return true;
+
+        if (app.ExeHints.Any(h => h.Contains("launcher", StringComparison.OrdinalIgnoreCase) ||
+                                 h.Contains("stub", StringComparison.OrdinalIgnoreCase)))
+            return true;
+
+        return false;
     }
 
     private (string? error, string? detail, string? state, int? pid,
@@ -1758,9 +1878,9 @@ public sealed class AppService : IAppService, IDisposable
                 if (!string.IsNullOrWhiteSpace(stripped)) rawHints.Add(stripped);
             }
             var parts = h.Split(new[] { ' ', '-', '_', '.' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length > 1 && parts[0].Length >= 3)
+            foreach (var p in parts)
             {
-                rawHints.Add(parts[0]);
+                if (p.Length >= 3) rawHints.Add(p);
             }
         }
 
@@ -1790,11 +1910,17 @@ public sealed class AppService : IAppService, IDisposable
             }
 
             // Early detection: process exited before becoming ready
-            if (spawnedPid.HasValue && !ProcessAlive(spawnedPid) && !ProcessByName(hints, spawnedName))
+            // Do not fail prematurely if spawnedPid exits for launcher stubs / AUMID / execution aliases.
+            var isStubOrAlias = IsLauncherOrStub(app, spawnedName);
+            if (!isStubOrAlias && spawnedPid.HasValue && !ProcessAlive(spawnedPid) && !ProcessByName(hints, spawnedName))
             {
-                return ("Failed",
-                    $"process {spawnedPid.Value} exited before becoming ready",
-                    "Failed", spawnedPid, null, null, null);
+                var winImmediate = MatchWindow(spawnedPid, hints, spawnedName, app.DisplayName, requestedName);
+                if (winImmediate == null)
+                {
+                    return ("Failed",
+                        $"process {spawnedPid.Value} exited before becoming ready",
+                        "Failed", spawnedPid, null, null, null);
+                }
             }
 
             bool eventWoke = false;
@@ -1917,19 +2043,57 @@ public sealed class AppService : IAppService, IDisposable
             .Where(w => !w.Bounds.IsEmpty && !string.IsNullOrEmpty(w.Title) &&
                         !IsShellSurface(w.Hwnd))
             .ToList();
+
+        var norm = Norm(displayName);
+        var reqNorm = requestedName != null ? Norm(requestedName) : null;
+
+        bool MatchesFrameWindow(WindowInfo w)
+        {
+            if (NormProc(w.ProcessName) != "applicationframehost") return false;
+            var winTitle = Norm(w.Title);
+            if (string.IsNullOrEmpty(winTitle)) return false;
+
+            // 1. Direct title match against norm or requested name
+            if (winTitle.Contains(norm) || (norm.Length >= 4 && norm.Contains(winTitle))) return true;
+            if (reqNorm != null && (winTitle.Contains(reqNorm) || (reqNorm.Length >= 4 && reqNorm.Contains(winTitle)))) return true;
+            if (hints.Any(h => h.Length >= 3 && (winTitle.Contains(h) || h.Contains(winTitle)))) return true;
+
+            // 2. Localized aliases matching against title
+            var allKeys = new List<string> { norm };
+            if (reqNorm != null) allKeys.Add(reqNorm);
+            allKeys.AddRange(hints);
+
+            foreach (var key in allKeys)
+            {
+                if (WellKnownLocalizedAliases.TryGetValue(key, out var aliases))
+                {
+                    if (aliases.Any(a => winTitle.Contains(Norm(a)) || Norm(a).Contains(winTitle)))
+                        return true;
+                }
+            }
+
+            foreach (var kvp in WellKnownLocalizedAliases)
+            {
+                var aliasKey = kvp.Key;
+                if (allKeys.Any(k => k.Contains(aliasKey) || aliasKey.Contains(k)))
+                {
+                    if (kvp.Value.Any(a => winTitle.Contains(Norm(a)) || Norm(a).Contains(winTitle)))
+                        return true;
+                }
+            }
+
+            return false;
+        }
+
         if (pid is { } p)
         {
             var byPid = wins.Where(w => w.Pid == p).ToList();
             if (byPid.Count > 0) return BestWindow(byPid);
 
-            // Exact UWP attribution — an ApplicationFrameHost frame is
-            // owned by the shared host pid, but the app process pid
-            // returned by IApplicationActivationManager owns a descendant
-            // window inside the frame. Pid-exact beats title heuristics,
-            // and the reported pid becomes the real app pid.
+            // Exact UWP attribution or frame matching by title / localized aliases without relying on EnumChildWindows
             var hosted = wins
                 .Where(w => NormProc(w.ProcessName) == "applicationframehost" &&
-                            HostedProcessId(w.Hwnd) == p)
+                            (HostedProcessId(w.Hwnd) == p || MatchesFrameWindow(w)))
                 .ToList();
             if (hosted.Count > 0 &&
                 BestWindow(hosted) is { } frame)
@@ -1938,8 +2102,6 @@ public sealed class AppService : IAppService, IDisposable
             // spawned pid may be a launcher that exited or handed off —
             // fall through to name/title matching
         }
-        var norm = Norm(displayName);
-        var reqNorm = requestedName != null ? Norm(requestedName) : null;
         var named = wins.Where(w =>
         {
             var pn = NormProc(w.ProcessName);
@@ -1954,15 +2116,10 @@ public sealed class AppService : IAppService, IDisposable
             if (winTitle.Contains(norm) || (reqNorm != null && winTitle.Contains(reqNorm))) return true;
             if (hints.Any(h => h.Length >= 4 && (winTitle.Contains(h) || pn.Contains(h)))) return true;
 
-            // 3. UWP / ApplicationFrameHost special handling
+            // 3. UWP / ApplicationFrameHost special handling without relying on EnumChildWindows
             if (pn == "applicationframehost")
             {
-                if (winTitle.Contains(norm) || (reqNorm != null && winTitle.Contains(reqNorm))) return true;
-                if (hints.Any(h => h.Length >= 4 && winTitle.Contains(h))) return true;
-                if (reqNorm != null && WellKnownLocalizedAliases.TryGetValue(reqNorm, out var reqAliases) &&
-                    reqAliases.Any(a => winTitle.Contains(Norm(a)))) return true;
-                if (WellKnownLocalizedAliases.TryGetValue(norm, out var normAliases) &&
-                    normAliases.Any(a => winTitle.Contains(Norm(a)))) return true;
+                if (MatchesFrameWindow(w)) return true;
             }
 
             // 4. Localized aliases fallback for regular windows
@@ -1973,7 +2130,11 @@ public sealed class AppService : IAppService, IDisposable
 
             return false;
         }).ToList();
-        return BestWindow(named);
+
+        var best = BestWindow(named);
+        if (best != null && pid.HasValue && NormProc(best.ProcessName) == "applicationframehost")
+            return best with { Pid = pid.Value };
+        return best;
     }
 
     private static WindowInfo? BestWindow(List<WindowInfo> wins)

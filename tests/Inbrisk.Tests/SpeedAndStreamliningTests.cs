@@ -90,7 +90,7 @@ public class SpeedAndStreamliningTests
     [Fact]
     public async Task CloseWindow_BatchMode_CloseAllAgentWindows()
     {
-        var session = new McpSession(EmergencyControl.Process);
+        var session = new McpSession(EmergencyControl.ForTests());
         var tools = new InbriskTools(session);
 
         // Record a mock agent-owned window in provenance
@@ -109,7 +109,7 @@ public class SpeedAndStreamliningTests
     [Fact]
     public async Task CloseWindow_BatchMode_WithHwndsList()
     {
-        var session = new McpSession(EmergencyControl.Process);
+        var session = new McpSession(EmergencyControl.ForTests());
         var tools = new InbriskTools(session);
 
         // Target fake hwnds
@@ -126,7 +126,7 @@ public class SpeedAndStreamliningTests
     [Fact]
     public async Task ComputerDo_ValidatesMalformedWhenNoActionsProvided()
     {
-        var session = new McpSession(EmergencyControl.Process);
+        var session = new McpSession(EmergencyControl.ForTests());
         var tools = new InbriskTools(session);
 
         var res = await tools.ComputerDo();

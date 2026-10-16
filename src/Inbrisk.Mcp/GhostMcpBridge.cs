@@ -251,7 +251,7 @@ public sealed class GhostMcpBridge : IDisposable
     {
         WriteIndented = false,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        DefaultIgnoreCondition = JsonIgnoreCondition.Never
     };
 
     private readonly IGhostSessionManager _sessionManager;
@@ -263,7 +263,23 @@ public sealed class GhostMcpBridge : IDisposable
     private readonly object _desktopGate = new();
     private GhostLocalDesktop? _localDesktop;
     private Inbrisk.Platform.Windows.GhostDesktopInput? _desktopInput;
+    private readonly McpSession? _session;
+    private InbriskTools? _inbriskTools;
     private int _disposed;
+
+    /// <summary>Reachability probe for the isolated desktop — a cheap WTS
+    /// query, no IPC round-trip. Lets a caller report whether switching the
+    /// session onto the ghost desktop actually has somewhere to land.</summary>
+    public Task<GhostSessionStatus> GetSessionStatusAsync(CancellationToken ct = default) =>
+        _sessionManager.GetStatusAsync(ct);
+
+    private InbriskTools GetTools()
+    {
+        if (_inbriskTools != null) return _inbriskTools;
+        var sess = _session ?? new McpSession(EmergencyControl.Process);
+        _inbriskTools = new InbriskTools(sess);
+        return _inbriskTools;
+    }
 
     private GhostLocalDesktop GetOrCreateDesktop()
     {
@@ -294,7 +310,7 @@ public sealed class GhostMcpBridge : IDisposable
     /// </summary>
     [ActivatorUtilitiesConstructor]
     public GhostMcpBridge(McpSession? session = null)
-        : this(sessionManager: null, pipManager: null, ipcServer: null)
+        : this(sessionManager: null, pipManager: null, ipcServer: null, session: session)
     {
     }
 
@@ -304,8 +320,12 @@ public sealed class GhostMcpBridge : IDisposable
     public GhostMcpBridge(
         IGhostSessionManager? sessionManager,
         GhostPipManager? pipManager = null,
-        GhostIpcServer? ipcServer = null)
+        GhostIpcServer? ipcServer = null,
+        McpSession? session = null,
+        InbriskTools? inbriskTools = null)
     {
+        _session = session;
+        _inbriskTools = inbriskTools;
         _sessionManager = sessionManager ?? new GhostSessionManager();
         _pipManager = pipManager ?? new GhostPipManager();
         _ipcServer = ipcServer ?? new GhostIpcServer(GhostIpcDefaults.PipeName);
@@ -344,6 +364,7 @@ public sealed class GhostMcpBridge : IDisposable
         [Description("Whether mouse clicks interact directly with PiP instead of click-through (default: false)")] bool? interactive = null,
         [Description("Desktop margin in pixels for PiP anchor positioning (default: 16)")] int? margin = null,
         [Description("Automatically provision local ghost user and RDP permissions if missing (default: true)")] bool? autoProvision = null,
+        [Description("Alias of autoProvision")] bool? auto_provision = null,
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostStart");
@@ -367,7 +388,7 @@ public sealed class GhostMcpBridge : IDisposable
         int targetWidth = width ?? 1920;
         int targetHeight = height ?? 1080;
         string targetUser = string.IsNullOrWhiteSpace(username) ? GhostUserProvisioner.DefaultGhostUsername : username.Trim();
-        bool shouldAutoProvision = autoProvision ?? true;
+        bool shouldAutoProvision = autoProvision ?? auto_provision ?? true;
 
         var config = new GhostSessionConfig(
             Width: targetWidth,
@@ -437,6 +458,7 @@ public sealed class GhostMcpBridge : IDisposable
             state = status.State,
             processId = status.ProcessId,
             pipActive = _pipManager.IsRunning,
+            windowHandle = _pipManager.WindowHandle != IntPtr.Zero ? $"0x{_pipManager.WindowHandle:X}" : null,
             pipPosition = _pipManager.CurrentPosition.ToString(),
             pipScale = _pipManager.CurrentScale,
             pipWidth = _pipManager.Width,
@@ -457,11 +479,14 @@ public sealed class GhostMcpBridge : IDisposable
         "Stops the background ghost desktop session (Session 2) and terminates the Picture-in-Picture (PiP) live stream.")]
     public async Task<CallToolResult> StopGhost(
         [Description("Target session ID to stop (optional; defaults to the active ghost session)")] int? sessionId = null,
+        [Description("Alias of sessionId")] int? session_id = null,
         [Description("Whether to stop the Picture-in-Picture (PiP) overlay window (default: true)")] bool? stopPip = null,
+        [Description("Alias of stopPip")] bool? stop_pip = null,
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostStop");
-        bool shouldStopPip = stopPip ?? true;
+        int? targetSessionId = sessionId ?? session_id;
+        bool shouldStopPip = stopPip ?? stop_pip ?? true;
         bool pipWasRunning = _pipManager.IsRunning;
 
         if (shouldStopPip)
@@ -476,32 +501,62 @@ public sealed class GhostMcpBridge : IDisposable
             }
         }
 
-        bool stopped = await _sessionManager.StopSessionAsync(sessionId, ct).ConfigureAwait(false);
+        bool stopped = await _sessionManager.StopSessionAsync(targetSessionId, ct).ConfigureAwait(false);
+
+        // Terminate any processes and close windows on the local isolated Ghost desktop station
+        bool localDeskCleaned = false;
+        try
+        {
+            var hDesktop = GhostDesktopNative.OpenDesktop(GhostDesktopNative.DefaultGhostDesktopName, GhostDesktopNative.DESKTOP_ALL_ACCESS, false);
+            if (hDesktop != IntPtr.Zero)
+            {
+                var windows = GhostDesktopNative.EnumerateWindows(hDesktop);
+                foreach (var hwnd in windows)
+                {
+                    try
+                    {
+                        GhostDesktopNative.GetWindowThreadProcessId(hwnd, out uint pid);
+                        if (pid > 0 && pid != Environment.ProcessId)
+                        {
+                            try { Process.GetProcessById((int)pid).Kill(entireProcessTree: true); } catch { }
+                        }
+                    }
+                    catch { }
+                }
+                GhostDesktopNative.CloseDesktop(hDesktop);
+                localDeskCleaned = true;
+            }
+        }
+        catch { }
+
+        bool isStopped = stopped || localDeskCleaned || pipWasRunning;
 
         var res = new
         {
-            success = stopped,
-            sessionId,
+            success = isStopped,
+            sessionId = targetSessionId,
+            pipActive = _pipManager.IsRunning,
+            windowHandle = _pipManager.WindowHandle != IntPtr.Zero ? $"0x{_pipManager.WindowHandle:X}" : null,
             pipStopped = shouldStopPip && pipWasRunning,
-            message = stopped
-                ? "Ghost desktop session and PiP live stream successfully stopped."
-                : "Failed to cleanly stop ghost desktop session (may have already exited)."
+            localDesktopCleaned = localDeskCleaned,
+            message = isStopped
+                ? "Ghost desktop session, local isolated desktop processes, and PiP stream successfully stopped."
+                : "Ghost desktop was not active or had already exited."
         };
 
         return new CallToolResult
         {
-            IsError = !stopped,
+            IsError = false,
             Content = [new TextContentBlock { Text = JsonSerializer.Serialize(res, SerializerOptions) }]
         };
     }
 
     /// <summary>
-    /// Forwards a declarative sequence of UI action steps directly to Session 2 via cross-session IPC.
-    /// Actions are executed by the ghost agent's own mouse and keyboard inside the isolated session.
+    /// Legacy shim forwarding batch execution to the unified computer_batch tool with ghost: true.
     /// </summary>
     [McpServerTool(Name = "computer_ghost_batch"), Description(
-        "Forwards a declarative sequence of UI action steps directly to Session 2 via cross-session IPC. " +
-        "Actions are executed by the ghost agent's own mouse and keyboard inside the isolated session without interfering with the local user.")]
+        "Legacy shim forwarding to unified computer_batch with ghost: true. " +
+        "Executes a declarative sequence of UI action steps inside Session 2 without interfering with the local user.")]
     public async Task<CallToolResult> GhostBatch(
         [Description("Ordered list of simple action steps to execute sequentially in Session 2 (mutually exclusive with 'set')")] InbriskTools.BatchStep[]? steps = null,
         [Description("Compact list of form fields to set in one turn in Session 2 (mutually exclusive with 'steps')")] InbriskTools.FormFieldSpec[]? set = null,
@@ -513,116 +568,27 @@ public sealed class GhostMcpBridge : IDisposable
         [Description("Auto-dismiss policy for save-confirmation modals inside Session 2: off|save|discard|closeOnly (default: closeOnly)")] string? autoDismissModals = null,
         [Description("Alias of autoDismissModals")] string? auto_dismiss_modals = null,
         [Description("Execution timeout in milliseconds for the batch inside Session 2 (default: 30000)")] int? timeoutMs = null,
+        [Description("Alias of timeoutMs")] int? timeout_ms = null,
         [Description("Optional client operation ID for retry deduplication")] string? operationId = null,
+        [Description("Alias of operationId")] string? operation_id = null,
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostBatch");
-
-        if (EmergencyGate.IsStopped)
-        {
-            return EmergencyResult();
-        }
-
-        if ((steps == null || steps.Length == 0) && (set == null || set.Length == 0))
-        {
-            return ErrorResult("Malformed", "computer_ghost_batch requires non-empty 'steps' or 'set'.");
-        }
-
-        if (steps is { Length: > 0 } && set is { Length: > 0 })
-        {
-            return ErrorResult("Malformed", "Ambiguous execution order: specify either 'set' or 'steps', not both simultaneously.");
-        }
-
-        if (steps is { Length: > GhostBatchDispatcher.MaxBatchSteps })
-        {
-            return ErrorResult("Malformed", $"computer_ghost_batch accepts at most {GhostBatchDispatcher.MaxBatchSteps} steps.");
-        }
-
-        if (set is { Length: > 100 })
-        {
-            return ErrorResult("Malformed", "computer_ghost_batch accepts at most 100 'set' fields.");
-        }
-
-        // Verify active ghost session
-        var status = await _sessionManager.GetStatusAsync(ct).ConfigureAwait(false);
-        if (!status.IsActive)
-        {
-            return ErrorResult("SessionInactive", "Ghost session is not active. Call computer_ghost_start first to launch the background session.");
-        }
-
-        // Verify IPC connection to Session 2 worker (wait briefly if connection is warming up)
-        if (!_ipcServer.IsConnected)
-        {
-            var sw = Stopwatch.StartNew();
-            while (!_ipcServer.IsConnected && sw.Elapsed < TimeSpan.FromSeconds(5) && !ct.IsCancellationRequested)
-            {
-                await Task.Delay(100, ct).ConfigureAwait(false);
-            }
-        }
-
-        if (!_ipcServer.IsConnected)
-        {
-            return ErrorResult("GhostWorkerNotConnected", "The Ghost session worker in Session 2 is not connected to the IPC bus. Ensure the session was started with computer_ghost_start and the Inbrisk worker is running inside Session 2.");
-        }
-
-        var payload = new
-        {
-            steps,
-            set,
-            until,
-            read,
-            detail = detail ?? "slim",
-            failFast = failFast ?? fail_fast ?? true,
-            autoDismissModals = autoDismissModals ?? auto_dismiss_modals ?? "closeOnly",
-            operationId
-        };
-        string payloadJson = JsonSerializer.Serialize(payload, SerializerOptions);
-        var timeout = TimeSpan.FromMilliseconds(Math.Clamp(timeoutMs ?? 30000, 1000, 300_000));
-
-        try
-        {
-            string responseJson = await _ipcServer.SendRequestAsync(GhostBatchDispatcher.ExecuteBatchAction, payloadJson, timeout, ct).ConfigureAwait(false);
-
-            bool isErr = false;
-            try
-            {
-                using var doc = JsonDocument.Parse(responseJson);
-                if (doc.RootElement.TryGetProperty("isError", out var ep) && ep.GetBoolean())
-                {
-                    isErr = true;
-                }
-                else if (doc.RootElement.TryGetProperty("success", out var sp) && !sp.GetBoolean())
-                {
-                    isErr = true;
-                }
-            }
-            catch
-            {
-                // Fall through on non-JSON response string
-            }
-
-            return new CallToolResult
-            {
-                IsError = isErr,
-                Content = [new TextContentBlock { Text = responseJson }]
-            };
-        }
-        catch (GhostIpcException gex)
-        {
-            return ErrorResult("GhostIpcError", $"IPC communication with Session 2 failed: {gex.Message}");
-        }
-        catch (TimeoutException tex)
-        {
-            return ErrorResult("Timeout", $"Ghost batch execution timed out after {timeout.TotalSeconds:F0}s: {tex.Message}");
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            return ErrorResult("Cancelled", "Ghost batch operation was cancelled.");
-        }
-        catch (Exception ex)
-        {
-            return ErrorResult(ex.GetType().Name, $"Unexpected error executing ghost batch: {ex.Message}");
-        }
+        return await GetTools().Batch(
+            steps: steps,
+            set: set,
+            until: until,
+            read: read,
+            detail: detail,
+            failFast: failFast ?? fail_fast,
+            saveAsRecipe: null,
+            save_as_recipe: null,
+            enableReflex: null,
+            enable_reflex: null,
+            autoDismissModals: autoDismissModals ?? auto_dismiss_modals,
+            operationId: operationId ?? operation_id,
+            ghost: true,
+            ct: ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -668,6 +634,8 @@ public sealed class GhostMcpBridge : IDisposable
             success = true,
             isActive = sessionStatus.IsActive,
             sessionId = sessionStatus.SessionId,
+            pipActive = _pipManager.IsRunning,
+            windowHandle = _pipManager.WindowHandle != IntPtr.Zero ? $"0x{_pipManager.WindowHandle:X}" : null,
             username = sessionStatus.Username,
             state = sessionStatus.State,
             uptime = sessionStatus.Uptime.ToString(@"hh\:mm\:ss"),
@@ -682,90 +650,22 @@ public sealed class GhostMcpBridge : IDisposable
     }
 
     /// <summary>
-    /// Returns the operational status of the isolated Ghost Desktop, including resolution, active windows, and running state.
+    /// Legacy shim forwarding ghost desktop status query to the unified computer_windows tool with ghost: true.
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_status"), Description(
-        "Returns the operational status of the isolated Ghost Desktop, including resolution, active windows, and running state.")]
+        "Legacy shim forwarding to unified computer_windows with ghost: true. Returns the operational status and active windows of the isolated Ghost Desktop.")]
     public async Task<CallToolResult> GhostDesktopStatus(CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopStatus");
-        int width = 1920;
-        int height = 1080;
-        bool isActive = false;
-        var windows = new List<object>();
-        int processCount = 0;
-
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-        {
-            try
-            {
-                var hDesktop = GhostDesktopNative.OpenDesktop(GhostDesktopNative.DefaultGhostDesktopName, GhostDesktopNative.DESKTOP_ALL_ACCESS, false);
-                if (hDesktop != IntPtr.Zero)
-                {
-                    try
-                    {
-                        isActive = true;
-                        var hwnds = GhostDesktopNative.EnumerateWindows(hDesktop);
-                        foreach (var hwnd in hwnds)
-                        {
-                            var (title, className, visible) = GhostDesktopNative.GetWindowDetails(hwnd);
-                            if (!string.IsNullOrWhiteSpace(title) || visible)
-                            {
-                                windows.Add(new
-                                {
-                                    hwnd = $"0x{hwnd:X}",
-                                    title,
-                                    className,
-                                    isVisible = visible
-                                });
-                            }
-                        }
-                    }
-                    finally
-                    {
-                        GhostDesktopNative.CloseDesktop(hDesktop);
-                    }
-                }
-            }
-            catch { }
-
-            lock (_desktopGate)
-            {
-                if (_localDesktop != null && _localDesktop.IsCreated)
-                {
-                    isActive = true;
-                    processCount = _localDesktop.ProcessCount;
-                }
-            }
-        }
-
-        var result = new
-        {
-            success = true,
-            isActive,
-            desktopName = GhostDesktopNative.DefaultGhostDesktopName,
-            resolution = $"{width}x{height}",
-            width,
-            height,
-            windowsCount = windows.Count,
-            windows,
-            processCount,
-            pipActive = _pipManager.IsRunning,
-            pipPosition = _pipManager.CurrentPosition.ToString(),
-            pipInteractive = _pipManager.IsInteractive,
-            message = isActive
-                ? $"Ghost Desktop '{GhostDesktopNative.DefaultGhostDesktopName}' is ACTIVE with {windows.Count} window(s)."
-                : $"Ghost Desktop '{GhostDesktopNative.DefaultGhostDesktopName}' is inactive."
-        };
-
-        return SuccessResult(result);
+        await Task.CompletedTask;
+        return GetTools().Windows(ghost: true, ct: ct);
     }
 
     /// <summary>
-    /// Launches an application or command-line process directly on the isolated Ghost Desktop without interfering with the user's desktop.
+    /// Legacy shim forwarding process launch to the unified computer_launch tool with ghost: true.
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_launch"), Description(
-        "Launches an application or command-line process directly on the isolated Ghost Desktop without interfering with the user's desktop.")]
+        "Legacy shim forwarding to unified computer_launch with ghost: true. Launches an application or command-line process directly on the isolated Ghost Desktop without interfering with the user's desktop.")]
     public async Task<CallToolResult> GhostDesktopLaunch(
         [Description("Executable path or command name to run (e.g. 'cmd.exe', 'powershell.exe', 'notepad.exe', 'chrome.exe')")] string program,
         [Description("Optional command-line arguments")] string? args = null,
@@ -773,47 +673,30 @@ public sealed class GhostMcpBridge : IDisposable
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopLaunch");
-
-        if (EmergencyGate.IsStopped)
-        {
-            return EmergencyResult();
-        }
-
         if (string.IsNullOrWhiteSpace(program))
         {
             return ErrorResult("Malformed", "'program' must not be null or empty.");
         }
 
-        try
-        {
-            var desktop = GetOrCreateDesktop();
-            var proc = desktop.StartProcess(program, args, workingDir);
+        string[]? argArray = string.IsNullOrWhiteSpace(args)
+            ? null
+            : args.Split(' ', StringSplitOptions.RemoveEmptyEntries);
 
-            var result = new
-            {
-                success = true,
-                processId = proc.Id,
-                processName = proc.ProcessName,
-                program,
-                arguments = args,
-                workingDirectory = workingDir,
-                desktopName = desktop.DesktopName,
-                message = $"Process '{program}' successfully launched on isolated desktop '{desktop.DesktopName}' (PID: {proc.Id})."
-            };
+        bool isPath = program.Contains(Path.DirectorySeparatorChar) || program.Contains(Path.AltDirectorySeparatorChar);
 
-            return SuccessResult(result);
-        }
-        catch (Exception ex)
-        {
-            return ErrorResult("LaunchFailed", $"Failed to launch '{program}' on Ghost Desktop: {ex.Message}");
-        }
+        return await GetTools().Launch(
+            executable: isPath ? null : program,
+            path: isPath ? program : null,
+            arguments: argArray,
+            ghost: true,
+            ct: ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Performs a mouse click at the specified coordinates on the isolated Ghost Desktop. Does NOT move or affect the user's physical mouse cursor.
+    /// Legacy shim forwarding mouse click to the unified computer_click tool with ghost: true.
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_click"), Description(
-        "Performs a mouse click at the specified coordinates on the isolated Ghost Desktop. Does NOT move or affect the user's physical mouse cursor.")]
+        "Legacy shim forwarding to unified computer_click with ghost: true. Performs a mouse click at the specified coordinates on the isolated Ghost Desktop.")]
     public async Task<CallToolResult> GhostDesktopClick(
         [Description("Physical X coordinate on the ghost desktop (0 to 1919)")] int x,
         [Description("Physical Y coordinate on the ghost desktop (0 to 1079)")] int y,
@@ -822,179 +705,79 @@ public sealed class GhostMcpBridge : IDisposable
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopClick");
-        await Task.CompletedTask;
-
-        if (EmergencyGate.IsStopped)
-        {
-            return EmergencyResult();
-        }
-
-        int maxX = 1920, maxY = 1080;
-        if (_sessionManager is GhostSessionManager gsmBounds)
-        {
-            maxX = gsmBounds.CurrentConfig.Width;
-            maxY = gsmBounds.CurrentConfig.Height;
-        }
-        if (x < 0 || y < 0 || x >= maxX || y >= maxY)
-        {
-            return ErrorResult("Malformed", $"Coordinates ({x}, {y}) are outside the ghost desktop bounds 0..{maxX - 1} x 0..{maxY - 1}.");
-        }
-
-        try
-        {
-            var input = GetOrCreateInput();
-            MouseButton mb = (button?.Trim().ToLowerInvariant()) switch
-            {
-                "right" => MouseButton.Right,
-                "middle" => MouseButton.Middle,
-                _ => MouseButton.Left
-            };
-
-            bool dbl = doubleClick ?? false;
-            input.SendMouseClick(x, y, mb, dbl);
-
-            var result = new
-            {
-                success = true,
-                x,
-                y,
-                button = mb.ToString(),
-                doubleClick = dbl,
-                desktopName = input.DesktopName,
-                message = $"Injected mouse {(dbl ? "double-" : "")}click with {mb} button at ({x}, {y}) on {input.DesktopName}."
-            };
-
-            return SuccessResult(result);
-        }
-        catch (Exception ex)
-        {
-            return ErrorResult("ClickFailed", $"Failed to inject mouse click: {ex.Message}");
-        }
+        string btn = (doubleClick == true) ? "double" : (button ?? "left");
+        return await GetTools().Click(
+            x: x,
+            y: y,
+            button: btn,
+            ghost: true,
+            ct: ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Types text into the active/focused window on the isolated Ghost Desktop. Does NOT affect the user's foreground typing.
+    /// Legacy shim forwarding keyboard typing to the unified computer_type tool with ghost: true.
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_type"), Description(
-        "Types text into the active/focused window on the isolated Ghost Desktop. Does NOT affect the user's foreground typing.")]
+        "Legacy shim forwarding to unified computer_type with ghost: true. Types text into the active/focused window on the isolated Ghost Desktop.")]
     public async Task<CallToolResult> GhostDesktopType(
         [Description("Text string to type into the ghost desktop")] string text,
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopType");
-        await Task.CompletedTask;
-
-        if (EmergencyGate.IsStopped)
-        {
-            return EmergencyResult();
-        }
-
-        if (text == null)
-        {
-            return ErrorResult("Malformed", "'text' must not be null.");
-        }
-        if (text.Length > 8192)
-        {
-            return ErrorResult("Malformed", "'text' exceeds the 8192-character limit.");
-        }
-
-        try
-        {
-            var input = GetOrCreateInput();
-            input.SendText(text);
-
-            var result = new
-            {
-                success = true,
-                charactersTyped = text.Length,
-                desktopName = input.DesktopName,
-                message = $"Typed {text.Length} character(s) into Ghost Desktop."
-            };
-
-            return SuccessResult(result);
-        }
-        catch (Exception ex)
-        {
-            return ErrorResult("TypeFailed", $"Failed to inject text input: {ex.Message}");
-        }
+        return await GetTools().Type(
+            text: text,
+            ghost: true,
+            ct: ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Captures a high-resolution screenshot from the isolated Ghost Desktop frame buffer.
+    /// Legacy shim forwarding screenshot capture to the unified computer_screenshot tool with ghost: true.
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_screenshot"), Description(
-        "Captures a high-resolution screenshot from the isolated Ghost Desktop frame buffer.")]
+        "Legacy shim forwarding to unified computer_screenshot with ghost: true. Captures a screenshot from the isolated Ghost Desktop frame buffer.")]
     public async Task<CallToolResult> GhostDesktopScreenshot(CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopScreenshot");
         await Task.CompletedTask;
-        byte[]? pngBytes = TryReadSharedFrameToPng(out int width, out int height, out long frameIndex);
-
-        if (pngBytes == null)
-        {
-            try
-            {
-                pngBytes = GhostDesktopCapture.CaptureDesktopToPng(GhostDesktopNative.DefaultGhostDesktopName, width, height);
-            }
-            catch (Exception ex)
-            {
-                return ErrorResult("ScreenshotFailed", $"Could not capture ghost desktop: {ex.Message}");
-            }
-        }
-
-        var meta = new
-        {
-            success = true,
-            width,
-            height,
-            frameIndex,
-            bytes = pngBytes.Length,
-            message = $"Captured {width}x{height} screenshot from Inbrisk Ghost Desktop."
-        };
-
-        return new CallToolResult
-        {
-            IsError = false,
-            Content =
-            [
-                new TextContentBlock { Text = JsonSerializer.Serialize(meta, SerializerOptions) },
-                ImageContentBlock.FromBytes(pngBytes, "image/png")
-            ]
-        };
+        return GetTools().Screenshot(target: "desktop", ghost: true, ct: ct);
     }
 
     /// <summary>
-    /// Opens or controls the Inbrisk Ghost Control suite (System Tray daemon, PiP window, isolated Ghost Desktop).
+    /// Alias for computer_ghost_control. Opens or controls the Inbrisk Ghost Control suite (System Tray daemon, PiP window, isolated Ghost Desktop).
     /// </summary>
     [McpServerTool(Name = "ghost_control_open"), Description(
-        "Opens or controls the Inbrisk Ghost Control suite (System Tray daemon, PiP window, isolated Ghost Desktop). Starts the daemon if not running.")]
+        "Alias for computer_ghost_control. Opens or controls the Inbrisk Ghost Control suite (System Tray daemon, PiP window, isolated Ghost Desktop). Starts the daemon if not running.")]
     public async Task<CallToolResult> GhostControlOpen(
         [Description("Action to perform: 'open'|'tray' (starts daemon if not running), 'pip' (configures PiP), 'status' (queries status), 'stop' (stops daemon). Default: 'open'")] string? action = "open",
         [Description("Toggle click-through transparent mode (true = clickable/interactive, false = click-through transparent).")] bool? interactive = null,
         [Description("Toggle full-screen Shadow Mode covering the primary display.")] bool? fullScreen = null,
+        [Description("Alias of fullScreen")] bool? fullscreen = null,
+        [Description("Alias of fullScreen")] bool? full_screen = null,
         [Description("Preset anchor position: TopLeft | TopRight | BottomLeft | BottomRight")] string? position = null,
         [Description("Alpha opacity: 50 | 80 | 100 (or 0-255 / percentage)")] byte? opacity = null,
         [Description("Window scale multiplier (e.g. 1.0, 1.5, 2.0; default: 1.0)")] float? scale = null,
         CancellationToken ct = default)
     {
-        return await ExecuteGhostControlAsync(action, interactive, fullScreen, position, opacity, scale, ct).ConfigureAwait(false);
+        return await ComputerGhostControl(action, interactive, fullScreen, fullscreen, full_screen, position, opacity, scale, ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Controls the Ghost OS desktop, tray daemon, and PiP overlay.
+    /// Sole presentation tool for Ghost PiP and daemon. Controls the Ghost OS desktop, tray daemon, and PiP overlay.
     /// </summary>
     [McpServerTool(Name = "computer_ghost_control"), Description(
-        "Controls the Ghost OS desktop, tray daemon, and PiP overlay.")]
+        "Sole presentation tool for Ghost PiP and daemon. Controls the Ghost OS desktop, tray daemon, and PiP overlay (action: open|tray|pip|status|stop, interactive, fullscreen, position, opacity, scale).")]
     public async Task<CallToolResult> ComputerGhostControl(
         [Description("Action to perform: 'open'|'tray' (starts daemon if not running), 'pip' (configures PiP), 'status' (queries status), 'stop' (stops daemon). Default: 'open'")] string? action = "open",
         [Description("Toggle click-through transparent mode (true = clickable/interactive, false = click-through transparent).")] bool? interactive = null,
         [Description("Toggle full-screen Shadow Mode covering the primary display.")] bool? fullScreen = null,
+        [Description("Alias of fullScreen")] bool? fullscreen = null,
+        [Description("Alias of fullScreen")] bool? full_screen = null,
         [Description("Preset anchor position: TopLeft | TopRight | BottomLeft | BottomRight")] string? position = null,
         [Description("Alpha opacity: 50 | 80 | 100 (or 0-255 / percentage)")] byte? opacity = null,
         [Description("Window scale multiplier (e.g. 1.0, 1.5, 2.0; default: 1.0)")] float? scale = null,
         CancellationToken ct = default)
     {
-        return await ExecuteGhostControlAsync(action, interactive, fullScreen, position, opacity, scale, ct).ConfigureAwait(false);
+        return await ExecuteGhostControlAsync(action, interactive, fullScreen ?? fullscreen ?? full_screen, position, opacity, scale, ct).ConfigureAwait(false);
     }
 
     private async Task<CallToolResult> ExecuteGhostControlAsync(
@@ -1037,7 +820,19 @@ public sealed class GhostMcpBridge : IDisposable
                     if (act == "stop")
                     {
                         var stopResp = await testClient.SendRequestAsync("stop", JsonSerializer.Serialize(new { token = controlToken }), TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
-                        return SuccessResult(new { success = true, action = "stop", state = "stopped", message = "Ghost Control daemon stopped.", response = stopResp });
+                        object? respObj = null;
+                        try { using var d = JsonDocument.Parse(stopResp); respObj = d.RootElement.Clone(); } catch { respObj = stopResp; }
+                        return SuccessResult(new
+                        {
+                            success = true,
+                            action = "stop",
+                            sessionId = (int?)null,
+                            pipActive = false,
+                            windowHandle = (string?)null,
+                            state = "stopped",
+                            message = "Ghost Control daemon stopped.",
+                            response = respObj
+                        });
                     }
 
                     var actionsTaken = new List<string>();
@@ -1079,17 +874,56 @@ public sealed class GhostMcpBridge : IDisposable
 
                     string statusJson = await testClient.SendRequestAsync("status", "{}", TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
 
+                    int? daemonSessionId = null;
+                    bool daemonPipActive = false;
+                    string? daemonWindowHandle = null;
+                    object? parsedStatus = null;
+
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(statusJson);
+                        parsedStatus = doc.RootElement.Clone();
+
+                        if (doc.RootElement.TryGetProperty("session", out var sessProp) &&
+                            sessProp.TryGetProperty("sessionId", out var sidProp) &&
+                            sidProp.ValueKind == JsonValueKind.Number)
+                        {
+                            daemonSessionId = sidProp.GetInt32();
+                        }
+
+                        if (doc.RootElement.TryGetProperty("pip", out var pipProp))
+                        {
+                            if (pipProp.TryGetProperty("running", out var runProp) &&
+                                (runProp.ValueKind == JsonValueKind.True || runProp.ValueKind == JsonValueKind.False))
+                            {
+                                daemonPipActive = runProp.GetBoolean();
+                            }
+                            if (pipProp.TryGetProperty("hwnd", out var hwndProp) &&
+                                hwndProp.ValueKind == JsonValueKind.String)
+                            {
+                                daemonWindowHandle = hwndProp.GetString();
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        parsedStatus = statusJson;
+                    }
+
                     return SuccessResult(new
                     {
                         success = true,
                         daemonRunning = true,
+                        sessionId = daemonSessionId ?? (_sessionManager as GhostSessionManager)?.CurrentSessionId,
+                        pipActive = daemonPipActive || _pipManager.IsRunning,
+                        windowHandle = daemonWindowHandle ?? (_pipManager.WindowHandle != IntPtr.Zero ? $"0x{_pipManager.WindowHandle:X}" : null),
                         state = "running",
                         pipeName = "inbrisk_ghost_control",
                         actionsApplied = actionsTaken,
                         message = actionsTaken.Count > 0
                             ? $"Applied settings to running Ghost Control: {string.Join(", ", actionsTaken)}"
                             : "Ghost Control daemon is already active and running.",
-                        status = statusJson
+                        status = parsedStatus
                     });
                 }
             }
@@ -1102,12 +936,33 @@ public sealed class GhostMcpBridge : IDisposable
 
         if (act == "stop")
         {
-            return SuccessResult(new { success = true, action = "stop", state = "stopped", message = "Ghost Control daemon is not running." });
+            return SuccessResult(new
+            {
+                success = true,
+                action = "stop",
+                sessionId = (int?)null,
+                pipActive = false,
+                windowHandle = (string?)null,
+                state = "stopped",
+                message = "Ghost Control daemon is not running."
+            });
         }
 
         if (act == "status")
         {
-            return SuccessResult(new { success = true, daemonRunning = false, state = "stopped", message = "Ghost Control daemon is not running." });
+            var localStatus = await _sessionManager.GetStatusAsync(ct).ConfigureAwait(false);
+            return SuccessResult(new
+            {
+                success = true,
+                daemonRunning = false,
+                sessionId = localStatus.SessionId,
+                pipActive = _pipManager.IsRunning,
+                windowHandle = _pipManager.WindowHandle != IntPtr.Zero ? $"0x{_pipManager.WindowHandle:X}" : null,
+                state = localStatus.IsActive ? localStatus.State : "stopped",
+                message = localStatus.IsActive
+                    ? "Ghost session is active in-process; Ghost Control daemon is not running."
+                    : "Ghost Control daemon is not running."
+            });
         }
 
         // 2. Daemon not running -> Start in background via Process.Start("inbrisk.exe", "ghost tray")
@@ -1144,6 +999,11 @@ public sealed class GhostMcpBridge : IDisposable
             // Wait briefly for pipe to warm up
             var sw = Stopwatch.StartNew();
             bool connected = false;
+            int? launchedSessionId = null;
+            bool launchedPipActive = false;
+            string? launchedHwnd = null;
+            object? parsedStatus = null;
+
             while (sw.ElapsedMilliseconds < 3500 && !ct.IsCancellationRequested)
             {
                 await Task.Delay(250, ct).ConfigureAwait(false);
@@ -1155,6 +1015,34 @@ public sealed class GhostMcpBridge : IDisposable
                     if (check.IsConnected)
                     {
                         connected = true;
+                        try
+                        {
+                            string statusResp = await check.SendRequestAsync("status", "{}", TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                            using var doc = JsonDocument.Parse(statusResp);
+                            parsedStatus = doc.RootElement.Clone();
+
+                            if (doc.RootElement.TryGetProperty("session", out var sessProp) &&
+                                sessProp.TryGetProperty("sessionId", out var sidProp) &&
+                                sidProp.ValueKind == JsonValueKind.Number)
+                            {
+                                launchedSessionId = sidProp.GetInt32();
+                            }
+
+                            if (doc.RootElement.TryGetProperty("pip", out var pipProp))
+                            {
+                                if (pipProp.TryGetProperty("running", out var runProp) &&
+                                    (runProp.ValueKind == JsonValueKind.True || runProp.ValueKind == JsonValueKind.False))
+                                {
+                                    launchedPipActive = runProp.GetBoolean();
+                                }
+                                if (pipProp.TryGetProperty("hwnd", out var hwndProp) &&
+                                    hwndProp.ValueKind == JsonValueKind.String)
+                                {
+                                    launchedHwnd = hwndProp.GetString();
+                                }
+                            }
+                        }
+                        catch { }
                         break;
                     }
                 }
@@ -1170,9 +1058,13 @@ public sealed class GhostMcpBridge : IDisposable
                 success = true,
                 started = true,
                 processId = proc?.Id,
+                sessionId = launchedSessionId ?? (_sessionManager as GhostSessionManager)?.CurrentSessionId,
+                pipActive = launchedPipActive || _pipManager.IsRunning,
+                windowHandle = launchedHwnd ?? (_pipManager.WindowHandle != IntPtr.Zero ? $"0x{_pipManager.WindowHandle:X}" : null),
                 executable = exe,
                 arguments = startArgs,
                 pipeConnected = connected,
+                status = parsedStatus,
                 message = connected
                     ? "Ghost Control daemon successfully started and listening."
                     : "Ghost Control process launched. Initializing background session and PiP overlay."

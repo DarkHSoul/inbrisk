@@ -405,7 +405,12 @@ public class ReliabilityAndPerformancePhaseTests
     [Fact]
     public async Task SaveRecipe_AcceptsLegacyRawJsonSteps()
     {
-        using var session = new McpSession(EmergencyControl.Process, startEvents: false);
+        // ForTests, not Process: the real process control only latches Active
+        // when a hotkey authority exists on the live machine — with the user's
+        // running Inbrisk desktop holding the panic chord (peer undetectable:
+        // different marker path), the default EmergencyStopped state would
+        // fail every mutating call here. ForTests is deterministic Active.
+        using var session = new McpSession(EmergencyControl.ForTests(), startEvents: false);
         var tools = new InbriskTools(session);
 
         var legacyJson = JsonDocument.Parse("[{\"action\":\"click\",\"target\":{\"name\":\"OK\"}}]").RootElement;
@@ -442,10 +447,10 @@ public class ReliabilityAndPerformancePhaseTests
     // =========================================================================
 
     [Fact]
-    public void CoreToolNames_ContainsExactly25Tools()
+    public void CoreToolNames_ContainsExactly26Tools()
     {
         var coreTools = McpHost.CoreTools;
-        Assert.Equal(25, coreTools.Count);
+        Assert.Equal(26, coreTools.Count);
 
         var expected = new[]
         {
@@ -477,6 +482,9 @@ public class ReliabilityAndPerformancePhaseTests
             // ghost desktop control entry points
             "ghost_control_open",
             "computer_ghost_control",
+            // session desktop switch — a core session must be able to move
+            // itself onto the isolated desktop
+            "computer_session",
         };
 
         foreach (var tool in expected)

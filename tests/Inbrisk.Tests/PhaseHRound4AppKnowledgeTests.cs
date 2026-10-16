@@ -105,6 +105,9 @@ public sealed class PhaseHRound4AppKnowledgeTests : IDisposable
         public TaskRecipeDefinition? Get(string name) => _recipes.TryGetValue(name, out var r) ? r : null;
         public IReadOnlyList<TaskRecipeDefinition> List() => _recipes.Values.ToList();
         public void RecordRun(string name, bool success) { }
+        // ITaskRecipeStore is storage-agnostic; a memory store has no on-disk
+        // path, so return a synthetic one for diagnostics only.
+        public string PathFor(string name) => $"(memory)/{name}.json";
     }
 
     // =========================================================================

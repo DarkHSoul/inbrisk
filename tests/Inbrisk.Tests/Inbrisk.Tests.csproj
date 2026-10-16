@@ -29,6 +29,15 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <!-- GUI otomasyonu testleri tek ise kosmalidir. xunit.runner.json
+       xunit.runner.visualstudio tarafindan otomatik bulunur ancak
+       CopyToOutputDirectory tanimlanmazsa bazi build yapilarinda
+       kopyalanmaz; assembly seviyesindeki TestParallelization.cs
+       bu durumda yedek guvence olarak calisir. -->
+  <ItemGroup>
+    <None Update="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <Target Name="RemoveTestHostExe" AfterTargets="Build">
     <Delete Files="$(TargetDir)testhost.exe" Condition="Exists('$(TargetDir)testhost.exe')" />
   </Target>

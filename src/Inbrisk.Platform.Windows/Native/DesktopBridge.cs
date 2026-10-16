@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -11,6 +12,54 @@ namespace Inbrisk.Platform.Windows.Native;
 public static class DesktopBridge
 {
     private const uint DesktopAllAccess = 0x01FF;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public string? lpReserved;
+        public string? lpDesktop;
+        public string? lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CreateProcessW(
+        string? lpApplicationName,
+        StringBuilder? lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string? lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern IntPtr OpenDesktop(string lpszDesktop, uint dwFlags, bool fInherit, uint dwDesiredAccess);
@@ -29,6 +78,104 @@ public static class DesktopBridge
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, StringBuilder pvInfo, int nLength, out int lpnLengthNeeded);
+
+    /// <summary>
+    /// Launches an executable process with STARTUPINFO.lpDesktop explicitly set to @"WinSta0\Default"
+    /// so the window appears on the user's interactive desktop rather than a background sandbox desktop.
+    /// </summary>
+    public static int? CreateProcessOnDefaultDesktop(string applicationPath, IReadOnlyList<string>? args = null, string? workingDirectory = null)
+    {
+        try
+        {
+            var si = new STARTUPINFO();
+            si.cb = Marshal.SizeOf<STARTUPINFO>();
+            si.lpDesktop = @"WinSta0\Default";
+
+            var cmdBuilder = new StringBuilder();
+            var trimmedPath = applicationPath.Trim();
+            if (trimmedPath.StartsWith("\"") && trimmedPath.EndsWith("\""))
+                cmdBuilder.Append(trimmedPath);
+            else
+                cmdBuilder.Append('"').Append(trimmedPath).Append('"');
+
+            if (args != null)
+            {
+                foreach (var arg in args)
+                {
+                    if (arg == null) continue;
+                    cmdBuilder.Append(' ');
+                    if (arg.Length == 0)
+                    {
+                        cmdBuilder.Append("\"\"");
+                    }
+                    else if (!arg.Contains(' ') && !arg.Contains('\t') && !arg.Contains('"'))
+                    {
+                        cmdBuilder.Append(arg);
+                    }
+                    else
+                    {
+                        cmdBuilder.Append('"').Append(arg.Replace("\"", "\\\"")).Append('"');
+                    }
+                }
+            }
+
+            var appName = File.Exists(trimmedPath) ? trimmedPath : null;
+            bool ok = CreateProcessW(
+                appName,
+                cmdBuilder,
+                IntPtr.Zero,
+                IntPtr.Zero,
+                false,
+                0,
+                IntPtr.Zero,
+                string.IsNullOrEmpty(workingDirectory) ? null : workingDirectory,
+                ref si,
+                out var pi);
+
+            if (!ok && appName != null)
+            {
+                // Retry with null appName and command line token if absolute path failed
+                ok = CreateProcessW(
+                    null,
+                    cmdBuilder,
+                    IntPtr.Zero,
+                    IntPtr.Zero,
+                    false,
+                    0,
+                    IntPtr.Zero,
+                    string.IsNullOrEmpty(workingDirectory) ? null : workingDirectory,
+                    ref si,
+                    out pi);
+            }
+
+            if (ok)
+            {
+                if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
+                if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
+                return pi.dwProcessId;
+            }
+
+            // Fallback: start via Process.Start wrapped in RunOnDefaultDesktop
+            return RunOnDefaultDesktop(() =>
+            {
+                var psi = new ProcessStartInfo(trimmedPath)
+                {
+                    UseShellExecute = true,
+                    WorkingDirectory = workingDirectory ?? ""
+                };
+                if (args != null)
+                {
+                    foreach (var a in args) psi.ArgumentList.Add(a);
+                }
+                var p = Process.Start(psi);
+                return p?.Id;
+            });
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     public static string GetCurrentDesktopName()
     {
@@ -116,4 +263,14 @@ public static class DesktopBridge
         if (error != null) throw new InvalidOperationException("Failed on Default desktop", error);
         return result;
     }
+
+    public static void RunOnDefaultDesktop(Action action)
+    {
+        RunOnDefaultDesktop<bool>(() =>
+        {
+            action();
+            return true;
+        });
+    }
 }
+

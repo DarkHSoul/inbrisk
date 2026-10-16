@@ -32,9 +32,10 @@ public sealed class PhaseHRound5DynamicToolsetTests
 
         var visible = manager.GetVisibleToolNames();
 
-        // Must include exactly the 25 core tools (16 desktop primitives +
-        // 7 escape-hatch/run-lifecycle + 2 ghost-control entry points)
-        Assert.Equal(25, visible.Count);
+        // Must include exactly the 26 core tools (16 desktop primitives +
+        // 7 escape-hatch/run-lifecycle + 2 ghost-control entry points +
+        // the session desktop switch)
+        Assert.Equal(26, visible.Count);
         Assert.Contains("computer_batch", visible);
         Assert.Contains("computer_do", visible);
         Assert.Contains("computer_run", visible);
@@ -51,6 +52,7 @@ public sealed class PhaseHRound5DynamicToolsetTests
         Assert.Contains("computer_screenshot", visible);
         Assert.Contains("computer_reset_input", visible);
         Assert.Contains("computer_capabilities", visible);
+        Assert.Contains("computer_session", visible);
 
         // Optional browser tools must NOT be visible by default in core profile
         Assert.DoesNotContain("browser_browse", visible);
@@ -91,8 +93,8 @@ public sealed class PhaseHRound5DynamicToolsetTests
         Assert.Contains("browser_content", visible);
         Assert.Contains("browser_screenshot", visible);
 
-        // Core tools must still remain visible, total tools = 25 + 7 = 32
-        Assert.Equal(32, visible.Count);
+        // Core tools must still remain visible, total tools = 26 + 7 = 33
+        Assert.Equal(33, visible.Count);
         Assert.Contains("computer_click", visible);
         Assert.Contains("computer_observe", visible);
     }

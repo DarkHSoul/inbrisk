@@ -1,14 +1,20 @@
 using System.Diagnostics;
+using System.Drawing;
+using System.Drawing.Imaging;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Inbrisk.Core;
 using Inbrisk.Mcp;
+using Inbrisk.Platform.Windows;
 using Inbrisk.Platform.Windows.Hud;
 using Inbrisk.Platform.Windows.Indicator;
 using Inbrisk.Platform.Windows.Topology;
 using Inbrisk.Platform.Windows.Tray;
 using Inbrisk.Runtime;
 using Inbrisk.Sdk;
+using GhostBatchResult = Inbrisk.Runtime.GhostBatchResult;
+using GhostInputExecutor = Inbrisk.Runtime.GhostInputExecutor;
 
 // Exception resilience: a fault on any background thread, timer, async-void
 // or event callback must never take down the MCP server/daemon. Log and
@@ -97,11 +103,22 @@ try
 }
 catch { /* update must never break the requested command */ }
 
-// `inbrisk mcp [--stdio] [--log-level debug]` — runs the MCP stdio server
+// `inbrisk mcp [--stdio] [--log-level debug] [--ghost]` — runs the MCP stdio server
 // in-process; the server owns its own InbriskRuntime via McpSession, so it
 // must dispatch before the CLI's runtime is created.
 if (args[0].Equals("mcp", StringComparison.OrdinalIgnoreCase))
-    return await Inbrisk.Mcp.McpHost.RunAsync(args.Skip(1).ToArray());
+{
+    var mcpArgs = args.Skip(1).ToArray();
+    if (Has(args, "--ghost"))
+    {
+        Environment.SetEnvironmentVariable("INBRISK_GHOST", "1");
+        if (!mcpArgs.Contains("--ghost", StringComparer.OrdinalIgnoreCase))
+        {
+            mcpArgs = mcpArgs.Append("--ghost").ToArray();
+        }
+    }
+    return await Inbrisk.Mcp.McpHost.RunAsync(mcpArgs);
+}
 
 // Production surface (setup/doctor/install/status/…) — runs WITHOUT the
 // computer-control runtime: no indicator, no input hooks, no session.
@@ -120,35 +137,36 @@ try
 {
     if (args.ElementAtOrDefault(1) is "--help" or "-h")
         return CmdHelp(cmd);
-    return cmd switch
+    switch (cmd)
     {
-        "windows" => CmdWindows(inbrisk),
-        "monitors" => CmdMonitors(inbrisk),
-        "inspect" => CmdInspect(inbrisk, args),
-        "find" => CmdFind(inbrisk, args),
-        "invoke" => CmdAct(inbrisk, args, ActionKind.Invoke),
-        "click" => CmdAct(inbrisk, args, ActionKind.Click),
-        "clickat" => CmdClickAt(inbrisk, args),
-        "rightclick" => CmdRightClick(inbrisk, args),
-        "scroll" => CmdScroll(inbrisk, args),
-        "key" => CmdKey(inbrisk, args),
-        "hotkey" => CmdHotkey(inbrisk, args),
-        "drag" => CmdDrag(inbrisk, args),
-        "setvalue" => CmdSetValue(inbrisk, args),
-        "type" => CmdType(inbrisk, args),
-        "toggle" => CmdAct(inbrisk, args, ActionKind.Toggle),
-        "select" => CmdAct(inbrisk, args, ActionKind.Select),
-        "focus" => CmdFocus(inbrisk, args),
-        "observe" => CmdObserve(inbrisk, args),
-        "shot" => CmdShot(inbrisk, args),
-        "wait" => CmdWait(inbrisk, args),
-        "run" => CmdRun(inbrisk, args),
-        "events" => CmdEvents(inbrisk, args),
-        "clipboard" => CmdClipboard(inbrisk, args),
-        "guards" => CmdGuards(inbrisk),
-        "reset-input" => CmdResetInput(inbrisk, args),
-        _ => Usage(),
-    };
+        case "windows": return CmdWindows(inbrisk, args);
+        case "launch": return CmdLaunch(inbrisk, args);
+        case "shot": return CmdShot(inbrisk, args);
+        case "run": return await CmdRunAsync(inbrisk, args).ConfigureAwait(false);
+        case "monitors": return CmdMonitors(inbrisk);
+        case "inspect": return CmdInspect(inbrisk, args);
+        case "find": return CmdFind(inbrisk, args);
+        case "invoke": return CmdAct(inbrisk, args, ActionKind.Invoke);
+        case "click": return CmdAct(inbrisk, args, ActionKind.Click);
+        case "clickat": return CmdClickAt(inbrisk, args);
+        case "rightclick": return CmdRightClick(inbrisk, args);
+        case "scroll": return CmdScroll(inbrisk, args);
+        case "key": return CmdKey(inbrisk, args);
+        case "hotkey": return CmdHotkey(inbrisk, args);
+        case "drag": return CmdDrag(inbrisk, args);
+        case "setvalue": return CmdSetValue(inbrisk, args);
+        case "type": return CmdType(inbrisk, args);
+        case "toggle": return CmdAct(inbrisk, args, ActionKind.Toggle);
+        case "select": return CmdAct(inbrisk, args, ActionKind.Select);
+        case "focus": return CmdFocus(inbrisk, args);
+        case "observe": return CmdObserve(inbrisk, args);
+        case "wait": return CmdWait(inbrisk, args);
+        case "events": return CmdEvents(inbrisk, args);
+        case "clipboard": return CmdClipboard(inbrisk, args);
+        case "guards": return CmdGuards(inbrisk);
+        case "reset-input": return CmdResetInput(inbrisk, args);
+        default: return Usage();
+    }
 }
 catch (InbriskException e)
 {
@@ -191,10 +209,85 @@ static async Task<(bool uia, bool capture, bool input, bool dpi)> Probes()
 
 // ---------------------------------------------------------------- commands
 
-int CmdWindows(InbriskRuntime i)
+int CmdWindows(InbriskRuntime i, string[] args)
 {
+    if (Has(args, "--ghost"))
+    {
+        try
+        {
+            using var desktop = new GhostLocalDesktop(GhostLocalDesktop.DefaultDesktopName, createIfNotExists: false);
+            var handles = GhostDesktopNative.EnumerateWindows(desktop.DesktopHandle);
+            int count = 0;
+            foreach (var hWnd in handles)
+            {
+                if (hWnd == IntPtr.Zero || !GhostDesktopNative.IsWindowVisible(hWnd)) continue;
+                var (title, className, _) = GhostDesktopNative.GetWindowDetails(hWnd);
+                GhostDesktopNative.GetWindowThreadProcessId(hWnd, out uint pid);
+                if (!string.IsNullOrEmpty(title) || !string.IsNullOrEmpty(className))
+                {
+                    Console.WriteLine($"0x{hWnd.ToInt64():X8}  pid={pid,-6}  class='{className}'  '{title}'");
+                    count++;
+                }
+            }
+            if (count == 0)
+            {
+                Console.WriteLine("No visible windows on Ghost Desktop.");
+            }
+            return 0;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            Console.WriteLine("Ghost Desktop is not currently active (no background session running).");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"error: Could not inspect Ghost Desktop windows: {ex.Message}");
+            return 1;
+        }
+    }
+
     foreach (var w in i.Windows()) Console.WriteLine(w);
     return 0;
+}
+
+int CmdLaunch(InbriskRuntime i, string[] args)
+{
+    var app = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--"))
+        ?? throw new InbriskException(ErrorCode.Unsupported, "launch requires an app name or path");
+    var isGhost = Has(args, "--ghost");
+    if (isGhost)
+    {
+        try
+        {
+            using var desktop = new GhostLocalDesktop(GhostLocalDesktop.DefaultDesktopName, createIfNotExists: true);
+            var proc = desktop.StartProcess(app);
+            Console.WriteLine($"launched '{app}' on Ghost Desktop (PID: {proc.Id})");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"error: Failed to launch '{app}' on Ghost Desktop: {ex.Message}");
+            return 1;
+        }
+    }
+    else
+    {
+        var spec = File.Exists(app)
+            ? new LaunchSpec(Path: app)
+            : new LaunchSpec(App: app);
+        var r = i.Launch(spec);
+        if (r.Success)
+        {
+            Console.WriteLine($"launched '{app}' (PID: {r.Pid}, HWND: 0x{r.Hwnd:X}, State: {r.LaunchState})");
+            return 0;
+        }
+        else
+        {
+            Console.Error.WriteLine($"launch failed: {r.Error ?? r.ErrorDetail ?? r.LaunchState}");
+            return 1;
+        }
+    }
 }
 
 int CmdMonitors(InbriskRuntime i)
@@ -424,7 +517,41 @@ int CmdObserve(InbriskRuntime i, string[] args)
 
 int CmdShot(InbriskRuntime i, string[] args)
 {
-    var path = args.ElementAtOrDefault(1) ?? "shot.png";
+    var path = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--")) ?? "shot.png";
+    if (Has(args, "--ghost"))
+    {
+        try
+        {
+            byte[]? pngBytes = null;
+            if (GhostSharedFrameBuffer.TryOpenConsumer(out var consumer, GhostSharedFrameBuffer.DefaultMapName) && consumer != null)
+            {
+                using (consumer)
+                {
+                    int approxSize = 1920 * 1080 * 4;
+                    byte[] buffer = new byte[approxSize];
+                    if (consumer.TryReadLatestFrame(buffer, out var header))
+                    {
+                        pngBytes = ConvertRawBgraToPng(header.Width, header.Height, header.Stride, buffer);
+                    }
+                }
+            }
+
+            if (pngBytes == null)
+            {
+                pngBytes = GhostDesktopCapture.CaptureDesktopToPng(GhostDesktopNative.DefaultGhostDesktopName, 1920, 1080);
+            }
+
+            File.WriteAllBytes(path, pngBytes);
+            Console.WriteLine($"saved {path} (Ghost Desktop)");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"error: Failed to capture Ghost Desktop shot: {ex.Message}");
+            return 1;
+        }
+    }
+
     i.Shot(path, ScopedHwnd(i, args));
     Console.WriteLine($"saved {path}");
     return 0;
@@ -469,15 +596,22 @@ int CmdWait(InbriskRuntime i, string[] args)
 ///    {"do":"shot","path":"out.png"}, {"do":"focus","window":"Title"}]
 /// Steps abort on first failure unless "continueOnError":true.
 /// </summary>
-int CmdRun(InbriskRuntime i, string[] args)
+async Task<int> CmdRunAsync(InbriskRuntime i, string[] args)
 {
-    var path = args.ElementAtOrDefault(1)
+    var path = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--"))
         ?? throw new InbriskException(ErrorCode.Unsupported,
             "run requires a plan.json path");
-    using var doc = JsonDocument.Parse(File.ReadAllText(path));
+    var planText = File.ReadAllText(path);
+    using var doc = JsonDocument.Parse(planText);
     if (doc.RootElement.ValueKind != JsonValueKind.Array)
         throw new InbriskException(ErrorCode.Unsupported,
             "run plan must be a JSON array of steps");
+
+    if (Has(args, "--ghost"))
+    {
+        return await RunGhostPlanAsync(planText).ConfigureAwait(false);
+    }
+
     var vars = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     var stepNo = 0;
     foreach (var step in doc.RootElement.EnumerateArray())
@@ -497,6 +631,108 @@ int CmdRun(InbriskRuntime i, string[] args)
         }
     }
     return 0;
+}
+
+async Task<int> RunGhostPlanAsync(string planText)
+{
+    if (EmergencyGate.IsStopped)
+    {
+        Console.Error.WriteLine("error: Computer control stopped by emergency hotkey.");
+        return 1;
+    }
+
+    GhostBatchResult? result = null;
+    try
+    {
+        await using var ipcServer = new GhostIpcServer(GhostIpcDefaults.PipeName);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await ipcServer.StartAsync(cts.Token).ConfigureAwait(false);
+            var sw = Stopwatch.StartNew();
+            while (!ipcServer.IsConnected && sw.Elapsed < TimeSpan.FromSeconds(3) && !cts.IsCancellationRequested)
+            {
+                await Task.Delay(100, cts.Token).ConfigureAwait(false);
+            }
+        }
+        catch { }
+
+        if (ipcServer.IsConnected)
+        {
+            var dispatcher = new GhostBatchDispatcher(ipcServer);
+            result = await dispatcher.DispatchBatchAsync(planText, timeout: TimeSpan.FromMinutes(5)).ConfigureAwait(false);
+        }
+    }
+    catch (Exception ex)
+    {
+        Debug.WriteLine($"[GhostBatchDispatcher] Remote dispatch attempt: {ex.Message}");
+    }
+
+    if (result == null)
+    {
+        try
+        {
+            var localExecutor = new GhostInputExecutor();
+            result = await localExecutor.ExecuteBatchAsync(planText).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"error: Failed to execute ghost batch: {ex.Message}");
+            return 4;
+        }
+    }
+
+    if (result.Results != null && result.Results.Count > 0)
+    {
+        for (int idx = 0; idx < result.Results.Count; idx++)
+        {
+            var r = result.Results[idx];
+            var stepNum = r.Step > 0 ? r.Step : (idx + 1);
+            var desc = !string.IsNullOrEmpty(r.ActionName) ? r.ActionName : (r.Do ?? "?");
+            if (r.Ok)
+            {
+                Console.WriteLine($"[{stepNum}] {desc}: ok ({r.Duration}ms)");
+            }
+            else
+            {
+                Console.WriteLine($"[{stepNum}] {desc}: FAILED {r.Error ?? "unknown error"} ({r.Duration}ms)");
+            }
+        }
+    }
+
+    if (!result.Success)
+    {
+        if (!string.IsNullOrEmpty(result.Error))
+        {
+            Console.Error.WriteLine($"error: Ghost batch execution failed: {result.Error}");
+        }
+        return 4;
+    }
+
+    Console.WriteLine($"Ghost batch execution finished: {result.StepsExecuted} step(s) completed in {result.TotalDurationMs}ms.");
+    return 0;
+}
+
+static byte[] ConvertRawBgraToPng(int width, int height, int stride, byte[] rawBgra)
+{
+    using var bmp = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+    var bmpData = bmp.LockBits(new Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+    try
+    {
+        int rowBytes = Math.Min(stride, bmpData.Stride);
+        for (int y = 0; y < height; y++)
+        {
+            Marshal.Copy(rawBgra, y * stride, IntPtr.Add(bmpData.Scan0, y * bmpData.Stride), rowBytes);
+        }
+    }
+    finally
+    {
+        bmp.UnlockBits(bmpData);
+    }
+
+    using var ms = new MemoryStream();
+    bmp.Save(ms, ImageFormat.Png);
+    return ms.ToArray();
 }
 
 string RunStep(InbriskRuntime i, JsonElement s, Dictionary<string, string> vars)
@@ -741,15 +977,17 @@ static int CmdHelp(string cmd)
     ["select"] = "select <element-id|--selectors> — list/tree item select, post-verified",
     ["focus"] = "focus <window|--pid P> — raise a window to the foreground",
     ["observe"] = "observe [--window W|--pid P] [--shot] — unified JSON observation",
-    ["shot"] = "shot [out.png] [--window W|--pid P] — capture a frame to PNG",
+    ["launch"] = "launch <app> [--ghost] — launch application (pass --ghost to launch on isolated Ghost desktop)",
+    ["shot"] = "shot [out.png] [--window W|--pid P] [--ghost] — capture a frame to PNG (pass --ghost to capture Ghost desktop)",
     ["wait"] = "wait stable [--window W|--pid P] | wait element --selectors | wait gone <element-id>",
-    ["run"] = "run <plan.json> — multi-step plan in one process; find results bind via \"as\":\"name\", reference with \"$name\" or \"$last\"",
+    ["run"] = "run <plan.json> [--ghost] — multi-step plan in one process (pass --ghost to dispatch to Ghost session / GhostBatchDispatcher)",
     ["events"] = "events [seconds] — stream semantic UIA/WinEvent events",
     ["clipboard"] = "clipboard read|write \"text\"",
     ["guards"] = "guards — secure-desktop + foreground integrity state",
     ["reset-input"] = "reset-input [--fix] — release stuck keys/buttons, list input-swallowing windows",
-    ["windows"] = "windows — list top-level windows (hwnd shown as 0x-hex; decimal, 0x-hex and bare hex all accepted as input)",
+    ["windows"] = "windows [--ghost] — list top-level windows (pass --ghost to list Ghost desktop windows)",
     ["monitors"] = "monitors — monitor topology + DPI",
+    ["mcp"] = "mcp [--stdio] [--log-level L] [--ghost] — MCP stdio server (pass --ghost to enable Ghost session mode)",
     };
     if (Help.TryGetValue(cmd, out var line))
     {
@@ -915,8 +1153,9 @@ static int Usage()
         inbrisk — windows computer-use runtime (M1)
 
           ui                               setup app (install, hosts, safety, colors)
-          windows                          list top-level windows
+          windows [--ghost]                list top-level windows (--ghost for Ghost desktop)
           monitors                         monitor topology + DPI
+          launch <app> [--ghost]           launch app (--ghost for Ghost desktop)
           inspect <window|--pid P> [--depth N]   pruned UIA tree
           find --window W|--pid P [--role R] [--name N] [--automation-id A]
                [--limit N] [--depth N] [--value V]
@@ -931,17 +1170,18 @@ static int Usage()
           type <element-id|--selectors|--focused> "text"
           focus <window|--pid P>
           observe [--window W|--pid P] [--shot]   unified JSON observation
-          shot [out.png] [--window W|--pid P]     capture frame
+          shot [out.png] [--window W|--pid P] [--ghost]     capture frame (--ghost for Ghost desktop)
           wait stable|element|gone … [--pid P]
-          run <plan.json>                  multi-step UI plan in one process —
-                                           element ids stay alive between steps
+          run <plan.json> [--ghost]        multi-step UI plan in one process (--ghost dispatches to Ghost session)
           events [seconds]                 stream semantic events
           clipboard read|write "text"
           guards                           integrity/secure-desktop state
           reset-input [--fix]              release stuck keys/buttons + find
                                            input-swallowing windows (--fix
                                            makes them click-through)
-          mcp [--stdio] [--log-level L]    MCP stdio server (protocol=stdout, logs=stderr)
+          mcp [--stdio] [--log-level L] [--ghost]    MCP stdio server (protocol=stdout, logs=stderr)
+
+          ghost <tray|pip|status|stop|logs>  Ghost OS background session & PiP control suite
 
           setup [--non-interactive] [--host H]   onboard: detect hosts + connect
           install [--machine]              install to %LOCALAPPDATA%\Programs\Inbrisk
@@ -954,6 +1194,7 @@ static int Usage()
           update [--manifest url|file]     verified update (SHA-256 required)
           uninstall [--keep-data] [--yes]  remove registrations + binaries
 
+          --ghost       target isolated Ghost session/desktop instead of interactive desktop
           --yes / -y    auto-confirm CONFIRM-class actions
         """);
     return 2;

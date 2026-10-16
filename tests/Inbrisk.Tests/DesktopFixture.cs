@@ -15,6 +15,7 @@ public sealed class DesktopFixture : IDisposable
     public Inbrisk.Sdk.InbriskRuntime Inbrisk { get; }
     public Process TestApp { get; }
     public long Hwnd { get; }
+    private readonly TestProcessTracker? _tracker;
     public static readonly string StateFile =
         Path.Combine(Path.GetTempPath(), "inbrisk_testapp", "state.txt");
 
@@ -76,6 +77,13 @@ public sealed class DesktopFixture : IDisposable
                 : $"{pos.X},{pos.Y}";
         }
         TestApp = Process.Start(psi)!;
+        // TestApp'i bir Job Object'e al. Boylece test hostu OLURSA bile
+        // (asili kalma, --blame-hang, Ctrl+C, kapanma) isletim sistemi
+        // tum handle'lari kapattiginda KILL_ON_JOB_CLOSE tetiklenir ve
+        // TestApp ortada birakilmaz. Once yalnizca Dispose() cocugu
+        // olduruyordu; Dispose calismazsa pencere kaliyordu.
+        _tracker = new TestProcessTracker("Inbrisk.TestApp", "dotnet");
+        _tracker.TrackProcess(TestApp);
         Inbrisk = new Inbrisk.Sdk.InbriskRuntime(new InbriskOptions(AutoConfirm: true,
             StartEvents: true,
             TelemetryPath: Path.Combine(Path.GetTempPath(), "inbrisk", "test-telemetry.jsonl")));
@@ -257,6 +265,9 @@ public sealed class DesktopFixture : IDisposable
         try { Inbrisk.Dispose(); } catch { }
         try { if (!TestApp.HasExited) TestApp.Kill(); } catch { }
         TestApp.Dispose();
+        // Job Object handle'i kapaninca KILL_ON_JOB_CLOSE TestApp'i son
+        // kez garantiler; normal akista zaten yukarida oldu.
+        try { _tracker?.Dispose(); } catch { }
         Environment.SetEnvironmentVariable("INBRISK_DESKTOP_BRIDGE", null);
     }
 }

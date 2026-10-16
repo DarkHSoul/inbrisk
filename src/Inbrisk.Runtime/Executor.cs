@@ -131,7 +131,12 @@ public sealed class Executor
                             $"element {id} is stale and could not be re-resolved");
                 }
                 point = element.Center;
-                if (element.Hwnd is { } h) window = _windows.GetTopLevelWindow(h);
+                // element.Hwnd can be null for hwnd-less subtree elements (WPF
+                // controls report zero native window handles); the element's
+                // re-resolve recipe still records the OWNING top-level window,
+                // which is what the policy/verify layers actually need.
+                if ((element.Hwnd ?? element.Handle.Recipe.Hwnd) is { } h)
+                    window = _windows.GetTopLevelWindow(h);
                 targetDesc = $"{id} ({element.Role} '{element.Name}')";
             }
             else if (intent.Target.Selector is { } spec)
@@ -144,7 +149,9 @@ public sealed class Executor
                 _registry.Register(found);
                 elementId = element.Id;
                 point = element.Center;
-                if (element.Hwnd is { } h) window = _windows.GetTopLevelWindow(h);
+                // same owner-hwnd fallback as the elementId path above
+                if ((element.Hwnd ?? element.Handle.Recipe.Hwnd) is { } h)
+                    window = _windows.GetTopLevelWindow(h);
                 targetDesc = $"{element.Id} ({element.Role} '{element.Name}')";
             }
             else if (intent.Target.Point is { } pt)
@@ -185,12 +192,19 @@ public sealed class Executor
                     $"target '{window!.Title}' runs elevated — injected input would be silently dropped (UIPI)");
 
             // --- policy ---
-            SafetyClass cls;
+            PolicyDecision decision;
             using (PerfTrace.Stage("policy"))
-                cls = _policy.Classify(intent, element, window);
+                decision = _policy.Evaluate(intent, element, window);
+            var cls = decision.Class;
+            // the reason is recorded as an attempt row so the machine-readable
+            // trail says WHY the gate fired, not just that it did
+            if (cls != SafetyClass.Safe)
+                attempts.Add(new Attempt(BackendId.Win32,
+                    $"policy:{decision.Code}", false, decision.Detail, TimeSpan.Zero));
             if (cls == SafetyClass.Deny)
                 return Finish(false, null, "policy", attempts, VerifyResult.NotRequested,
-                    sw, ErrorCode.PolicyDenied, "action denied by safety policy");
+                    sw, ErrorCode.PolicyDenied,
+                    $"action denied by safety policy [{decision.Code}]: {decision.Detail}");
             if (cls == SafetyClass.Confirm)
             {
                 // F04: a client tool call can never confirm itself — an
@@ -220,33 +234,56 @@ public sealed class Executor
                     try { localOk = consent?.Invoke(intent, element, window) == true; }
                     catch { localOk = false; }
                     if (!localOk)
-                        return DenyConfirm("dangerous action requires a LOCAL " +
-                            "confirmation the client cannot supply — approve " +
-                            "on this machine via the Inbrisk control UI, then " +
-                            "retry with args.approvalId (AutoConfirm/tool-call " +
-                            "flags are ignored for dangerous classes)");
+                        return DenyConfirm($"dangerous action requires a LOCAL " +
+                            $"confirmation the client cannot supply " +
+                            $"[{decision.Code}] {decision.Detail} — approve on " +
+                            "this machine via the Inbrisk control UI, then retry " +
+                            "with args.approvalId (AutoConfirm/tool-call flags " +
+                            "are ignored for dangerous classes)");
                     attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
                         "approved by local consent", TimeSpan.Zero));
                 }
                 else
                 {
-                    // a run-scoped confirmer wins over global AutoConfirm — an
-                    // explicit per-run policy is always more specific
-                    var confirmer = ctx?.Confirmer ?? _policy.Confirmer;
-                    if (confirmer == null)
+                    // precedence, most specific first:
+                    // 1. a run-scoped confirmer — an explicit per-run policy
+                    //    is always more specific than any global setting;
+                    // 2. operator AutoConfirm (INBRISK_AUTOCONFIRM / CLI
+                    //    --yes parity) — the machine's operator opted this
+                    //    instance into unattended CONFIRM-class work before
+                    //    the server started; never implied by tool args;
+                    // 3. the wired confirm channel (session gate) — approves
+                    //    only a pending a LOCAL surface granted, else fails
+                    //    closed.
+                    var confirmer = ctx?.Confirmer;
+                    if (confirmer != null)
                     {
-                        if (!_policy.AutoConfirm)
-                            return DenyConfirm("action requires confirmation — " +
-                                "approve via the local Inbrisk control " +
-                                "surface, then retry with args.approvalId " +
-                                "(AutoConfirm=false)");
+                        if (confirmer(intent, element, window))
+                            attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
+                                "approved by confirmer", TimeSpan.Zero));
+                        else
+                            return DenyConfirm($"action denied by run confirmer " +
+                                $"[{decision.Code}] {decision.Detail} — issued " +
+                                "approvalId for local override");
                     }
-                    else if (confirmer(intent, element, window))
+                    else if (_policy.AutoConfirm)
                         attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
-                            "approved by confirmer", TimeSpan.Zero));
+                            "approved by operator AutoConfirm", TimeSpan.Zero));
+                    else if (_policy.Confirmer != null)
+                    {
+                        if (_policy.Confirmer(intent, element, window))
+                            attempts.Add(new Attempt(BackendId.Win32, "confirm", true,
+                                "approved by confirmer", TimeSpan.Zero));
+                        else
+                            return DenyConfirm($"action denied by run confirmer " +
+                                $"[{decision.Code}] {decision.Detail} — issued " +
+                                "approvalId for local override");
+                    }
                     else
-                        return DenyConfirm("action denied by run confirmer — " +
-                            "issued approvalId for local override");
+                        return DenyConfirm("action requires confirmation — " +
+                            $"[{decision.Code}] {decision.Detail} — approve via " +
+                            "the local Inbrisk control surface, then retry " +
+                            "with args.approvalId (AutoConfirm=false)");
                 }
             }
 

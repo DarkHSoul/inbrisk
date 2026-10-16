@@ -106,10 +106,30 @@ public sealed record ProcessProvenance(
     bool UsedInCurrentTask,
     DateTimeOffset RegisteredAt,
     string? LaunchArgument = null,
-    LifecycleIntent Intent = LifecycleIntent.Unknown)
+    LifecycleIntent Intent = LifecycleIntent.Unknown,
+    // LaunchVerified: true ONLY when RegisterAgentLaunch created this entry.
+    // Name-based adoption never sets it, so it is the sole safe basis for a
+    // close/terminate policy decision.
+    bool LaunchVerified = false)
 {
     public bool SafeToClose => OpenedByAgent && Ownership == ProcessOwnership.Agent;
     public CleanupDisposition Disposition => LifecycleDecisionEngine.Decide(Ownership, OpenedByAgent, Intent).Disposition;
+}
+
+/// <summary>Ownership as reported by the STRICT (registration-only)
+/// probe — see <see cref="IProcessProvenanceService.GetStrictWindowOwnership"/>.
+/// <see cref="ProcessOwnership.System"/> deliberately has no member here:
+/// for a policy gate "not provably the agent's" must collapse onto User,
+/// never onto a third bucket that could be reasoned about as permissive.</summary>
+public enum StrictWindowOwnership
+{
+    /// <summary>No registration for this hwnd — provenance unknown. Every
+    /// consumer must treat this as "not the agent's".</summary>
+    Unknown,
+    /// <summary>Registered by RegisterAgentLaunch for exactly this handle.</summary>
+    Agent,
+    /// <summary>Registered as pre-existing / owned by the local user.</summary>
+    User,
 }
 
 public interface IProcessProvenanceService
@@ -122,8 +142,16 @@ public interface IProcessProvenanceService
     void MarkUsedWindow(long hwnd);
     ProcessProvenance? GetProvenance(int pid);
     ProcessProvenance? GetProvenanceForHwnd(long hwnd);
+    StrictWindowOwnership GetStrictWindowOwnership(long hwnd);
     bool CanAgentClose(long hwnd, out string? reason);
     bool CanAgentCloseProcess(int pid, out string? reason);
+    /// <summary>Strict window-ownership probe (see
+    /// <see cref="TryGetVerifiedAgentProcessForHwnd"/>): matches only windows
+    /// whose live PID is a VERIFIED agent launch — the replacement-window
+    /// case. Unlike <see cref="CanAgentClose"/> this performs no protection
+    /// check and answers ownership only; false simply means "not provably a
+    /// verified agent launch".</summary>
+    bool TryGetVerifiedAgentProcessForHwnd(long hwnd, out ProcessProvenance? prov);
     IReadOnlyList<ProcessProvenance> ListProvenance();
 }
 
@@ -168,7 +196,8 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
             UsedInCurrentTask: true,
             RegisteredAt: DateTimeOffset.UtcNow,
             LaunchArgument: launchArg,
-            Intent: intent
+            Intent: intent,
+            LaunchVerified: true
         );
         _byPid[pid] = prov;
         if (hwnd.HasValue) _byHwnd[hwnd.Value] = prov;
@@ -369,6 +398,38 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
         return null;
     }
 
+    /// <summary>
+    /// Ownership for a SECURITY decision (safety policy gating).
+    ///
+    /// <see cref="GetProvenanceForHwnd"/> deliberately ADOPTS windows by
+    /// process-name / title similarity when the handle itself is unknown
+    /// (line ~305). That heuristic is right for cleanup — better to
+    /// recognise an app's replacement window — but far too loose for a
+    /// policy gate: once the agent has launched "notepad" once, the
+    /// process-name index would answer Agent for every Notepad window the
+    /// USER opens afterwards, and the gate would wave through writes into
+    /// the user's own documents.
+    ///
+    /// So this probe answers from the hwnd-keyed registration table only.
+    /// The sole path to <see cref="StrictWindowOwnership.Agent"/> is a
+    /// <see cref="RegisterAgentLaunch"/> call that named exactly this
+    /// handle — which, in the MCP launch path, only happens after
+    /// LaunchCreationEvidenceEvaluator proved positive creation evidence
+    /// (new pid AND new hwnd AND start-time after the pre-launch
+    /// snapshot). A reused "ExistingInstance" window is never registered,
+    /// so it never answers Agent.
+    ///
+    /// Unknown handle → <see cref="StrictWindowOwnership.Unknown"/>, which
+    /// every caller must read as "not the agent's".
+    /// </summary>
+    public StrictWindowOwnership GetStrictWindowOwnership(long hwnd)
+    {
+        if (!_byHwnd.TryGetValue(hwnd, out var prov)) return StrictWindowOwnership.Unknown;
+        return prov.Ownership == ProcessOwnership.Agent && prov.OpenedByAgent
+            ? StrictWindowOwnership.Agent
+            : StrictWindowOwnership.User;
+    }
+
     public bool CanAgentClose(long hwnd, out string? reason)
     {
         if (_windowService != null && _windowService.IsWindowProtected(hwnd, out var protReason))
@@ -377,15 +438,35 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
             return false;
         }
 
-        var prov = GetProvenanceForHwnd(hwnd);
-        if (prov == null)
+        // Security gate. GetProvenanceForHwnd deliberately ADOPTS windows by
+        // process-name / title similarity, which is right for cleanup but far
+        // too loose for a policy gate: once the agent launched "notepad" once,
+        // the name index would answer Agent for EVERY Notepad window the user
+        // opens afterwards. Accept only:
+        //   1. the exact hwnd named by RegisterAgentLaunch, or
+        //   2. a window whose live PID is a VERIFIED agent launch (a
+        //      replacement window of the process we spawned - same PID). A
+        //      different process instance the user opens later has a
+        //      different PID and is therefore never adopted.
+        var strict = GetStrictWindowOwnership(hwnd);
+        if (strict == StrictWindowOwnership.Agent)
         {
-            // Golden rule: When in doubt, leave it open.
-            reason = "Application provenance is unknown (not opened by agent). Inbrisk Application Lifecycle Policy prevents closing applications not explicitly launched by the agent. When in doubt, leave it open.";
+            reason = null;
+            return true;
+        }
+
+        if (strict == StrictWindowOwnership.User)
+        {
+            reason = "Window belongs to a pre-existing user application (ownership: user). Inbrisk Application Lifecycle Policy prevents closing applications not explicitly launched by the agent. When in doubt, leave it open.";
             return false;
         }
 
-        return CanAgentCloseCore(prov, out reason);
+        if (TryGetVerifiedAgentProcessForHwnd(hwnd, out var prov) && prov != null)
+            return CanAgentCloseCore(prov, out reason);
+
+        // Golden rule: When in doubt, leave it open.
+        reason = "Application provenance is unknown (not opened by agent). Inbrisk Application Lifecycle Policy prevents closing applications not explicitly launched by the agent. When in doubt, leave it open.";
+        return false;
     }
 
     public bool CanAgentCloseProcess(int pid, out string? reason)
@@ -405,18 +486,90 @@ public sealed class ProcessProvenanceService : IProcessProvenanceService
             }
             catch (Exception ex)
             {
+                // Fail CLOSED: if the protection probe cannot run we cannot
+                // prove the process is unprotected, so refuse. Previously the
+                // catch swallowed the exception and execution fell through to
+                // GetProvenance(pid), which adopts a process by NAME — letting
+                // an enumeration failure escalate into a name-based allow.
                 System.Diagnostics.Debug.WriteLine($"CanAgentCloseProcess protection probe pid={pid} failed: {ex.Message}");
+                reason = $"Process PID {pid} protection could not be verified (window enumeration failed); refusing to close.";
+                return false;
             }
         }
 
-        var prov = GetProvenance(pid);
-        if (prov == null)
+        // Strict: only a VERIFIED agent launch may be closed. GetProvenance
+        // adopts by process name (a Notepad the user opened after the agent
+        // launched one shares the name), so it must not gate a close.
+        if (!_byPid.TryGetValue(pid, out var prov) || !prov.LaunchVerified)
         {
             reason = $"Process PID {pid} was not launched by agent. Inbrisk Application Lifecycle Policy prevents closing applications not explicitly launched by the agent. When in doubt, leave it open.";
             return false;
         }
 
         return CanAgentCloseCore(prov, out reason);
+    }
+
+    /// <summary>
+    /// Strict provenance query: resolve a window to a process the agent
+    /// VERIFIABLY launched (same live PID). Unlike <see cref="CanAgentClose"/>
+    /// (a POLICY gate: protection + ownership), this answers "who owns this
+    /// window" only — callers that already gate protection separately (e.g.
+    /// window-ownership probes for cleanup/selection) should use this and
+    /// <see cref="GetStrictWindowOwnership"/> directly. Replacement windows
+    /// of a process we spawned match; a *different* instance of the same app
+    /// (a Notepad the user opens later) is never matched.
+    /// </summary>
+    public bool TryGetVerifiedAgentProcessForHwnd(long hwnd, out ProcessProvenance? prov)
+    {
+        prov = null;
+
+        int pid = 0;
+        string? title = null;
+        try
+        {
+            var win = _windowService?.GetWindow(hwnd);
+            if (win != null)
+            {
+                pid = win.Pid;
+                title = win.Title;
+            }
+        }
+        catch { }
+
+        if (pid == 0 && _hwndToPid.TryGetValue(hwnd, out var mappedPid))
+            pid = mappedPid;
+
+        if (pid == 0)
+            return false;
+
+        if (!_byPid.TryGetValue(pid, out var p) ||
+            !p.LaunchVerified ||
+            !p.OpenedByAgent ||
+            p.Ownership != ProcessOwnership.Agent)
+            return false;
+
+        // Shared host containers (ApplicationFrameHost and friends) multiplex
+        // many unrelated apps under ONE pid, so a pid match alone would let a
+        // user window hosted by the same process inherit agent ownership.
+        // Require the window title to match the identity we launched.
+        if (IsSharedHostContainer(p.ProcessName))
+        {
+            var t = title ?? "";
+            if (string.IsNullOrWhiteSpace(p.LaunchArgument) ||
+                !t.Contains(p.LaunchArgument, StringComparison.OrdinalIgnoreCase))
+                return false;
+        }
+
+        prov = p;
+        return true;
+    }
+
+    private static bool IsSharedHostContainer(string? processName)
+    {
+        if (string.IsNullOrWhiteSpace(processName)) return false;
+        var clean = processName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+            ? processName[..^4] : processName;
+        return clean.Equals("ApplicationFrameHost", StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool CanAgentCloseCore(ProcessProvenance prov, out string? reason)

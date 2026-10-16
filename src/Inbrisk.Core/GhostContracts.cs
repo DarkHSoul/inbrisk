@@ -1,6 +1,57 @@
 namespace Inbrisk.Core;
 
 /// <summary>
+/// Which desktop an automation session targets. Session-scoped on purpose:
+/// one switch routes every tool, so a per-call ghost flag is only ever
+/// needed to override the session for a single call.
+/// </summary>
+public enum SessionDesktop
+{
+    /// <summary>The user's live desktop — real cursor, real focus, real windows.</summary>
+    Interactive = 0,
+
+    /// <summary>The isolated background desktop (Session 2 / PiP) — no focus
+    /// theft and no physical cursor movement.</summary>
+    Ghost = 1,
+}
+
+/// <summary>Wire-format helpers for <see cref="SessionDesktop"/> — the MCP
+/// surface speaks "interactive"/"ghost" strings, not enum names.</summary>
+public static class SessionDesktops
+{
+    public const string InteractiveName = "interactive";
+    public const string GhostName = "ghost";
+
+    /// <summary>Parse a desktop name. Accepts ghost/interactive (also
+    /// "local"/"live" for interactive and "background"/"isolated" for ghost).
+    /// False on anything else — callers must not silently fall back.</summary>
+    public static bool TryParse(string? text, out SessionDesktop value)
+    {
+        value = SessionDesktop.Interactive;
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        switch (text.Trim().ToLowerInvariant())
+        {
+            case InteractiveName:
+            case "local":
+            case "live":
+            case "foreground":
+                value = SessionDesktop.Interactive;
+                return true;
+            case GhostName:
+            case "background":
+            case "isolated":
+                value = SessionDesktop.Ghost;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    public static string ToWire(SessionDesktop desktop) =>
+        desktop == SessionDesktop.Ghost ? GhostName : InteractiveName;
+}
+
+/// <summary>
 /// Configuration parameters for starting a dedicated Ghost desktop session.
 /// </summary>
 public record GhostSessionConfig(
