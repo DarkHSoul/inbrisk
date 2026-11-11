@@ -79,7 +79,15 @@ public class GhostDesktopInput : IDisposable
     /// </summary>
     /// <param name="ipcBus">Optional IPC channel connected to the ghost desktop daemon.</param>
     /// <param name="inputService">Optional direct input injection service.</param>
-    public GhostDesktopInput(IGhostIpcBus? ipcBus = null, IInputService? inputService = null)
+    /// <param name="desktopName">Isolated Win32 desktop name used by the platform injector.</param>
+    /// <param name="desktopWidth">Virtual ghost desktop width in pixels.</param>
+    /// <param name="desktopHeight">Virtual ghost desktop height in pixels.</param>
+    public GhostDesktopInput(
+        IGhostIpcBus? ipcBus = null,
+        IInputService? inputService = null,
+        string desktopName = "InbriskGhostDesktop",
+        int desktopWidth = 1920,
+        int desktopHeight = 1080)
     {
         _ipcBus = ipcBus;
         _inputService = inputService;
@@ -95,7 +103,13 @@ public class GhostDesktopInput : IDisposable
                     var ctor = pType.GetConstructor(new[] { typeof(string), typeof(int), typeof(int), typeof(bool) });
                     if (ctor != null)
                     {
-                        _platformInjector = ctor.Invoke(new object[] { "InbriskGhostDesktop", 1920, 1080, true });
+                        _platformInjector = ctor.Invoke(new object[]
+                        {
+                            string.IsNullOrWhiteSpace(desktopName) ? "InbriskGhostDesktop" : desktopName,
+                            Math.Max(1, desktopWidth),
+                            Math.Max(1, desktopHeight),
+                            true
+                        });
                         _platformForwardMethod = pType.GetMethod("ForwardPipInput", new[] { typeof(PipInputEventArgs) });
                         _platformReleaseMethod = pType.GetMethod("ReleaseAll", Type.EmptyTypes);
                     }

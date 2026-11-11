@@ -484,13 +484,12 @@ public sealed class GhostPipWindowHost : IDisposable
         // WS_EX_LAYERED (0x80000) -> Supports opacity & alpha blending
         uint dwStyle = NativeMethods.WS_POPUP | NativeMethods.WS_VISIBLE | NativeMethods.WS_MINIMIZEBOX | NativeMethods.WS_SYSMENU | NativeMethods.WS_THICKFRAME;
         uint dwExStyle = (uint)(NativeMethods.WS_EX_TOPMOST |
-                                NativeMethods.WS_EX_NOACTIVATE |
                                 NativeMethods.WS_EX_APPWINDOW |
                                 NativeMethods.WS_EX_LAYERED);
 
         if (_clickThrough)
         {
-            dwExStyle |= (uint)NativeMethods.WS_EX_TRANSPARENT;
+            dwExStyle |= (uint)(NativeMethods.WS_EX_NOACTIVATE | NativeMethods.WS_EX_TRANSPARENT);
         }
 
         _hwnd = NativeMethods.CreateWindowExW(

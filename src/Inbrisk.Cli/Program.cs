@@ -4,6 +4,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using Inbrisk.Cli;
 using Inbrisk.Core;
 using Inbrisk.Mcp;
 using Inbrisk.Platform.Windows;
@@ -63,7 +64,6 @@ if (Inbrisk.Cli.GhostWorkerCommand.Matches(args))
 
 if (Inbrisk.Cli.GhostControlCommand.Matches(args))
 {
-    Inbrisk.Cli.Ui.ConsoleAttach.Ensure();
     return await Inbrisk.Cli.GhostControlCommand.RunAsync(args);
 }
 
@@ -209,13 +209,34 @@ static async Task<(bool uia, bool capture, bool input, bool dpi)> Probes()
 
 // ---------------------------------------------------------------- commands
 
+static string ResolveGhostDesktopName()
+{
+    try
+    {
+        var statePath = Path.Combine(UserSettings.DataDir, "ghost-control.json");
+        if (!File.Exists(statePath)) return GhostLocalDesktop.DefaultDesktopName;
+        using var stream = new FileStream(statePath, FileMode.Open, FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+        using var doc = JsonDocument.Parse(stream);
+        var root = doc.RootElement;
+        if (root.TryGetProperty("desktopName", out var desktop) &&
+            desktop.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(desktop.GetString()))
+        {
+            return desktop.GetString()!;
+        }
+    }
+    catch { }
+    return GhostLocalDesktop.DefaultDesktopName;
+}
+
 int CmdWindows(InbriskRuntime i, string[] args)
 {
     if (Has(args, "--ghost"))
     {
         try
         {
-            using var desktop = new GhostLocalDesktop(GhostLocalDesktop.DefaultDesktopName, createIfNotExists: false);
+            using var desktop = new GhostLocalDesktop(ResolveGhostDesktopName(), createIfNotExists: false);
             var handles = GhostDesktopNative.EnumerateWindows(desktop.DesktopHandle);
             int count = 0;
             foreach (var hWnd in handles)
@@ -253,16 +274,53 @@ int CmdWindows(InbriskRuntime i, string[] args)
 
 int CmdLaunch(InbriskRuntime i, string[] args)
 {
-    var app = args.Skip(1).FirstOrDefault(a => !a.StartsWith("--"))
-        ?? throw new InbriskException(ErrorCode.Unsupported, "launch requires an app name or path");
+    int appIndex = -1;
+    for (int ai = 1; ai < args.Length; ai++)
+    {
+        if (!args[ai].StartsWith("--", StringComparison.Ordinal))
+        {
+            appIndex = ai;
+            break;
+        }
+    }
+
+    var app = appIndex >= 0 ? args[appIndex] : null;
+    if (string.IsNullOrWhiteSpace(app))
+        throw new InbriskException(ErrorCode.Unsupported, "launch requires an app name or path");
+
+    var appArgs = appIndex >= 0
+        ? string.Join(' ', args.Skip(appIndex + 1).Where(a => !a.StartsWith("--", StringComparison.Ordinal)))
+        : null;
     var isGhost = Has(args, "--ghost");
     if (isGhost)
     {
         try
         {
-            using var desktop = new GhostLocalDesktop(GhostLocalDesktop.DefaultDesktopName, createIfNotExists: true);
-            var proc = desktop.StartProcess(app);
-            Console.WriteLine($"launched '{app}' on Ghost Desktop (PID: {proc.Id})");
+            var surfaceResponse = GhostControlCommand.DaemonSurfaceLaunchAsync(
+                app,
+                string.IsNullOrWhiteSpace(appArgs) ? null : appArgs,
+                workingDirectory: null).GetAwaiter().GetResult();
+            if (!string.IsNullOrWhiteSpace(surfaceResponse))
+            {
+                using var doc = JsonDocument.Parse(surfaceResponse);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("ok", out var ok) && !ok.GetBoolean())
+                {
+                    var error = root.TryGetProperty("error", out var e) ? e.GetString() : "unknown surface launch error";
+                    Console.Error.WriteLine($"error: Failed to launch '{app}' as Ghost window surface: {error}");
+                    return 1;
+                }
+                var hwnd = root.TryGetProperty("hwnd", out var h) ? h.GetString() : null;
+                var pid = root.TryGetProperty("pid", out var p) ? p.GetInt32() : 0;
+                Console.WriteLine($"launched '{app}' as Ghost window surface (PID: {pid}, HWND: {hwnd})");
+                return 0;
+            }
+
+            var ghostDesktopName = ResolveGhostDesktopName();
+            var desktop = new GhostLocalDesktop(ghostDesktopName, createIfNotExists: true);
+            var proc = desktop.StartProcess(app, string.IsNullOrWhiteSpace(appArgs) ? null : appArgs);
+            GC.SuppressFinalize(desktop);
+            Console.WriteLine($"launched '{app}' on Ghost Desktop '{ghostDesktopName}' (PID: {proc.Id})");
             return 0;
         }
         catch (Exception ex)
@@ -538,7 +596,7 @@ int CmdShot(InbriskRuntime i, string[] args)
 
             if (pngBytes == null)
             {
-                pngBytes = GhostDesktopCapture.CaptureDesktopToPng(GhostDesktopNative.DefaultGhostDesktopName, 1920, 1080);
+                pngBytes = GhostDesktopCapture.CaptureDesktopToPng(ResolveGhostDesktopName(), 1920, 1080);
             }
 
             File.WriteAllBytes(path, pngBytes);

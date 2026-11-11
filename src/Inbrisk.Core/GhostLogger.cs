@@ -31,8 +31,7 @@ public static class GhostLogger
             lock (Gate)
             {
                 if (_logFilePath != null) return _logFilePath;
-                string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-                string logDir = Path.Combine(localAppData, "inbrisk", "logs");
+                string logDir = Path.Combine(UserSettings.DataDir, "logs");
                 try
                 {
                     if (!Directory.Exists(logDir))

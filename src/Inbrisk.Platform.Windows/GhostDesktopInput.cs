@@ -1114,8 +1114,12 @@ public sealed class GhostDesktopInput : IDisposable
             if (targetHwnd == IntPtr.Zero) return;
 
             uint vk = (uint)key;
+            // Mask the scan to its low byte: an 0xE0-prefixed extended scan
+            // shifted into bits 16-23 would otherwise spill into bits 29-31,
+            // faking Alt-context / previous-state / transition (release) flags
+            // on a key-DOWN. Extended-ness belongs to bit 24 only.
             uint scanCode = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-            uint lParam = 1 | (scanCode << 16);
+            uint lParam = 1 | ((scanCode & 0xFF) << 16);
             if (IsExtendedKey(vk))
             {
                 lParam |= (1u << 24);
@@ -1146,7 +1150,7 @@ public sealed class GhostDesktopInput : IDisposable
             if (targetHwnd == IntPtr.Zero) return;
 
             uint scanCode = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-            uint lParam = 1 | (scanCode << 16) | (1u << 30) | (1u << 31);
+            uint lParam = 1 | ((scanCode & 0xFF) << 16) | (1u << 30) | (1u << 31);
             if (IsExtendedKey(vk))
             {
                 lParam |= (1u << 24);
@@ -1202,8 +1206,18 @@ public sealed class GhostDesktopInput : IDisposable
                 }
                 else
                 {
-                    uint scanCode = Win32.MapVirtualKeyW((uint)c, MAPVK_VK_TO_VSC);
-                    uint lParam = 1 | (scanCode << 16);
+                    // WM_CHAR lParam carries the scan code of the PHYSICAL key
+                    // the character maps to. Resolve char→VK via VkKeyScanW
+                    // first — passing the char itself to MapVirtualKeyW reads
+                    // it as a virtual-key code ('e' = 0x65 = VK_NUMPAD5,
+                    // 's' = VK_F4) and stamps a garbage scan code.
+                    uint lParam = 1;
+                    short ks = Win32.VkKeyScanW(c);
+                    if (ks != -1)
+                    {
+                        uint sc = Win32.MapVirtualKeyW((uint)(byte)(ks & 0xFF), MAPVK_VK_TO_VSC);
+                        lParam = 1 | ((sc & 0xFF) << 16);
+                    }
                     Win32.PostMessageW(targetHwnd, WM_CHAR, (IntPtr)c, (IntPtr)lParam);
                 }
             }
@@ -1256,7 +1270,7 @@ public sealed class GhostDesktopInput : IDisposable
         if (ctrl) Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)VirtualKey.Control, (IntPtr)(1 | (ctrlSc << 16)));
         if (alt) Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)VirtualKey.Alt, (IntPtr)(1 | (altSc << 16)));
 
-        uint sc = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        uint sc = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) & 0xFF;
         try
         {
             uint downLParam = 1 | (sc << 16);
@@ -1271,16 +1285,16 @@ public sealed class GhostDesktopInput : IDisposable
         }
         finally
         {
-            if (alt) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Alt, (IntPtr)(1 | (altSc << 16) | (1u << 30) | (1u << 31)));
-            if (ctrl) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Control, (IntPtr)(1 | (ctrlSc << 16) | (1u << 30) | (1u << 31)));
-            if (shift) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Shift, (IntPtr)(1 | (shiftSc << 16) | (1u << 30) | (1u << 31)));
+            if (alt) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Alt, (IntPtr)(1 | ((altSc & 0xFF) << 16) | (1u << 30) | (1u << 31)));
+            if (ctrl) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Control, (IntPtr)(1 | ((ctrlSc & 0xFF) << 16) | (1u << 30) | (1u << 31)));
+            if (shift) Win32.PostMessageW(hwnd, WM_KEYUP, (IntPtr)VirtualKey.Shift, (IntPtr)(1 | ((shiftSc & 0xFF) << 16) | (1u << 30) | (1u << 31)));
         }
     }
 
     private static void SendKeyPressCore(IntPtr hwnd, VirtualKey key)
     {
         uint vk = (uint)key;
-        uint scanCode = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+        uint scanCode = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) & 0xFF;
         uint downLParam = 1 | (scanCode << 16);
         if (IsExtendedKey(vk)) downLParam |= (1u << 24);
         Win32.PostMessageW(hwnd, WM_KEYDOWN, (IntPtr)vk, (IntPtr)downLParam);
@@ -1826,7 +1840,7 @@ public sealed class GhostDesktopInput : IDisposable
 
                 uint vk = kv.Key;
                 uint scanCode = Win32.MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-                uint lParam = 1 | (scanCode << 16) | (1u << 30) | (1u << 31);
+                uint lParam = 1 | ((scanCode & 0xFF) << 16) | (1u << 30) | (1u << 31);
                 if (IsExtendedKey(vk))
                 {
                     lParam |= (1u << 24);

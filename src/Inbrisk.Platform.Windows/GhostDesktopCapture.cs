@@ -48,6 +48,7 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
 
     private const uint SRCCOPY = 0x00CC0020;
 
+
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT
     {
@@ -95,6 +96,11 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
+
+    [DllImport("user32.dll")]
+    private static extern int FillRect(IntPtr hDC, ref RECT lprc, IntPtr hbr);
+
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern int GetWindowTextW(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
 
@@ -133,6 +139,10 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
 
     [DllImport("gdi32.dll")]
     private static extern bool BitBlt(IntPtr hdc, int x, int y, int cx, int cy, IntPtr hdcSrc, int x1, int y1, uint rop);
+
+    [DllImport("gdi32.dll")]
+    private static extern IntPtr CreateSolidBrush(uint color);
+
 
     #endregion
 
@@ -591,10 +601,17 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
         if (w <= 0 || h <= 0) return;
         if (rect.Right <= 0 || rect.Bottom <= 0 || rect.Left >= _width || rect.Top >= _height) return;
 
+        FillRectGdi(hdcDest, rect, 0x00302D2D);
+
+        int captureW = w;
+        int captureH = h;
+        int destX = rect.Left;
+        int destY = rect.Top;
+
         IntPtr hdcWinMem = CreateCompatibleDC(hdcDest);
         if (hdcWinMem == IntPtr.Zero) return;
 
-        IntPtr hBitmap = CreateCompatibleBitmap(hdcDest, w, h);
+        IntPtr hBitmap = CreateCompatibleBitmap(hdcDest, captureW, captureH);
         if (hBitmap == IntPtr.Zero)
         {
             DeleteDC(hdcWinMem);
@@ -605,19 +622,15 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
 
         try
         {
-            bool printed = PrintWindow(hWnd, hdcWinMem, PW_RENDERFULLCONTENT);
-            if (!printed)
-            {
-                printed = PrintWindow(hWnd, hdcWinMem, PW_DEFAULT);
-            }
+            bool printed = PrintWindow(hWnd, hdcWinMem, PW_RENDERFULLCONTENT) ||
+                           PrintWindow(hWnd, hdcWinMem, PW_DEFAULT);
 
             if (printed)
             {
-                BitBlt(hdcDest, rect.Left, rect.Top, w, h, hdcWinMem, 0, 0, SRCCOPY);
+                BitBlt(hdcDest, destX, destY, captureW, captureH, hdcWinMem, 0, 0, SRCCOPY);
             }
             else
             {
-                // Fallback to window DC
                 IntPtr hdcSrc = GetWindowDC(hWnd);
                 if (hdcSrc != IntPtr.Zero)
                 {
@@ -635,11 +648,24 @@ public sealed class GhostDesktopCapture : IDisposable, IAsyncDisposable
         catch { }
         finally
         {
-            SelectObject(hdcWinMem, hOldBmp);
-            DeleteObject(hBitmap);
-            DeleteDC(hdcWinMem);
+            if (hdcWinMem != IntPtr.Zero)
+            {
+                SelectObject(hdcWinMem, hOldBmp);
+                if (hBitmap != IntPtr.Zero) DeleteObject(hBitmap);
+                DeleteDC(hdcWinMem);
+            }
         }
+
     }
+
+    private static void FillRectGdi(IntPtr hdc, RECT rect, uint color)
+    {
+        IntPtr brush = CreateSolidBrush(color);
+        if (brush == IntPtr.Zero) return;
+        try { FillRect(hdc, ref rect, brush); }
+        finally { DeleteObject(brush); }
+    }
+
 
     private List<WindowEntry> EnumerateDesktopWindows(IntPtr hDesktop)
     {

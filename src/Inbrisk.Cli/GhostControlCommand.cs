@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Threading;
@@ -72,6 +73,7 @@ public sealed record GhostControlOptions(
     int TargetFps = 60,
     bool StartSession = false,
     bool ExtraSession = false,
+    bool StartInitialShell = false,
     string Username = "InbriskAgent",
     string ControlPipeName = GhostControlCommand.DefaultControlPipeName,
     bool JsonOutput = false,
@@ -92,6 +94,7 @@ public sealed record GhostControlOptions(
         int targetFps = 60;
         bool startSession = false;
         bool extraSession = false;
+        bool startInitialShell = false;
         string username = "InbriskAgent";
         string controlPipeName = GhostControlCommand.DefaultControlPipeName;
         bool jsonOutput = false;
@@ -371,6 +374,19 @@ public sealed record GhostControlOptions(
                 extraSession = true;
             }
 
+            // Optional initial shell on the isolated desktop (off by default;
+            // an empty desktop is the normal Ghost Control canvas).
+            else if (a.Equals("--initial-shell", StringComparison.OrdinalIgnoreCase) ||
+                     a.Equals("--start-shell", StringComparison.OrdinalIgnoreCase))
+            {
+                startInitialShell = true;
+            }
+            else if (a.Equals("--no-initial-shell", StringComparison.OrdinalIgnoreCase) ||
+                     a.Equals("--no-shell", StringComparison.OrdinalIgnoreCase))
+            {
+                startInitialShell = false;
+            }
+
             // Target user account
             else if (a.Equals("--user", StringComparison.OrdinalIgnoreCase) ||
                      a.Equals("--username", StringComparison.OrdinalIgnoreCase))
@@ -402,6 +418,7 @@ public sealed record GhostControlOptions(
             TargetFps: targetFps,
             StartSession: startSession,
             ExtraSession: extraSession,
+            StartInitialShell: startInitialShell,
             Username: username,
             ControlPipeName: controlPipeName,
             JsonOutput: jsonOutput,
@@ -500,7 +517,32 @@ public static class GhostControlCommand
         public static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int processId);
+
+        [DllImport("user32.dll")]
         public static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetWindowTextLengthW(IntPtr hWnd);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetWindowTextW(IntPtr hWnd, StringBuilder text, int count);
+    }
+
+    private static string GetWindowTextSafe(IntPtr hwnd)
+    {
+        try
+        {
+            int length = Win32.GetWindowTextLengthW(hwnd);
+            if (length <= 0) return string.Empty;
+            var sb = new StringBuilder(length + 1);
+            _ = Win32.GetWindowTextW(hwnd, sb, sb.Capacity);
+            return sb.ToString();
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     #endregion
@@ -508,29 +550,114 @@ public static class GhostControlCommand
     #region Control Channel Authorization
 
     private static string? _controlToken;
+    private static string? _instanceId;
 
-    private sealed record ControlDaemonState(int Pid, DateTime StartTimeUtc, string Token, string PipeName);
+    private sealed record ControlDaemonState(
+        int Pid,
+        DateTime StartTimeUtc,
+        string Token,
+        string PipeName,
+        string DesktopName,
+        string? InstanceId,
+        string? Status,
+        string? Backend,
+        DateTime? LastHeartbeatUtc);
 
     private static string ControlStatePath =>
         Path.Combine(UserSettings.DataDir, "ghost-control.json");
 
-    private static void WriteControlState(string token, string pipeName)
+    private static void TraceStartup(string stage)
     {
         try
         {
-            Directory.CreateDirectory(UserSettings.DataDir);
-            using var p = Process.GetCurrentProcess();
-            var tmp = ControlStatePath + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(new
+            var dir = Path.Combine(UserSettings.DataDir, "logs");
+            Directory.CreateDirectory(dir);
+            File.AppendAllText(Path.Combine(dir, "ghost-startup.log"),
+                $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} pid={Environment.ProcessId} {stage}{Environment.NewLine}");
+        }
+        catch { }
+    }
+
+    private static bool WriteControlState(string token, string pipeName, string desktopName, string status)
+    {
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            string? tmp = null;
+            try
             {
+                Directory.CreateDirectory(UserSettings.DataDir);
+                using var p = Process.GetCurrentProcess();
+                tmp = Path.Combine(UserSettings.DataDir,
+                    $"ghost-control.{p.Id}.{Guid.NewGuid():N}.tmp");
+                var json = JsonSerializer.Serialize(new
+                {
+                    version = 1,
+                    instanceId = _instanceId,
+                    backend = "LocalDesktop",
+                    status,
+                    pid = p.Id,
+                    startTimeUtc = p.StartTime.ToUniversalTime().ToString("O"),
+                    token,
+                    pipeName,
+                    desktopName,
+                    lastHeartbeatUtc = DateTime.UtcNow.ToString("O")
+                }, JsonOptions);
+
+                using (var stream = new FileStream(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                using (var writer = new StreamWriter(stream))
+                {
+                    writer.Write(json);
+                    writer.Flush();
+                    stream.Flush(flushToDisk: true);
+                }
+
+                File.Move(tmp, ControlStatePath, overwrite: true);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                try { if (tmp != null && File.Exists(tmp)) File.Delete(tmp); } catch { }
+                if (attempt == 2)
+                {
+                    GhostLogger.Warn($"[GhostControl] Failed to write daemon state '{ControlStatePath}': {ex}");
+                    try { Console.Error.WriteLine($"[Ghost OS] ⚠ Failed to write daemon state '{ControlStatePath}': {ex.GetType().Name}: {ex.Message}"); } catch { }
+                }
+                Thread.Sleep(100);
+            }
+        }
+
+        // Sandboxed or AV-filtered environments can reject rename/replace even
+        // though a direct bounded write is allowed. Prefer a last-resort direct
+        // write over running an unowned daemon or leaving stale state behind.
+        try
+        {
+            using var p = Process.GetCurrentProcess();
+            var json = JsonSerializer.Serialize(new
+            {
+                version = 1,
+                instanceId = _instanceId,
+                backend = "LocalDesktop",
+                status,
                 pid = p.Id,
                 startTimeUtc = p.StartTime.ToUniversalTime().ToString("O"),
                 token,
-                pipeName
-            }, JsonOptions));
-            File.Move(tmp, ControlStatePath, overwrite: true);
+                pipeName,
+                desktopName,
+                lastHeartbeatUtc = DateTime.UtcNow.ToString("O")
+            }, JsonOptions);
+            using var stream = new FileStream(ControlStatePath, FileMode.Create, FileAccess.Write, FileShare.Read);
+            using var writer = new StreamWriter(stream);
+            writer.Write(json);
+            writer.Flush();
+            stream.Flush(flushToDisk: true);
+            return true;
         }
-        catch { }
+        catch (Exception directEx)
+        {
+            GhostLogger.Warn($"[GhostControl] Direct daemon state write failed '{ControlStatePath}': {directEx}");
+            try { Console.Error.WriteLine($"[Ghost OS] ⚠ Failed to write daemon state '{ControlStatePath}': {directEx.GetType().Name}: {directEx.Message}"); } catch { }
+        }
+        return false;
     }
 
     private static ControlDaemonState? ReadControlState()
@@ -541,19 +668,40 @@ public static class GhostControlCommand
             {
                 return null;
             }
-            using var doc = JsonDocument.Parse(File.ReadAllText(ControlStatePath));
-            var r = doc.RootElement;
-            if (!r.TryGetProperty("pid", out var pidProp) || pidProp.ValueKind != JsonValueKind.Number)
+            JsonDocument doc;
+            using (var stream = new FileStream(ControlStatePath, FileMode.Open, FileAccess.Read,
+                       FileShare.ReadWrite | FileShare.Delete))
+            using (var reader = new StreamReader(stream))
             {
-                return null;
+                doc = JsonDocument.Parse(reader.ReadToEnd());
             }
-            var start = r.TryGetProperty("startTimeUtc", out var s) &&
-                DateTime.TryParse(s.GetString(), null, DateTimeStyles.RoundtripKind, out var st)
-                ? st
-                : DateTime.MinValue;
-            var token = r.TryGetProperty("token", out var t) ? t.GetString() ?? string.Empty : string.Empty;
-            var pipe = r.TryGetProperty("pipeName", out var pn) ? pn.GetString() ?? DefaultControlPipeName : DefaultControlPipeName;
-            return new ControlDaemonState(pidProp.GetInt32(), start, token, pipe);
+            using (doc)
+            {
+                var r = doc.RootElement;
+                if (!r.TryGetProperty("pid", out var pidProp) || pidProp.ValueKind != JsonValueKind.Number)
+                {
+                    return null;
+                }
+                var start = r.TryGetProperty("startTimeUtc", out var s) &&
+                    DateTime.TryParse(s.GetString(), null, DateTimeStyles.RoundtripKind, out var st)
+                    ? st
+                    : DateTime.MinValue;
+                var token = r.TryGetProperty("token", out var t) ? t.GetString() ?? string.Empty : string.Empty;
+                var pipe = r.TryGetProperty("pipeName", out var pn) ? pn.GetString() ?? DefaultControlPipeName : DefaultControlPipeName;
+                var desktop = r.TryGetProperty("desktopName", out var dn) &&
+                    !string.IsNullOrWhiteSpace(dn.GetString())
+                    ? dn.GetString()!
+                    : GhostDesktopNative.DefaultGhostDesktopName;
+                var instanceId = r.TryGetProperty("instanceId", out var iid) ? iid.GetString() : null;
+                var status = r.TryGetProperty("status", out var stat) ? stat.GetString() : null;
+                var backend = r.TryGetProperty("backend", out var be) ? be.GetString() : null;
+                DateTime? heartbeat = r.TryGetProperty("lastHeartbeatUtc", out var hb) &&
+                    DateTime.TryParse(hb.GetString(), null, DateTimeStyles.RoundtripKind, out var hbt)
+                    ? hbt
+                    : null;
+                return new ControlDaemonState(pidProp.GetInt32(), start, token, pipe, desktop,
+                    instanceId, status, backend, heartbeat);
+            }
         }
         catch { return null; }
     }
@@ -563,7 +711,7 @@ public static class GhostControlCommand
         try
         {
             using var p = Process.GetProcessById(state.Pid);
-            if (!p.ProcessName.Contains("inbrisk", StringComparison.OrdinalIgnoreCase))
+            if (p.HasExited)
             {
                 return false;
             }
@@ -578,6 +726,46 @@ public static class GhostControlCommand
     }
 
     private static string? ControlToken() => ReadControlState()?.Token;
+
+    /// <summary>
+    /// Sends a real-window surface launch request to the running Ghost daemon.
+    /// Returns null when no daemon supports the request; callers may then fall
+    /// back to the older isolated-Win32-desktop path.
+    /// </summary>
+    public static async Task<string?> DaemonSurfaceLaunchAsync(
+        string program,
+        string? arguments,
+        string? workingDirectory,
+        CancellationToken ct = default)
+    {
+        var daemon = ReadControlState();
+        if (daemon == null || !ControlStateAlive(daemon) ||
+            !string.Equals(daemon.Status, "Ready", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        try
+        {
+            await using var client = new GhostIpcClient(daemon.PipeName);
+            await client.ConnectAsync(TimeSpan.FromMilliseconds(700), ct).ConfigureAwait(false);
+            if (!client.IsConnected) return null;
+
+            var payload = JsonSerializer.Serialize(new
+            {
+                token = daemon.Token,
+                program,
+                args = arguments,
+                workingDir = workingDirectory
+            });
+            var response = await client.SendRequestAsync("ghost_surface_launch", payload, TimeSpan.FromSeconds(25), ct).ConfigureAwait(false);
+            return response;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private static bool IsAuthorized(string? payloadJson)
     {
@@ -601,7 +789,8 @@ public static class GhostControlCommand
         try
         {
             var s = ReadControlState();
-            if (s != null && s.Pid == Environment.ProcessId)
+            if (s != null && s.Pid == Environment.ProcessId &&
+                (s.InstanceId == null || s.InstanceId == _instanceId))
             {
                 File.Delete(ControlStatePath);
             }
@@ -681,6 +870,7 @@ public static class GhostControlCommand
         writer.WriteLine("  --session               Launch secondary RDP session (default: off to avoid single-session kick)");
         writer.WriteLine("  --no-session            Launch PiP and System Tray without starting a new RDP session (default)");
         writer.WriteLine("  --extra-session         Force creating an additional secondary RDP session even if a desktop session is already running");
+        writer.WriteLine("  --initial-shell         Start a cmd shell on the isolated desktop (default: off; use only for diagnostics)");
         writer.WriteLine("  --user <name>           Ghost desktop username (default: InbriskAgent)");
         writer.WriteLine("  --json                  Output status and responses formatted as JSON");
         writer.WriteLine("  --verbose, -v           Enable detailed diagnostic logging");
@@ -701,9 +891,17 @@ public static class GhostControlCommand
     /// </summary>
     public static async Task<int> RunAsync(string[] args, CancellationToken ct = default)
     {
-        ConsoleAttach.Ensure();
-
         var options = GhostControlOptions.Parse(args);
+        if (options.Subcommand == GhostSubcommand.Tray)
+        {
+            TraceStartup("arguments parsed");
+        }
+
+        ConsoleAttach.Ensure();
+        if (options.Subcommand == GhostSubcommand.Tray)
+        {
+            TraceStartup("console attach completed");
+        }
 
         if (options.Subcommand == GhostSubcommand.Help)
         {
@@ -723,6 +921,39 @@ public static class GhostControlCommand
     }
 
     #region Subcommand: Tray (Full Orchestration)
+
+    private static GhostLocalDesktop? CreateIsolatedDesktop(GhostControlOptions options)
+    {
+        TraceStartup($"desktop create begin name={GhostLocalDesktop.DefaultDesktopName}");
+        try
+        {
+            var desktop = new GhostLocalDesktop(GhostLocalDesktop.DefaultDesktopName, createIfNotExists: true);
+            TraceStartup($"desktop create success name={desktop.DesktopName}");
+            return desktop;
+        }
+        catch (Exception ex)
+        {
+            LogWarning($"Failed to initialize GhostLocalDesktop '{GhostLocalDesktop.DefaultDesktopName}': {ex.Message}", options);
+        }
+
+        // A previously killed daemon can leave an inaccessible desktop object in
+        // WinSta0. Never fall back to the user's Default desktop: create a fresh
+        // per-daemon desktop and publish its name in ghost-control.json instead.
+        var fallbackName = $"{GhostLocalDesktop.DefaultDesktopName}_{Environment.ProcessId}";
+        TraceStartup($"desktop fallback begin name={fallbackName}");
+        try
+        {
+            var desktop = new GhostLocalDesktop(fallbackName, createIfNotExists: true);
+            TraceStartup($"desktop fallback success name={desktop.DesktopName}");
+            LogWarning($"Using fresh fallback Ghost Desktop '{fallbackName}'.", options);
+            return desktop;
+        }
+        catch (Exception ex)
+        {
+            LogError($"Failed to initialize fallback GhostLocalDesktop '{fallbackName}': {ex.Message}", options);
+            return null;
+        }
+    }
 
     /// <summary>
     /// Launches the full Ghost OS experience: background session, PiP overlay,
@@ -747,6 +978,7 @@ public static class GhostControlCommand
         Console.CancelKeyPress += cancelHandler;
         AppDomain.CurrentDomain.ProcessExit += processExitHandler;
 
+        TraceStartup("RunTray entered");
         LogHeader(options);
 
         if (EmergencyGate.IsStopped)
@@ -763,23 +995,58 @@ public static class GhostControlCommand
         GhostTrayApp? trayApp = null;
         GhostKeyboardForwarder? keyboardForwarder = null;
         GhostIpcServer? controlServer = null;
+        GhostWindowSurfaceManager? surfaceManager = null;
         GhostWorkerDaemon? localWorker = null;
         ActivityHudService? hud = null;
+        Mutex? singleInstanceMutex = null;
+        bool ownsSingleInstance = false;
 
         try
         {
-            // 1. Initialize Isolated Win32 Ghost Desktop ("InbriskGhostDesktop")
+            TraceStartup("single-instance mutex begin");
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
+                singleInstanceMutex = new Mutex(false, @"Local\InbriskGhostTrayDaemon");
                 try
                 {
-                    localDesktop = new GhostLocalDesktop(GhostLocalDesktop.DefaultDesktopName, createIfNotExists: true);
-                    LogSuccess($"Isolated Ghost Desktop active: '{localDesktop.DesktopName}' (Handle: 0x{localDesktop.DesktopHandle:X}, New: {localDesktop.WasCreatedNew})", options);
+                    ownsSingleInstance = singleInstanceMutex.WaitOne(0);
                 }
-                catch (Exception ex)
+                catch (AbandonedMutexException)
                 {
-                    LogWarning($"Failed to initialize GhostLocalDesktop: {ex.Message}. Continuing with default session.", options);
+                    ownsSingleInstance = true;
                 }
+
+                if (!ownsSingleInstance)
+                {
+                    TraceStartup("single-instance mutex denied");
+                    LogWarning("Ghost OS daemon is already running; refusing to start a duplicate tray process.", options);
+                    return 0;
+                }
+            }
+            TraceStartup("single-instance mutex acquired");
+
+            _controlToken = Guid.NewGuid().ToString("N");
+            _instanceId = Guid.NewGuid().ToString("N");
+            try { File.Delete(ControlStatePath); } catch { }
+
+            // 1. Initialize Isolated Win32 Ghost Desktop. If the canonical
+            // object is stale/inaccessible, use a fresh named fallback; never
+            // run Ghost capture/input against the user's Default desktop.
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                localDesktop = CreateIsolatedDesktop(options);
+                if (localDesktop == null)
+                {
+                    return 1;
+                }
+
+                if (!WriteControlState(_controlToken, options.ControlPipeName, localDesktop.DesktopName, "Starting"))
+                {
+                    LogError("Could not publish Ghost daemon state; refusing to run an unowned isolated session.", options);
+                    return 1;
+                }
+                TraceStartup($"control state published status=Starting desktop={localDesktop.DesktopName}");
+                LogSuccess($"Isolated Ghost Desktop active: '{localDesktop.DesktopName}' (Handle: 0x{localDesktop.DesktopHandle:X}, New: {localDesktop.WasCreatedNew})", options);
             }
 
             // 1b. Secondary RDP Session (enabled by default via StartSession, or explicitly via --extra-session)
@@ -826,8 +1093,10 @@ public static class GhostControlCommand
                 TargetFps: options.TargetFps,
                 Title: "Inbrisk Ghost PiP");
 
-            pipManager = new GhostPipManager();
+            pipManager = new GhostPipManager(
+                ghostDesktopName: localDesktop?.DesktopName ?? GhostLocalDesktop.DefaultDesktopName);
             pipManager.StartPip(pipConfig);
+            surfaceManager = new GhostWindowSurfaceManager(pipManager);
 
             LogSuccess($"Ghost PiP window started ({pipManager.Width}x{pipManager.Height} at {pipManager.CurrentPosition}, HWND: 0x{pipManager.WindowHandle:X8})", options);
 
@@ -850,14 +1119,15 @@ public static class GhostControlCommand
                 }
             }
 
-            // 4. Start lightweight initial app or terminal on the ghost desktop if none exists
-            if (localDesktop != null && localDesktop.IsCreated)
+            // 4. Optionally start a diagnostic shell on the ghost desktop. This
+            // is intentionally off by default: PiP is a live capture surface and
+            // does not need a foreground cmd window as its initial app.
+            if (localDesktop != null && localDesktop.IsCreated && options.StartInitialShell)
             {
                 try
                 {
                     var (hasActiveApp, consolePids) = GhostDesktopNative.InspectActiveDesktopWindows(localDesktop.DesktopHandle);
 
-                    // If multiple duplicate console windows accumulated, clean up all but the most recent one
                     if (consolePids.Count > 1)
                     {
                         for (int i = 0; i < consolePids.Count - 1; i++)
@@ -874,7 +1144,7 @@ public static class GhostControlCommand
                     if (!hasActiveApp)
                     {
                         var initialProc = localDesktop.StartProcess("cmd.exe", "/k title Inbrisk Ghost Desktop && echo Inbrisk Ghost OS Desktop Active.");
-                        LogSuccess($"Started initial terminal on Ghost Desktop (PID: {initialProc.Id}).", options);
+                        LogSuccess($"Started diagnostic terminal on Ghost Desktop (PID: {initialProc.Id}).", options);
                     }
                     else
                     {
@@ -955,10 +1225,15 @@ public static class GhostControlCommand
 
             // 7. Start Remote Control IPC Server
             controlServer = new GhostIpcServer(options.ControlPipeName);
-            _controlToken = Guid.NewGuid().ToString("N");
-            WriteControlState(_controlToken, options.ControlPipeName);
-            RegisterIpcControlHandlers(controlServer, pipManager, expander, trayApp, keyboardForwarder, sessionManager, linkedCts, options);
+            RegisterIpcControlHandlers(controlServer, pipManager, expander, trayApp, keyboardForwarder, sessionManager, localDesktop, surfaceManager, linkedCts, options);
             await controlServer.StartAsync(linkedCts.Token).ConfigureAwait(false);
+            if (!WriteControlState(_controlToken, options.ControlPipeName,
+                    localDesktop?.DesktopName ?? GhostDesktopNative.DefaultGhostDesktopName, "Ready"))
+            {
+                LogError("Control IPC is running but Ghost daemon readiness could not be published.", options);
+                return 1;
+            }
+            TraceStartup("control state published status=Ready");
             LogSuccess($"Control IPC server listening on \\\\.\\pipe\\{options.ControlPipeName}", options);
 
             // 8. If fullscreen requested on initial launch, expand now
@@ -1025,6 +1300,11 @@ public static class GhostControlCommand
                 try { trayApp.Dispose(); } catch { }
             }
 
+            if (surfaceManager != null)
+            {
+                try { surfaceManager.Dispose(); } catch { }
+            }
+
             if (desktopCapture != null)
             {
                 try
@@ -1070,12 +1350,23 @@ public static class GhostControlCommand
                 catch { }
             }
 
-            // Thorough cleanup: clear loopback credentials, delete temp files, kill leftover client processes
-            try
+            // Thorough cleanup belongs only to the daemon instance that owns
+            // the singleton. A duplicate launch must not tear down shared or
+            // account-level resources for the already-running owner.
+            if (ownsSingleInstance)
             {
-                await GhostRdpConnector.CleanupAllSessionsAsync(options.Username).ConfigureAwait(false);
+                try
+                {
+                    await GhostRdpConnector.CleanupAllSessionsAsync(options.Username).ConfigureAwait(false);
+                }
+                catch { }
             }
-            catch { }
+
+            if (ownsSingleInstance)
+            {
+                try { singleInstanceMutex?.ReleaseMutex(); } catch { }
+            }
+            try { singleInstanceMutex?.Dispose(); } catch { }
 
             LogSuccess("Ghost OS System Tray session terminated and all resources cleaned up.", options);
         }
@@ -1199,6 +1490,8 @@ public static class GhostControlCommand
         GhostTrayApp trayApp,
         GhostKeyboardForwarder? keyboardForwarder,
         GhostSessionManager? sessionManager,
+        GhostLocalDesktop? localDesktop,
+        GhostWindowSurfaceManager? surfaceManager,
         CancellationTokenSource linkedCts,
         GhostControlOptions options)
     {
@@ -1364,23 +1657,185 @@ public static class GhostControlCommand
             return JsonSerializer.Serialize(new { ok = true, scale = pipManager.CurrentScale, width = pipManager.Width, height = pipManager.Height });
         });
 
-        // 6. status handler
+        // 6. real-window surface launch/status/input handlers
+        server.RegisterHandler("ghost_surface_launch", async (payloadJson) =>
+        {
+            if (!IsAuthorized(payloadJson))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
+
+            if (surfaceManager == null)
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "surface manager unavailable" });
+            }
+
+            string? program = null;
+            string? arguments = null;
+            string? workingDirectory = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(payloadJson);
+                if (doc.RootElement.TryGetProperty("program", out var p)) program = p.GetString();
+                if (doc.RootElement.TryGetProperty("args", out var a)) arguments = a.GetString();
+                if (doc.RootElement.TryGetProperty("workingDir", out var wd)) workingDirectory = wd.GetString();
+            }
+            catch { }
+
+            if (string.IsNullOrWhiteSpace(program))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "program required" });
+            }
+
+            try
+            {
+                var surface = await surfaceManager.LaunchAsync(program, arguments, workingDirectory).ConfigureAwait(false);
+                Win32.GetWindowThreadProcessId(surface.Hwnd, out var pid);
+                return JsonSerializer.Serialize(new
+                {
+                    ok = true,
+                    backend = "dwmWindowSurface",
+                    hwnd = $"0x{surface.Hwnd.ToInt64():X}",
+                    pid,
+                    title = GetWindowTextSafe(surface.Hwnd)
+                });
+            }
+            catch (Exception ex)
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = ex.Message });
+            }
+        });
+
+        server.RegisterHandler("ghost_surface_status", async (payloadJson) =>
+        {
+            await Task.Yield();
+            if (!IsAuthorized(payloadJson))
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
+
+            var windows = surfaceManager?.GetSurfaceStatus() ?? Array.Empty<object>();
+            return JsonSerializer.Serialize(new
+            {
+                ok = true,
+                backend = "dwmWindowSurface",
+                activeHwnd = surfaceManager?.ActiveHwnd is { } h && h != IntPtr.Zero ? $"0x{h.ToInt64():X}" : null,
+                count = windows.Count,
+                windows
+            });
+        });
+
+        server.RegisterHandler("ghost_surface_select", async (payloadJson) =>
+        {
+            await Task.Yield();
+            if (!IsAuthorized(payloadJson) || surfaceManager == null)
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
+
+            long hwndValue = 0;
+            try
+            {
+                using var doc = JsonDocument.Parse(payloadJson);
+                if (doc.RootElement.TryGetProperty("hwnd", out var h))
+                {
+                    var raw = h.GetString() ?? string.Empty;
+                    hwndValue = raw.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+                        ? Convert.ToInt64(raw[2..], 16)
+                        : Convert.ToInt64(raw);
+                }
+            }
+            catch { }
+
+            var hwnd = new IntPtr(hwndValue);
+            bool ok = hwndValue != 0 && surfaceManager.Select(hwnd);
+            return JsonSerializer.Serialize(new { ok, hwnd = $"0x{hwndValue:X}" });
+        });
+
+        server.RegisterHandler("ghost_surface_click", async (payloadJson) =>
+        {
+            await Task.Yield();
+            if (!IsAuthorized(payloadJson) || surfaceManager == null)
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
+
+            int x = 0, y = 0;
+            bool doubleClick = false;
+            MouseButton button = MouseButton.Left;
+            try
+            {
+                using var doc = JsonDocument.Parse(payloadJson);
+                if (doc.RootElement.TryGetProperty("x", out var px)) x = px.GetInt32();
+                if (doc.RootElement.TryGetProperty("y", out var py)) y = py.GetInt32();
+                if (doc.RootElement.TryGetProperty("doubleClick", out var dc)) doubleClick = dc.GetBoolean();
+                if (doc.RootElement.TryGetProperty("button", out var pb))
+                {
+                    button = (pb.GetString() ?? "left").ToLowerInvariant() switch
+                    {
+                        "right" => MouseButton.Right,
+                        "middle" => MouseButton.Middle,
+                        _ => MouseButton.Left
+                    };
+                }
+            }
+            catch { }
+
+            bool ok = surfaceManager.ForwardMouse(
+                new PipInputEventArgs(doubleClick ? PipInputEventType.DoubleClick : PipInputEventType.MouseDown, 0, 0, button), x, y);
+            if (!doubleClick)
+            {
+                ok &= surfaceManager.ForwardMouse(new PipInputEventArgs(PipInputEventType.MouseUp, 0, 0, button), x, y);
+            }
+            return JsonSerializer.Serialize(new { ok, x, y, button = button.ToString(), doubleClick });
+        });
+
+        server.RegisterHandler("ghost_surface_type", async (payloadJson) =>
+        {
+            await Task.Yield();
+            if (!IsAuthorized(payloadJson) || surfaceManager == null)
+            {
+                return JsonSerializer.Serialize(new { ok = false, error = "unauthorized" });
+            }
+
+            string? text = null;
+            try
+            {
+                using var doc = JsonDocument.Parse(payloadJson);
+                if (doc.RootElement.TryGetProperty("text", out var t)) text = t.GetString();
+            }
+            catch { }
+
+            bool ok = true;
+            foreach (var c in text ?? string.Empty)
+            {
+                ok &= surfaceManager.ForwardKey(new PipInputEventArgs(PipInputEventType.Char, 0, 0, character: c));
+            }
+            return JsonSerializer.Serialize(new { ok, chars = text?.Length ?? 0 });
+        });
+
+        // 7. status handler
         server.RegisterHandler("status", async (_) =>
         {
             var sessionStatus = sessionManager != null
                 ? await sessionManager.GetStatusAsync().ConfigureAwait(false)
                 : GhostSessionStatus.Inactive;
+            bool localDesktopActive = localDesktop?.IsCreated == true;
 
             var result = new
             {
                 ok = true,
                 session = new
                 {
-                    active = sessionStatus.IsActive,
+                    active = sessionStatus.IsActive || localDesktopActive,
                     sessionId = sessionStatus.SessionId,
-                    username = sessionStatus.Username,
+                    username = sessionStatus.Username ?? (localDesktopActive ? Environment.UserName : null),
                     uptimeSeconds = sessionStatus.Uptime.TotalSeconds,
-                    state = sessionStatus.State
+                    state = sessionStatus.IsActive
+                        ? sessionStatus.State
+                        : (localDesktopActive ? "LocalDesktop" : sessionStatus.State),
+                    backend = sessionStatus.IsActive ? "rdp" : (localDesktopActive ? "localDesktop" : "none"),
+                    desktop = localDesktop?.DesktopName
                 },
                 pip = new
                 {
@@ -1399,6 +1854,12 @@ public static class GhostControlCommand
                     running = trayApp.IsRunning,
                     visible = trayApp.IsVisible,
                     statusText = trayApp.StatusText
+                },
+                surface = new
+                {
+                    backend = "dwmWindowSurface",
+                    activeHwnd = surfaceManager?.ActiveHwnd is { } h && h != IntPtr.Zero ? $"0x{h.ToInt64():X}" : null,
+                    windows = surfaceManager?.GetSurfaceStatus() ?? Array.Empty<object>()
                 }
             };
 
@@ -1614,10 +2075,35 @@ public static class GhostControlCommand
         }
         catch { }
 
-        // Fallback: Query Windows Terminal Services directly
+        // Fallback: distinguish an unreachable IPC endpoint from "not running".
+        // The daemon records its PID/start time before the pipe comes online and
+        // owns the named local desktop independently of any RDP/WTS session.
         var existingSession = GhostWtsInterop.FindSessionByUsername(options.Username);
-        bool isActive = existingSession != null &&
+        bool rdpActive = existingSession != null &&
             (existingSession.State == WTS_CONNECTSTATE_CLASS.WTSActive || existingSession.State == WTS_CONNECTSTATE_CLASS.WTSConnected);
+
+        var daemonState = ReadControlState();
+        bool daemonAlive = daemonState != null && ControlStateAlive(daemonState);
+        bool daemonReady = daemonAlive &&
+            string.Equals(daemonState?.Status, "Ready", StringComparison.OrdinalIgnoreCase);
+        bool localDesktopActive = false;
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            var hDesktop = GhostDesktopNative.OpenDesktop(
+                daemonState?.DesktopName ?? GhostDesktopNative.DefaultGhostDesktopName,
+                GhostDesktopNative.DESKTOP_READOBJECTS | GhostDesktopNative.DESKTOP_ENUMERATE,
+                false);
+            if (hDesktop != IntPtr.Zero)
+            {
+                localDesktopActive = true;
+                GhostDesktopNative.CloseDesktop(hDesktop);
+            }
+        }
+
+        bool isActive = rdpActive || (daemonReady && localDesktopActive);
+        string backendState = rdpActive
+            ? existingSession!.State.ToString()
+            : (isActive ? "LocalDesktop" : (daemonAlive ? "DaemonStarting" : "NotRunning"));
 
         if (options.JsonOutput)
         {
@@ -1628,11 +2114,13 @@ public static class GhostControlCommand
                 {
                     active = isActive,
                     sessionId = existingSession?.SessionId,
-                    username = existingSession?.UserName ?? options.Username,
-                    state = existingSession?.State.ToString() ?? "NotRunning"
+                    username = existingSession?.UserName ?? (isActive ? Environment.UserName : options.Username),
+                    state = backendState,
+                    backend = rdpActive ? "rdp" : (isActive ? "localDesktop" : "none"),
+                    desktop = daemonState?.DesktopName
                 },
-                pip = new { running = false },
-                tray = new { running = false }
+                pip = new { running = localDesktopActive },
+                tray = new { running = daemonAlive, pipeConnected = false }
             };
             Console.WriteLine(JsonSerializer.Serialize(raw, JsonOptions));
         }
@@ -1641,15 +2129,15 @@ public static class GhostControlCommand
             Console.WriteLine("==================================================================");
             Console.WriteLine("              INBRISK GHOST OS — SYSTEM STATUS                    ");
             Console.WriteLine("==================================================================");
-            Console.WriteLine($"  Session State:    {(isActive ? "ACTIVE" : "INACTIVE")}");
+            Console.WriteLine($"  Session State:    {(isActive ? "ACTIVE" : "INACTIVE")} ({backendState})");
             Console.WriteLine($"  Target User:      {options.Username}");
             if (existingSession != null)
             {
                 Console.WriteLine($"  Session ID:       {existingSession.SessionId}");
                 Console.WriteLine($"  Session Status:   {existingSession.State}");
             }
-            Console.WriteLine("  Tray Daemon:      NOT RUNNING (no active IPC control endpoint)");
-            Console.WriteLine("  PiP Display:      INACTIVE");
+            Console.WriteLine($"  Tray Daemon:      {(daemonAlive ? "RUNNING (control IPC unavailable)" : "NOT RUNNING")}");
+            Console.WriteLine($"  PiP Display:      {(localDesktopActive ? "LOCAL DESKTOP ACTIVE" : "INACTIVE")}");
             Console.WriteLine("==================================================================");
         }
 
@@ -1755,7 +2243,10 @@ public static class GhostControlCommand
         {
             try
             {
-                var hDesktop = GhostDesktopNative.OpenDesktop(GhostDesktopNative.DefaultGhostDesktopName, GhostDesktopNative.DESKTOP_ALL_ACCESS, false);
+                var hDesktop = GhostDesktopNative.OpenDesktop(
+                    daemonState?.DesktopName ?? GhostDesktopNative.DefaultGhostDesktopName,
+                    GhostDesktopNative.DESKTOP_ALL_ACCESS,
+                    false);
                 if (hDesktop != IntPtr.Zero)
                 {
                     var windows = GhostDesktopNative.EnumerateWindows(hDesktop);

@@ -23,6 +23,17 @@ public static class ConsoleAttach
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool FreeConsole();
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr GetStdHandle(int nStdHandle);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetFileType(IntPtr hFile);
+
+    private const int StdOutputHandle = -11;
+    private const int StdErrorHandle = -12;
+    private static readonly IntPtr InvalidHandleValue = new(-1);
+    private const uint FileTypeUnknown = 0;
+
     public static bool HasConsole => GetConsoleWindow() != IntPtr.Zero;
 
     /// <summary>Attach to the parent console if we don't own one. Returns
@@ -36,19 +47,37 @@ public static class ConsoleAttach
         try
         {
             try { Console.OutputEncoding = new System.Text.UTF8Encoding(false); } catch { }
-            var outStream = Console.OpenStandardOutput();
-            if (outStream != Stream.Null)
+
+            var outStream = TryOpenStandardStream(StdOutputHandle, Console.OpenStandardOutput);
+            if (outStream != null && outStream != Stream.Null)
             {
                 Console.SetOut(new StreamWriter(outStream, new System.Text.UTF8Encoding(false)) { AutoFlush = true });
             }
-            var errStream = Console.OpenStandardError();
-            if (errStream != Stream.Null)
+            var errStream = TryOpenStandardStream(StdErrorHandle, Console.OpenStandardError);
+            if (errStream != null && errStream != Stream.Null)
             {
                 Console.SetError(new StreamWriter(errStream, new System.Text.UTF8Encoding(false)) { AutoFlush = true });
             }
         }
         catch { }
         return attached;
+    }
+
+    private static Stream? TryOpenStandardStream(int stdHandle, Func<Stream> open)
+    {
+        try
+        {
+            var handle = GetStdHandle(stdHandle);
+            if (handle == IntPtr.Zero || handle == InvalidHandleValue || GetFileType(handle) == FileTypeUnknown)
+            {
+                return null;
+            }
+            return open();
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>Detach so the parent shell prompt returns cleanly.</summary>

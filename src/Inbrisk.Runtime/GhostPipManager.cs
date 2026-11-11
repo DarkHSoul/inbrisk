@@ -111,6 +111,25 @@ public interface IGhostPipWindowHost : IDisposable
     void ToggleExpand();
 }
 
+/// <summary>
+/// Optional direct input target for a managed Ghost window surface.
+/// Coordinates supplied to the target are in the surface's logical window space.
+/// </summary>
+public interface IGhostWindowSurfaceInputTarget
+{
+    /// <summary>Logical surface width in pixels.</summary>
+    int SurfaceWidth { get; }
+
+    /// <summary>Logical surface height in pixels.</summary>
+    int SurfaceHeight { get; }
+
+    /// <summary>Forwards a mapped mouse event to the real target window.</summary>
+    bool ForwardMouse(PipInputEventArgs args, int targetX, int targetY);
+
+    /// <summary>Forwards a keyboard event to the real target window.</summary>
+    bool ForwardKey(PipInputEventArgs args);
+}
+
 #endregion
 
 #region Telemetry Extension
@@ -251,6 +270,7 @@ public class GhostPipManager : IDisposable
     private GhostPipRenderer? _renderer;
     private bool _isRunning;
     private bool _isInteractive;
+    private IGhostWindowSurfaceInputTarget? _directInputTarget;
     private PipPresetPosition _currentPosition = PipPresetPosition.TopRight;
     private float _currentScale = 1.0f;
     private int _currentWidth = BaseWidth;
@@ -313,6 +333,19 @@ public class GhostPipManager : IDisposable
     /// <summary>Gets the active window host instance, if running.</summary>
     public IGhostPipWindowHost? WindowHost => _windowHost;
 
+    /// <summary>
+    /// Sets an optional real-window input target. When present, interactive PiP
+    /// input is posted directly to that managed window instead of the isolated
+    /// Win32 desktop input dispatcher.
+    /// </summary>
+    public void SetDirectInputTarget(IGhostWindowSurfaceInputTarget? target)
+    {
+        lock (_gate)
+        {
+            _directInputTarget = target;
+        }
+    }
+
     /// <summary>Gets the current PiP configuration.</summary>
     public PipConfig CurrentConfig => _currentConfig;
 
@@ -325,9 +358,17 @@ public class GhostPipManager : IDisposable
     /// </summary>
     /// <param name="desktopInput">Optional custom desktop input injector.</param>
     /// <param name="ipcBus">Optional IPC channel connected to the ghost desktop session.</param>
-    public GhostPipManager(GhostDesktopInput? desktopInput = null, IGhostIpcBus? ipcBus = null)
+    /// <param name="ghostDesktopName">Actual isolated desktop name for local input routing.</param>
+    public GhostPipManager(
+        GhostDesktopInput? desktopInput = null,
+        IGhostIpcBus? ipcBus = null,
+        string? ghostDesktopName = null)
     {
-        _desktopInput = desktopInput ?? new GhostDesktopInput(ipcBus);
+        _desktopInput = desktopInput ?? new GhostDesktopInput(
+            ipcBus,
+            desktopName: string.IsNullOrWhiteSpace(ghostDesktopName)
+                ? "InbriskGhostDesktop"
+                : ghostDesktopName);
     }
 
     #endregion
@@ -452,6 +493,11 @@ public class GhostPipManager : IDisposable
         // Forward keyboard events directly without mouse coordinate mapping
         if (e.EventType is PipInputEventType.KeyDown or PipInputEventType.KeyUp or PipInputEventType.Char)
         {
+            var keyTarget = _directInputTarget;
+            if (keyTarget != null && keyTarget.ForwardKey(e))
+            {
+                return;
+            }
             _desktopInput.ForwardKeyInput(e.EventType, e.KeyCode, e.Character);
             return;
         }
@@ -469,11 +515,17 @@ public class GhostPipManager : IDisposable
             return;
         }
 
-        int targetWidth = _targetResolutionWidth;
-        int targetHeight = _targetResolutionHeight;
+        var directTarget = _directInputTarget;
+        int targetWidth = directTarget?.SurfaceWidth ?? _targetResolutionWidth;
+        int targetHeight = directTarget?.SurfaceHeight ?? _targetResolutionHeight;
 
         int targetX = (int)Math.Clamp(((long)Math.Clamp(e.X, 0, pipWidth) * targetWidth) / Math.Max(1, pipWidth), 0, targetWidth - 1);
         int targetY = (int)Math.Clamp(((long)Math.Clamp(clientY, 0, contentHeight) * targetHeight) / contentHeight, 0, targetHeight - 1);
+
+        if (directTarget != null && directTarget.ForwardMouse(e, targetX, targetY))
+        {
+            return;
+        }
 
         // Forward the mapped click/move/scroll directly to the isolated ghost desktop!
         _desktopInput.ForwardInput(e.EventType, targetX, targetY, e.Button, e.Delta);
@@ -520,6 +572,7 @@ public class GhostPipManager : IDisposable
             }
 
             _desktopInput.ReleaseAll();
+            _directInputTarget = null;
             _isRunning = false;
 
             // Telemetry hook

@@ -174,4 +174,40 @@ public sealed class GhostMcpBridgeTests
         var text2 = string.Join("\n", r2.Content.OfType<TextContentBlock>().Select(t => t.Text));
         Assert.Contains("SessionInactive", text2);
     }
+
+    [Fact]
+    public async Task GhostMcpBridge_LocalDesktopBackend_CountsAsActiveGhostSession()
+    {
+        var localStatus = new GhostSessionStatus(
+            IsActive: true,
+            SessionId: null,
+            Username: Environment.UserName,
+            Uptime: TimeSpan.FromSeconds(3),
+            State: "LocalDesktop",
+            ProcessId: 1234);
+
+        using var bridge = new GhostMcpBridge(
+            sessionManager: new InactiveSessionManager(),
+            localBackendStatusProvider: () => localStatus);
+
+        var status = await bridge.GetSessionStatusAsync();
+        Assert.True(status.IsActive);
+        Assert.Equal("LocalDesktop", status.State);
+        Assert.Equal(1234, status.ProcessId);
+    }
+
+    private sealed class InactiveSessionManager : IGhostSessionManager
+    {
+        public Task<GhostUserProvisionResult> EnsureProvisionedAsync(CancellationToken ct = default) =>
+            Task.FromResult(GhostUserProvisionResult.Fail("InbriskAgent", "not provisioned in test"));
+
+        public Task<GhostSessionStatus> StartSessionAsync(GhostSessionConfig? config = null, CancellationToken ct = default) =>
+            Task.FromResult(GhostSessionStatus.Inactive);
+
+        public Task<bool> StopSessionAsync(int? sessionId = null, CancellationToken ct = default) =>
+            Task.FromResult(true);
+
+        public Task<GhostSessionStatus> GetStatusAsync(CancellationToken ct = default) =>
+            Task.FromResult(GhostSessionStatus.Inactive);
+    }
 }

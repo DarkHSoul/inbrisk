@@ -260,6 +260,7 @@ public sealed class GhostMcpBridge : IDisposable
     private readonly bool _ownsPipManager;
     private readonly bool _ownsSessionManager;
     private readonly bool _ownsIpcServer;
+    private readonly Func<GhostSessionStatus?>? _localBackendStatusProvider;
     private readonly object _desktopGate = new();
     private GhostLocalDesktop? _localDesktop;
     private Inbrisk.Platform.Windows.GhostDesktopInput? _desktopInput;
@@ -267,11 +268,11 @@ public sealed class GhostMcpBridge : IDisposable
     private InbriskTools? _inbriskTools;
     private int _disposed;
 
-    /// <summary>Reachability probe for the isolated desktop — a cheap WTS
-    /// query, no IPC round-trip. Lets a caller report whether switching the
-    /// session onto the ghost desktop actually has somewhere to land.</summary>
+    /// <summary>Reachability probe for the isolated desktop. Reports either an
+    /// active RDP/WTS session or the local Ghost Control backend that owns the
+    /// named isolated desktop.</summary>
     public Task<GhostSessionStatus> GetSessionStatusAsync(CancellationToken ct = default) =>
-        _sessionManager.GetStatusAsync(ct);
+        GetEffectiveSessionStatusAsync(ct);
 
     private InbriskTools GetTools()
     {
@@ -281,13 +282,19 @@ public sealed class GhostMcpBridge : IDisposable
         return _inbriskTools;
     }
 
+    private static string GetBackendDesktopName() =>
+        TryReadGhostControlDaemonInfo()?.DesktopName ?? GhostDesktopNative.DefaultGhostDesktopName;
+
     private GhostLocalDesktop GetOrCreateDesktop()
     {
         lock (_desktopGate)
         {
-            if (_localDesktop == null || !_localDesktop.IsCreated)
+            var desktopName = GetBackendDesktopName();
+            if (_localDesktop == null || !_localDesktop.IsCreated ||
+                !string.Equals(_localDesktop.DesktopName, desktopName, StringComparison.OrdinalIgnoreCase))
             {
-                _localDesktop = new GhostLocalDesktop(GhostDesktopNative.DefaultGhostDesktopName, createIfNotExists: true);
+                _localDesktop?.Dispose();
+                _localDesktop = new GhostLocalDesktop(desktopName, createIfNotExists: true);
             }
             return _localDesktop;
         }
@@ -297,11 +304,409 @@ public sealed class GhostMcpBridge : IDisposable
     {
         lock (_desktopGate)
         {
-            if (_desktopInput == null)
+            var desktopName = GetBackendDesktopName();
+            if (_desktopInput == null ||
+                !string.Equals(_desktopInput.DesktopName, desktopName, StringComparison.OrdinalIgnoreCase))
             {
-                _desktopInput = new Inbrisk.Platform.Windows.GhostDesktopInput(GhostDesktopNative.DefaultGhostDesktopName);
+                _desktopInput?.Dispose();
+                _desktopInput = new Inbrisk.Platform.Windows.GhostDesktopInput(desktopName);
             }
             return _desktopInput;
+        }
+    }
+
+    /// <summary>
+    /// The control layer historically only treated an RDP/WTS session as
+    /// active. Ghost Control can also run the supported local backend: the
+    /// isolated Win32 desktop recorded by its daemon plus the capture process. When that backend is
+    /// alive it is a valid target for GhostDesktopInput/GhostLocalDesktop.
+    /// </summary>
+    private async Task<GhostSessionStatus> GetEffectiveSessionStatusAsync(CancellationToken ct)
+    {
+        GhostSessionStatus? status = null;
+        try
+        {
+            status = await _sessionManager.GetStatusAsync(ct).ConfigureAwait(false);
+            if (status.IsActive) return status;
+        }
+        catch
+        {
+            if (TryGetLocalBackendStatus() is { } fallback) return fallback;
+            throw;
+        }
+
+        return TryGetLocalBackendStatus() ?? status;
+    }
+
+    private GhostSessionStatus? TryGetLocalBackendStatus()
+    {
+        if (_localBackendStatusProvider != null)
+        {
+            return _localBackendStatusProvider();
+        }
+
+        if (!OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+
+        var daemon = TryReadGhostControlDaemonInfo();
+        if (daemon == null || !IsGhostControlDaemonAlive(daemon) ||
+            !string.Equals(daemon.Status, "Ready", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        IntPtr desktopHandle = GhostDesktopNative.OpenDesktop(
+            daemon.DesktopName,
+            GhostDesktopNative.DESKTOP_READOBJECTS | GhostDesktopNative.DESKTOP_ENUMERATE,
+            inherit: false);
+        if (desktopHandle == IntPtr.Zero)
+        {
+            return null;
+        }
+        GhostDesktopNative.CloseDesktop(desktopHandle);
+
+        var uptime = daemon.StartTimeUtc.HasValue
+            ? DateTime.UtcNow - daemon.StartTimeUtc.Value
+            : TimeSpan.Zero;
+        if (uptime < TimeSpan.Zero) uptime = TimeSpan.Zero;
+
+        return new GhostSessionStatus(
+            IsActive: true,
+            SessionId: null,
+            Username: Environment.UserName,
+            Uptime: uptime,
+            State: "LocalDesktop",
+            ProcessId: daemon.Pid);
+    }
+
+    // ---------------------------------------------------------------
+    // Ghost action execution
+    //
+    // These shims used to forward straight back into the unified tools
+    // with ghost:true — but a unified tool's ghost path delegates to
+    // GhostSessionCoordinator, which calls right back into THIS class.
+    // That mutual recursion killed the whole process with a stack
+    // overflow on the first ghost action (computer_batch(ghost:true),
+    // computer_click(ghost:true), computer_windows(ghost:true), ...).
+    //
+    // The bridge owns the isolated-desktop primitives (GhostDesktopInput
+    // for injection, GhostLocalDesktop for windows/processes), so the
+    // bridge executes and the cycle is cut.
+    // ---------------------------------------------------------------
+
+    /// <summary>Ghost actions only run inside an ACTIVE ghost session —
+    /// otherwise the injection primitives would address whatever desktop
+    /// the caller happens to be on (i.e. the user's own).</summary>
+    private async Task<CallToolResult?> RequireActiveSessionAsync(CancellationToken ct)
+    {
+        GhostSessionStatus status;
+        try { status = await GetEffectiveSessionStatusAsync(ct).ConfigureAwait(false); }
+        catch (Exception ex)
+        {
+            return ErrorResult("SessionUnavailable",
+                $"ghost session status query failed: {ex.Message}");
+        }
+        return status.IsActive
+            ? null
+            : ErrorResult("SessionInactive",
+                $"no active ghost session (state: {status.State}) — start one with " +
+                "computer_ghost_control(action:\"open\") or computer_ghost_start before " +
+                "acting on the isolated desktop");
+    }
+
+    private static MouseButton ParseMouseButton(string? button) =>
+        (button ?? "left").Trim().ToLowerInvariant() switch
+        {
+            "right" => MouseButton.Right,
+            "middle" => MouseButton.Middle,
+            _ => MouseButton.Left,
+        };
+
+    private async Task<CallToolResult> ExecuteGhostClickAsync(
+        int x, int y, string? button, bool doubleClick, CancellationToken ct)
+    {
+        if (await RequireActiveSessionAsync(ct).ConfigureAwait(false) is { } inactive)
+            return inactive;
+
+        if (await TrySendSurfaceInputAsync("ghost_surface_click", new Dictionary<string, object?>
+        {
+            ["x"] = x,
+            ["y"] = y,
+            ["button"] = button ?? "left",
+            ["doubleClick"] = doubleClick
+        }, ct).ConfigureAwait(false))
+        {
+            return SuccessResult(new
+            {
+                success = true,
+                action = "click",
+                x,
+                y,
+                button = button ?? "left",
+                doubleClick,
+                backend = "dwmWindowSurface"
+            });
+        }
+
+        var btn = ParseMouseButton(button);
+        try { GetOrCreateInput().SendMouseClick(x, y, btn, doubleClick); }
+        catch (Exception ex)
+        { return ErrorResult("InjectionFailed", $"ghost click failed: {ex.Message}"); }
+        return SuccessResult(new
+        {
+            success = true,
+            action = "click",
+            x,
+            y,
+            button = btn.ToString(),
+            doubleClick,
+            desktop = GetBackendDesktopName(),
+        });
+    }
+
+    private async Task<CallToolResult> ExecuteGhostTypeAsync(
+        string text, CancellationToken ct)
+    {
+        if (await RequireActiveSessionAsync(ct).ConfigureAwait(false) is { } inactive)
+            return inactive;
+
+        if (await TrySendSurfaceInputAsync("ghost_surface_type", new Dictionary<string, object?>
+        {
+            ["text"] = text
+        }, ct).ConfigureAwait(false))
+        {
+            return SuccessResult(new
+            {
+                success = true,
+                action = "type",
+                chars = text.Length,
+                backend = "dwmWindowSurface"
+            });
+        }
+
+        try { GetOrCreateInput().SendText(text); }
+        catch (Exception ex)
+        { return ErrorResult("InjectionFailed", $"ghost type failed: {ex.Message}"); }
+        return SuccessResult(new
+        {
+            success = true,
+            action = "type",
+            chars = text.Length,
+            desktop = GetBackendDesktopName(),
+        });
+    }
+
+    private async Task<CallToolResult> ExecuteGhostWindowsAsync(CancellationToken ct)
+    {
+        if (await RequireActiveSessionAsync(ct).ConfigureAwait(false) is { } inactive)
+            return inactive;
+
+        var surfaceStatus = await TryGetSurfaceStatusAsync(ct).ConfigureAwait(false);
+        if (surfaceStatus != null && surfaceStatus.Count > 0)
+        {
+            return SuccessResult(new
+            {
+                success = true,
+                action = "windows",
+                backend = "dwmWindowSurface",
+                count = surfaceStatus.Count,
+                windows = surfaceStatus.Windows,
+                activeHwnd = surfaceStatus.ActiveHwnd
+            });
+        }
+
+        var desktop = GetOrCreateDesktop();
+        List<IntPtr> handles;
+        try { handles = GhostDesktopNative.EnumerateWindows(desktop.DesktopHandle); }
+        catch (Exception ex)
+        { return ErrorResult("EnumerationFailed", $"ghost desktop window enumeration failed: {ex.Message}"); }
+
+        var windows = new List<object>(handles.Count);
+        foreach (var h in handles)
+        {
+            try
+            {
+                var (title, className, visible) = GhostDesktopNative.GetWindowDetails(h);
+                GetWindowThreadProcessId(h, out var pid);
+                GetWindowRect(h, out var r);
+                windows.Add(new
+                {
+                    hwnd = $"0x{h.ToInt64():X}",
+                    title,
+                    className,
+                    visible,
+                    pid,
+                    rect = new
+                    {
+                        left = r.Left,
+                        top = r.Top,
+                        width = r.Right - r.Left,
+                        height = r.Bottom - r.Top,
+                    },
+                });
+            }
+            catch { /* one unreadable window never fails the listing */ }
+        }
+
+        return SuccessResult(new
+        {
+            success = true,
+            action = "windows",
+            desktop = GetBackendDesktopName(),
+            count = windows.Count,
+            windows,
+        });
+    }
+
+    private async Task<CallToolResult> ExecuteGhostLaunchAsync(
+        string program, string? args, string? workingDir, CancellationToken ct)
+    {
+        if (await RequireActiveSessionAsync(ct).ConfigureAwait(false) is { } inactive)
+            return inactive;
+
+        var surfaceLaunch = await TryLaunchDwmSurfaceAsync(program, args, workingDir, ct).ConfigureAwait(false);
+        if (surfaceLaunch != null)
+        {
+            return surfaceLaunch;
+        }
+
+        var desktop = GetOrCreateDesktop();
+        try
+        {
+            var proc = GhostDesktopNative.CreateProcessWithDesktop(
+                desktop.DesktopName, program,
+                string.IsNullOrWhiteSpace(args) ? null : args,
+                string.IsNullOrWhiteSpace(workingDir) ? null : workingDir);
+            return SuccessResult(new
+            {
+                success = true,
+                action = "launch",
+                program,
+                pid = proc.Id,
+                desktop = desktop.DesktopName,
+            });
+        }
+        catch (Exception ex)
+        {
+            return ErrorResult("LaunchFailed",
+                $"launching '{program}' on the ghost desktop failed: {ex.Message}");
+        }
+    }
+
+    private sealed record SurfaceStatusSnapshot(string? ActiveHwnd, int Count, List<object> Windows);
+
+    private static string? SurfaceRequestToken() => TryReadGhostControlDaemonInfo()?.Token;
+
+    private static async Task<string?> SendSurfaceRequestAsync(
+        string action,
+        IReadOnlyDictionary<string, object?> payload,
+        CancellationToken ct)
+    {
+        var daemon = TryReadGhostControlDaemonInfo();
+        if (daemon == null || !IsGhostControlDaemonAlive(daemon) || string.IsNullOrWhiteSpace(daemon.Token))
+            return null;
+
+        var client = await ConnectGhostControlAsync(daemon.PipeName, TimeSpan.FromMilliseconds(700), ct).ConfigureAwait(false);
+        if (client == null) return null;
+
+        await using (client)
+        {
+            var body = new Dictionary<string, object?>(payload) { ["token"] = daemon.Token };
+            return await client.SendRequestAsync(action, JsonSerializer.Serialize(body, SerializerOptions), TimeSpan.FromSeconds(25), ct).ConfigureAwait(false);
+        }
+    }
+
+    private static async Task<SurfaceStatusSnapshot?> TryGetSurfaceStatusAsync(CancellationToken ct)
+    {
+        var raw = await SendSurfaceRequestAsync("ghost_surface_status", new Dictionary<string, object?>(), ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("ok", out var ok) || !ok.GetBoolean()) return null;
+
+            var windows = new List<object>();
+            if (root.TryGetProperty("windows", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in arr.EnumerateArray())
+                {
+                    windows.Add(item.Clone());
+                }
+            }
+
+            string? active = root.TryGetProperty("activeHwnd", out var a) ? a.GetString() : null;
+            int count = root.TryGetProperty("count", out var c) && c.TryGetInt32(out var parsed)
+                ? parsed
+                : windows.Count;
+            return new SurfaceStatusSnapshot(active, count, windows);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static async Task<CallToolResult?> TryLaunchDwmSurfaceAsync(
+        string program,
+        string? args,
+        string? workingDir,
+        CancellationToken ct)
+    {
+        var raw = await SendSurfaceRequestAsync("ghost_surface_launch", new Dictionary<string, object?>
+        {
+            ["program"] = program,
+            ["args"] = args,
+            ["workingDir"] = workingDir
+        }, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+            if (!root.TryGetProperty("ok", out var ok) || !ok.GetBoolean())
+                return null;
+
+            return SuccessResult(new
+            {
+                success = true,
+                action = "launch",
+                program,
+                pid = root.TryGetProperty("pid", out var pid) ? pid.GetInt32() : (int?)null,
+                hwnd = root.TryGetProperty("hwnd", out var h) ? h.GetString() : null,
+                title = root.TryGetProperty("title", out var t) ? t.GetString() : null,
+                backend = "dwmWindowSurface"
+            });
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static async Task<bool> TrySendSurfaceInputAsync(
+        string action,
+        IReadOnlyDictionary<string, object?> payload,
+        CancellationToken ct)
+    {
+        var status = await TryGetSurfaceStatusAsync(ct).ConfigureAwait(false);
+        if (status == null || string.IsNullOrWhiteSpace(status.ActiveHwnd))
+            return false;
+
+        var raw = await SendSurfaceRequestAsync(action, payload, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            return doc.RootElement.TryGetProperty("ok", out var ok) && ok.GetBoolean();
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -322,10 +727,12 @@ public sealed class GhostMcpBridge : IDisposable
         GhostPipManager? pipManager = null,
         GhostIpcServer? ipcServer = null,
         McpSession? session = null,
-        InbriskTools? inbriskTools = null)
+        InbriskTools? inbriskTools = null,
+        Func<GhostSessionStatus?>? localBackendStatusProvider = null)
     {
         _session = session;
         _inbriskTools = inbriskTools;
+        _localBackendStatusProvider = localBackendStatusProvider;
         _sessionManager = sessionManager ?? new GhostSessionManager();
         _pipManager = pipManager ?? new GhostPipManager();
         _ipcServer = ipcServer ?? new GhostIpcServer(GhostIpcDefaults.PipeName);
@@ -507,7 +914,7 @@ public sealed class GhostMcpBridge : IDisposable
         bool localDeskCleaned = false;
         try
         {
-            var hDesktop = GhostDesktopNative.OpenDesktop(GhostDesktopNative.DefaultGhostDesktopName, GhostDesktopNative.DESKTOP_ALL_ACCESS, false);
+            var hDesktop = GhostDesktopNative.OpenDesktop(GetBackendDesktopName(), GhostDesktopNative.DESKTOP_ALL_ACCESS, false);
             if (hDesktop != IntPtr.Zero)
             {
                 var windows = GhostDesktopNative.EnumerateWindows(hDesktop);
@@ -574,21 +981,183 @@ public sealed class GhostMcpBridge : IDisposable
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostBatch");
-        return await GetTools().Batch(
-            steps: steps,
-            set: set,
-            until: until,
-            read: read,
-            detail: detail,
-            failFast: failFast ?? fail_fast,
-            saveAsRecipe: null,
-            save_as_recipe: null,
-            enableReflex: null,
-            enable_reflex: null,
-            autoDismissModals: autoDismissModals ?? auto_dismiss_modals,
-            operationId: operationId ?? operation_id,
-            ghost: true,
-            ct: ct).ConfigureAwait(false);
+
+        // Schema validation first: an empty or ambiguous request must be
+        // rejected before any session or desktop work happens.
+        if (steps is { Length: > 0 } && set is { Length: > 0 })
+        {
+            return ErrorResult("Malformed",
+                "'steps' and 'set' are mutually exclusive — specify either an " +
+                "ordered step list or a compact form list, not both");
+        }
+        if (steps is null or { Length: 0 } && set is null or { Length: 0 })
+        {
+            return ErrorResult("Malformed",
+                "'steps' or 'set' is required — nothing to execute");
+        }
+
+        if (await RequireActiveSessionAsync(ct).ConfigureAwait(false) is { } inactive)
+            return inactive;
+
+        // Steps run against the isolated desktop primitives. Semantic
+        // targets (uia_*/elementId) need a ghost-desktop UIA pass that is
+        // not wired yet, so those are refused explicitly instead of
+        // silently landing on the user's focused window.
+        var failFastOn = failFast ?? true;
+        var results = new List<object>();
+        var completed = 0;
+        string? failure = null;
+
+        if (set is { Length: > 0 })
+        {
+            failure = "compact form 'set' on the isolated desktop is not wired yet — " +
+                "use explicit 'steps' (type/click/key/wait) against the ghost desktop";
+        }
+        else
+        {
+            var desktopName = GetOrCreateDesktop().DesktopName;
+            foreach (var step in steps!)
+            {
+                var doWhat = (step.Do ?? step.Action ?? "").Trim().ToLowerInvariant();
+                var watch = System.Diagnostics.Stopwatch.StartNew();
+                string? stepError = null;
+                // BatchStep carries x/y inside its Target object, not as
+                // first-class fields — unwrap it once per step.
+                var target = step.Target is { } tEl ? tEl : default(JsonElement?);
+                try
+                {
+                    switch (doWhat)
+                    {
+                        case "wait":
+                            await Task.Delay(
+                                Math.Clamp(step.Ms ?? 100, 0, 60_000), ct).ConfigureAwait(false);
+                            break;
+                        case "type":
+                            {
+                                var text = step.V
+                                    ?? (step.Text is { ValueKind: JsonValueKind.String } te
+                                        ? te.GetString() : null);
+                                if (string.IsNullOrEmpty(text))
+                                    stepError = "type step needs text ('v')";
+                                else
+                                    GetOrCreateInput().SendText(text);
+                                break;
+                            }
+                        case "click":
+                            {
+                                if (step.T is { } named && !string.IsNullOrWhiteSpace(named))
+                                    stepError = "targeted click is not supported on the " +
+                                        "isolated desktop — pass target:{x,y} coordinates";
+                                else if (target is { ValueKind: JsonValueKind.Object } tj
+                                    && tj.TryGetProperty("x", out var xe)
+                                    && tj.TryGetProperty("y", out var ye)
+                                    && xe.TryGetInt32(out var gx)
+                                    && ye.TryGetInt32(out var gy))
+                                {
+                                    var btnName = tj.TryGetProperty("button", out var be)
+                                        && be.ValueKind == JsonValueKind.String ? be.GetString() : null;
+                                    var dbl = tj.TryGetProperty("doubleClick", out var de)
+                                        && de.ValueKind == JsonValueKind.True;
+                                    GetOrCreateInput().SendMouseClick(gx, gy, ParseMouseButton(btnName), dbl);
+                                }
+                                else
+                                {
+                                    stepError = "click step needs coordinates " +
+                                        "(target:{x,y}) on the isolated desktop";
+                                }
+                                break;
+                            }
+                        case "scroll":
+                            {
+                                static int Coord(JsonElement? el, string name) =>
+                                    el is { ValueKind: JsonValueKind.Object } o
+                                    && o.TryGetProperty(name, out var v)
+                                    && v.TryGetInt32(out var i) ? i : 0;
+                                GetOrCreateInput().SendMouseScroll(
+                                    Coord(target, "x"), Coord(target, "y"), step.Ms ?? 0);
+                                break;
+                            }
+                        case "key":
+                        case "press_key":
+                            {
+                                var key = GhostKeyMap.Parse(step.V ?? step.T ?? "");
+                                if (key is null) stepError = $"unknown key '{step.V ?? step.T}'";
+                                else GetOrCreateInput().SendKeyPress(key.Value);
+                                break;
+                            }
+                        default:
+                            stepError = $"'{doWhat}' is not executable on the isolated desktop " +
+                                "(supported: wait, type, click, scroll, key)";
+                            break;
+                    }
+                }
+                catch (Exception ex) { stepError = ex.Message; }
+                watch.Stop();
+
+                results.Add(new
+                {
+                    index = completed,
+                    action = doWhat,
+                    ok = stepError is null,
+                    error = stepError,
+                    ms = (int)watch.ElapsedMilliseconds,
+                });
+                if (stepError is not null)
+                {
+                    failure = $"step {completed} ({doWhat}) failed: {stepError}";
+                    if (failFastOn) break;
+                }
+                else completed++;
+            }
+
+            if (failure is null)
+            {
+                return SuccessResult(new
+                {
+                    success = true,
+                    action = "batch",
+                    desktop = desktopName,
+                    stepsCompleted = completed,
+                    totalSteps = results.Count,
+                    results,
+                });
+            }
+        }
+
+        return ErrorResult("BatchFailed", failure);
+    }
+
+    /// <summary>Minimal key-name → <see cref="KeyCode"/> mapping for ghost
+    /// batch steps. Anything the enum already names ("A".."Z", "F1".."F12",
+    /// digits, "Left", "Enter"…) resolves through Enum parsing; the short
+    /// aliases below cover the spellings models actually emit.</summary>
+    private static class GhostKeyMap
+    {
+        private static readonly Dictionary<string, KeyCode> Aliases =
+            new(StringComparer.OrdinalIgnoreCase)
+            {
+                ["esc"] = KeyCode.Escape,
+                ["return"] = KeyCode.Enter,
+                ["del"] = KeyCode.Delete,
+                ["pgup"] = KeyCode.PageUp,
+                ["pgdn"] = KeyCode.PageDown,
+                ["page_up"] = KeyCode.PageUp,
+                ["page_down"] = KeyCode.PageDown,
+                ["spacebar"] = KeyCode.Space,
+                ["arrowup"] = KeyCode.Up,
+                ["arrowdown"] = KeyCode.Down,
+                ["arrowleft"] = KeyCode.Left,
+                ["arrowright"] = KeyCode.Right,
+            };
+
+        public static KeyCode? Parse(string? name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return null;
+            var key = name.Trim().Replace(" ", string.Empty).Replace("-", string.Empty);
+            if (Aliases.TryGetValue(key, out var mapped)) return mapped;
+            // "Up"/"Down"/"PageUp" enum spellings with no separators
+            return Enum.TryParse<KeyCode>(key, ignoreCase: true, out var parsed) ? parsed : null;
+        }
     }
 
     /// <summary>
@@ -600,7 +1169,7 @@ public sealed class GhostMcpBridge : IDisposable
     public async Task<CallToolResult> GetGhostStatus(CancellationToken ct = default)
     {
         PerfTrace.Count("ghostStatus");
-        var sessionStatus = await _sessionManager.GetStatusAsync(ct).ConfigureAwait(false);
+        var sessionStatus = await GetEffectiveSessionStatusAsync(ct).ConfigureAwait(false);
 
         int width = 1920;
         int height = 1080;
@@ -650,24 +1219,27 @@ public sealed class GhostMcpBridge : IDisposable
     }
 
     /// <summary>
-    /// Legacy shim forwarding ghost desktop status query to the unified computer_windows tool with ghost: true.
+    /// Window listing for the isolated Ghost Desktop — enumerates the
+    /// ghost desktop directly. Forwarding to computer_windows(ghost:true)
+    /// would route right back here through the coordinator.
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_status"), Description(
-        "Legacy shim forwarding to unified computer_windows with ghost: true. Returns the operational status and active windows of the isolated Ghost Desktop.")]
-    public async Task<CallToolResult> GhostDesktopStatus(CancellationToken ct = default)
+        "Returns the operational status and active windows of the isolated Ghost Desktop.")]
+    public Task<CallToolResult> GhostDesktopStatus(CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopStatus");
-        await Task.CompletedTask;
-        return GetTools().Windows(ghost: true, ct: ct);
+        return ExecuteGhostWindowsAsync(ct);
     }
 
     /// <summary>
-    /// Legacy shim forwarding process launch to the unified computer_launch tool with ghost: true.
+    /// Process launch on the isolated Ghost Desktop — the process is
+    /// created with the ghost desktop as its startup desktop. Forwarding
+    /// to computer_launch(ghost:true) would route back here.
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_launch"), Description(
-        "Legacy shim forwarding to unified computer_launch with ghost: true. Launches an application or command-line process directly on the isolated Ghost Desktop without interfering with the user's desktop.")]
-    public async Task<CallToolResult> GhostDesktopLaunch(
-        [Description("Executable path or command name to run (e.g. 'cmd.exe', 'powershell.exe', 'notepad.exe', 'chrome.exe')")] string program,
+        "Launches an application or command-line process directly on the isolated Ghost Desktop without interfering with the user's desktop.")]
+    public Task<CallToolResult> GhostDesktopLaunch(
+        [Description("Executable path or command name to run (e.g. 'cmd.exe', 'notepad.exe', 'chrome.exe')")] string program,
         [Description("Optional command-line arguments")] string? args = null,
         [Description("Optional working directory")] string? workingDir = null,
         CancellationToken ct = default)
@@ -675,29 +1247,21 @@ public sealed class GhostMcpBridge : IDisposable
         PerfTrace.Count("ghostDesktopLaunch");
         if (string.IsNullOrWhiteSpace(program))
         {
-            return ErrorResult("Malformed", "'program' must not be null or empty.");
+            return Task.FromResult(ErrorResult("Malformed",
+                "'program' must not be null or empty."));
         }
-
-        string[]? argArray = string.IsNullOrWhiteSpace(args)
-            ? null
-            : args.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-
-        bool isPath = program.Contains(Path.DirectorySeparatorChar) || program.Contains(Path.AltDirectorySeparatorChar);
-
-        return await GetTools().Launch(
-            executable: isPath ? null : program,
-            path: isPath ? program : null,
-            arguments: argArray,
-            ghost: true,
-            ct: ct).ConfigureAwait(false);
+        return ExecuteGhostLaunchAsync(program, args, workingDir, ct);
     }
 
     /// <summary>
-    /// Legacy shim forwarding mouse click to the unified computer_click tool with ghost: true.
+    /// Legacy shim for mouse clicks on the isolated Ghost Desktop.
+    /// Executes directly through the ghost-desktop input primitives — it
+    /// must never forward back into computer_click(ghost:true), whose
+    /// ghost path routes right back here.
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_click"), Description(
-        "Legacy shim forwarding to unified computer_click with ghost: true. Performs a mouse click at the specified coordinates on the isolated Ghost Desktop.")]
-    public async Task<CallToolResult> GhostDesktopClick(
+        "Performs a mouse click at the specified coordinates on the isolated Ghost Desktop without interfering with the user's desktop.")]
+    public Task<CallToolResult> GhostDesktopClick(
         [Description("Physical X coordinate on the ghost desktop (0 to 1919)")] int x,
         [Description("Physical Y coordinate on the ghost desktop (0 to 1079)")] int y,
         [Description("Mouse button: left|right|middle (default: left)")] string? button = "left",
@@ -705,41 +1269,66 @@ public sealed class GhostMcpBridge : IDisposable
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopClick");
-        string btn = (doubleClick == true) ? "double" : (button ?? "left");
-        return await GetTools().Click(
-            x: x,
-            y: y,
-            button: btn,
-            ghost: true,
-            ct: ct).ConfigureAwait(false);
+        return ExecuteGhostClickAsync(x, y, button, doubleClick == true, ct);
     }
 
     /// <summary>
-    /// Legacy shim forwarding keyboard typing to the unified computer_type tool with ghost: true.
+    /// Types text into the focused window on the isolated Ghost Desktop —
+    /// executed through the ghost input primitives, never via
+    /// computer_type(ghost:true) (same cycle as ghost_desktop_click).
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_type"), Description(
-        "Legacy shim forwarding to unified computer_type with ghost: true. Types text into the active/focused window on the isolated Ghost Desktop.")]
-    public async Task<CallToolResult> GhostDesktopType(
+        "Types text into the active/focused window on the isolated Ghost Desktop.")]
+    public Task<CallToolResult> GhostDesktopType(
         [Description("Text string to type into the ghost desktop")] string text,
         CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopType");
-        return await GetTools().Type(
-            text: text,
-            ghost: true,
-            ct: ct).ConfigureAwait(false);
+        return ExecuteGhostTypeAsync(text ?? "", ct);
     }
 
     /// <summary>
-    /// Legacy shim forwarding screenshot capture to the unified computer_screenshot tool with ghost: true.
+    /// Screenshot of the isolated Ghost Desktop. Reads the latest frame written
+    /// by the Ghost Control daemon's desktop capture pipeline instead of routing
+    /// back through computer_screenshot(ghost:true).
     /// </summary>
     [McpServerTool(Name = "ghost_desktop_screenshot"), Description(
-        "Legacy shim forwarding to unified computer_screenshot with ghost: true. Captures a screenshot from the isolated Ghost Desktop frame buffer.")]
+        "Captures a screenshot from the isolated Ghost Desktop frame buffer.")]
     public async Task<CallToolResult> GhostDesktopScreenshot(CancellationToken ct = default)
     {
         PerfTrace.Count("ghostDesktopScreenshot");
-        await Task.CompletedTask;
-        return GetTools().Screenshot(target: "desktop", ghost: true, ct: ct);
+        if (await RequireActiveSessionAsync(ct).ConfigureAwait(false) is { } inactive)
+            return inactive;
+
+        var png = TryReadSharedFrameToPng(out var width, out var height, out var frameIndex);
+        if (png == null)
+        {
+            return ErrorResult("CaptureUnavailable",
+                "no ghost desktop frame is available yet — ensure the Ghost Control daemon " +
+                "is running with desktop capture enabled");
+        }
+
+        return new CallToolResult
+        {
+            IsError = false,
+            Content =
+            [
+                new TextContentBlock
+                {
+                    Text = JsonSerializer.Serialize(new
+                    {
+                        success = true,
+                        action = "screenshot",
+                        desktop = GetBackendDesktopName(),
+                        width,
+                        height,
+                        frameIndex,
+                        bytes = png.Length,
+                    }, SerializerOptions)
+                },
+                ImageContentBlock.FromBytes(png, "image/png"),
+            ]
+        };
     }
 
     /// <summary>
@@ -803,17 +1392,24 @@ public sealed class GhostMcpBridge : IDisposable
             return ErrorResult("Malformed", $"Unknown PiP position preset: '{position}'.");
         }
 
+        var controlDaemon = TryReadGhostControlDaemonInfo();
+        string controlPipeName = controlDaemon?.PipeName ?? "inbrisk_ghost_control";
         string? controlToken = GhostControlToken();
 
-        // 1. Check if the daemon is already running via the named pipe "inbrisk_ghost_control"
+        // 1. Check if the daemon is already running via its control pipe. If the
+        // state file proves a live daemon but IPC is still warming up, wait a bit
+        // longer rather than launching a duplicate tray process.
         bool isDaemonRunning = false;
         GhostIpcClient? testClient = null;
         try
         {
-            testClient = new GhostIpcClient("inbrisk_ghost_control");
-            await testClient.ConnectAsync(TimeSpan.FromMilliseconds(400), ct).ConfigureAwait(false);
-            isDaemonRunning = testClient.IsConnected;
-            if (isDaemonRunning)
+            testClient = await ConnectGhostControlAsync(controlPipeName, TimeSpan.FromMilliseconds(500), ct).ConfigureAwait(false);
+            if (testClient == null && IsGhostControlDaemonAlive(controlDaemon))
+            {
+                testClient = await ConnectGhostControlAsync(controlPipeName, TimeSpan.FromSeconds(3), ct).ConfigureAwait(false);
+            }
+            isDaemonRunning = testClient?.IsConnected == true;
+            if (testClient?.IsConnected == true)
             {
                 using (testClient)
                 {
@@ -934,6 +1530,47 @@ public sealed class GhostMcpBridge : IDisposable
             try { testClient?.Dispose(); } catch { }
         }
 
+        if (!isDaemonRunning && IsGhostControlDaemonAlive(controlDaemon))
+        {
+            if (act == "stop")
+            {
+                try
+                {
+                    using var daemonProc = Process.GetProcessById(controlDaemon!.Pid);
+                    daemonProc.Kill(entireProcessTree: true);
+                    daemonProc.WaitForExit(3000);
+                }
+                catch { }
+
+                return SuccessResult(new
+                {
+                    success = true,
+                    action = "stop",
+                    daemonRunning = false,
+                    sessionId = (int?)null,
+                    pipActive = false,
+                    windowHandle = (string?)null,
+                    state = "stopped",
+                    pipeConnected = false,
+                    message = "Ghost Control daemon process stopped (control pipe was not reachable)."
+                });
+            }
+
+            var startingStatus = await GetEffectiveSessionStatusAsync(ct).ConfigureAwait(false);
+            return SuccessResult(new
+            {
+                success = true,
+                daemonRunning = true,
+                sessionId = startingStatus.SessionId,
+                pipActive = _pipManager.IsRunning,
+                windowHandle = _pipManager.WindowHandle != IntPtr.Zero ? $"0x{_pipManager.WindowHandle:X}" : null,
+                state = startingStatus.IsActive ? startingStatus.State : "starting",
+                pipeName = controlPipeName,
+                pipeConnected = false,
+                message = "Ghost Control daemon process is already running; control IPC is still initializing."
+            });
+        }
+
         if (act == "stop")
         {
             return SuccessResult(new
@@ -950,7 +1587,7 @@ public sealed class GhostMcpBridge : IDisposable
 
         if (act == "status")
         {
-            var localStatus = await _sessionManager.GetStatusAsync(ct).ConfigureAwait(false);
+            var localStatus = await GetEffectiveSessionStatusAsync(ct).ConfigureAwait(false);
             return SuccessResult(new
             {
                 success = true,
@@ -974,7 +1611,7 @@ public sealed class GhostMcpBridge : IDisposable
                 exe = Environment.ProcessPath ?? Process.GetCurrentProcess().MainModule?.FileName ?? "inbrisk.exe";
             }
 
-            var argsList = new List<string> { "ghost", "tray" };
+            var argsList = new List<string> { "ghost", "tray", "--no-session" };
             if (interactive == true) argsList.Add("--interactive on");
             else if (interactive == false) argsList.Add("--no-interactive");
 
@@ -1010,7 +1647,7 @@ public sealed class GhostMcpBridge : IDisposable
                 GhostIpcClient? check = null;
                 try
                 {
-                    check = new GhostIpcClient("inbrisk_ghost_control");
+                    check = new GhostIpcClient(controlPipeName);
                     await check.ConnectAsync(TimeSpan.FromMilliseconds(200), ct).ConfigureAwait(false);
                     if (check.IsConnected)
                     {
@@ -1080,6 +1717,126 @@ public sealed class GhostMcpBridge : IDisposable
 
     #region Helper Methods
 
+    private sealed record GhostControlDaemonInfo(
+        int Pid,
+        DateTime? StartTimeUtc,
+        string? Token,
+        string PipeName,
+        string DesktopName,
+        string? InstanceId,
+        string? Status,
+        string? Backend,
+        DateTime? LastHeartbeatUtc);
+
+    private static GhostControlDaemonInfo? TryReadGhostControlDaemonInfo()
+    {
+        try
+        {
+            var path = Path.Combine(UserSettings.DataDir, "ghost-control.json");
+            if (!File.Exists(path)) return null;
+
+            JsonDocument doc;
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
+                       FileShare.ReadWrite | FileShare.Delete))
+            using (var reader = new StreamReader(stream))
+            {
+                doc = JsonDocument.Parse(reader.ReadToEnd());
+            }
+            using (doc)
+            {
+                var root = doc.RootElement;
+                if (!root.TryGetProperty("pid", out var pidProp) || pidProp.ValueKind != JsonValueKind.Number)
+                {
+                    return null;
+                }
+
+                DateTime? startedAt = null;
+                if (root.TryGetProperty("startTimeUtc", out var startProp) &&
+                    DateTime.TryParse(startProp.GetString(), null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsedStart))
+                {
+                    startedAt = parsedStart;
+                }
+
+                var token = root.TryGetProperty("token", out var tokenProp) &&
+                    tokenProp.ValueKind == JsonValueKind.String
+                    ? tokenProp.GetString()
+                    : null;
+                var pipeName = root.TryGetProperty("pipeName", out var pipeProp) &&
+                    pipeProp.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(pipeProp.GetString())
+                    ? pipeProp.GetString()!
+                    : "inbrisk_ghost_control";
+                var desktopName = root.TryGetProperty("desktopName", out var desktopProp) &&
+                    desktopProp.ValueKind == JsonValueKind.String &&
+                    !string.IsNullOrWhiteSpace(desktopProp.GetString())
+                    ? desktopProp.GetString()!
+                    : GhostDesktopNative.DefaultGhostDesktopName;
+                var instanceId = root.TryGetProperty("instanceId", out var instanceProp) &&
+                    instanceProp.ValueKind == JsonValueKind.String
+                    ? instanceProp.GetString()
+                    : null;
+                var status = root.TryGetProperty("status", out var statusProp) &&
+                    statusProp.ValueKind == JsonValueKind.String
+                    ? statusProp.GetString()
+                    : null;
+                var backend = root.TryGetProperty("backend", out var backendProp) &&
+                    backendProp.ValueKind == JsonValueKind.String
+                    ? backendProp.GetString()
+                    : null;
+                DateTime? heartbeat = root.TryGetProperty("lastHeartbeatUtc", out var heartbeatProp) &&
+                    DateTime.TryParse(heartbeatProp.GetString(), null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsedHeartbeat)
+                    ? parsedHeartbeat
+                    : null;
+
+                return new GhostControlDaemonInfo(pidProp.GetInt32(), startedAt, token, pipeName,
+                    desktopName, instanceId, status, backend, heartbeat);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static bool IsGhostControlDaemonAlive(GhostControlDaemonInfo? daemon)
+    {
+        if (daemon == null || daemon.Pid <= 0) return false;
+
+        try
+        {
+            using var process = Process.GetProcessById(daemon.Pid);
+            if (process.HasExited)
+            {
+                return false;
+            }
+
+            return !daemon.StartTimeUtc.HasValue ||
+                Math.Abs((process.StartTime.ToUniversalTime() - daemon.StartTimeUtc.Value).TotalSeconds) <= 2;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static async Task<GhostIpcClient?> ConnectGhostControlAsync(
+        string pipeName,
+        TimeSpan timeout,
+        CancellationToken ct)
+    {
+        var client = new GhostIpcClient(pipeName);
+        try
+        {
+            await client.ConnectAsync(timeout, ct).ConfigureAwait(false);
+            return client.IsConnected ? client : null;
+        }
+        catch
+        {
+            try { client.Dispose(); } catch { }
+            return null;
+        }
+    }
+
     private static byte[]? TryReadSharedFrameToPng(out int width, out int height, out long frameIndex)
     {
         width = 1920;
@@ -1136,19 +1893,7 @@ public sealed class GhostMcpBridge : IDisposable
 
     private static string? GhostControlToken()
     {
-        try
-        {
-            var path = Path.Combine(UserSettings.DataDir, "ghost-control.json");
-            if (!File.Exists(path))
-            {
-                return null;
-            }
-            using var doc = JsonDocument.Parse(File.ReadAllText(path));
-            return doc.RootElement.TryGetProperty("token", out var t) && t.ValueKind == JsonValueKind.String
-                ? t.GetString()
-                : null;
-        }
-        catch { return null; }
+        return TryReadGhostControlDaemonInfo()?.Token;
     }
 
     private static CallToolResult SuccessResult(object data) => new()
@@ -1156,6 +1901,18 @@ public sealed class GhostMcpBridge : IDisposable
         IsError = false,
         Content = [new TextContentBlock { Text = JsonSerializer.Serialize(data, SerializerOptions) }]
     };
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GhostRect
+    {
+        public int Left, Top, Right, Bottom;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out int lpdwProcessId);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out GhostRect lpRect);
 
     private static CallToolResult ErrorResult(string kind, string message) => new()
     {

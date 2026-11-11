@@ -59,10 +59,9 @@ public static class GhostIpcDefaults
 
     /// <summary>
     /// Creates a hardened PipeSecurity instance granting FullControl only to Administrators and
-    /// SYSTEM, plus ReadWrite to the dedicated ghost worker account (when resolvable).
-    /// No World, Authenticated Users, or ambient current-user access: arbitrary same-user
-    /// processes cannot attach to or drive the ghost session. Unresolvable accounts are
-    /// simply omitted, which fails closed (connection denied) rather than opening access.
+    /// SYSTEM, plus ReadWrite to the daemon owner and the dedicated ghost worker account
+    /// (when resolvable). No World or Authenticated Users access. Unresolvable worker
+    /// accounts are simply omitted, which fails closed rather than opening access.
     /// </summary>
     [SupportedOSPlatform("windows")]
     public static PipeSecurity CreateCrossSessionPipeSecurity(string? clientAccount = DefaultClientAccountName)
@@ -80,6 +79,17 @@ public static class GhostIpcDefaults
             new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
             PipeAccessRights.FullControl,
             AccessControlType.Allow));
+
+        // The daemon owner needs local CLI/MCP control access even when the
+        // optional cross-session worker account is unavailable or custom.
+        var ownerSid = WindowsIdentity.GetCurrent().User;
+        if (ownerSid != null)
+        {
+            ps.AddAccessRule(new PipeAccessRule(
+                ownerSid,
+                PipeAccessRights.ReadWrite,
+                AccessControlType.Allow));
+        }
 
         // Dedicated ghost worker account (e.g. InbriskAgent running in Session 2)
         var clientSid = ResolveAccountSid(clientAccount);
@@ -723,6 +733,13 @@ public sealed class GhostIpcServer : IGhostIpcBus
             });
 
             if (privileged) return true;
+
+            // The daemon's owning interactive user is a legitimate controller:
+            // custom/dev pipes otherwise only accept the worker account and make
+            // `ghost status/stop` look disconnected even while the server is healthy.
+            using var ownerIdentity = WindowsIdentity.GetCurrent();
+            var ownerSid = ownerIdentity.User;
+            if (ownerSid != null && clientSid != null && clientSid.Equals(ownerSid)) return true;
 
             var allowedSid = GhostIpcDefaults.ResolveAccountSid(_clientAccount);
             return allowedSid != null && clientSid != null && clientSid.Equals(allowedSid);
