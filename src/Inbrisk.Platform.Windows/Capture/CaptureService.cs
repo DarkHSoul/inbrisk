@@ -8,7 +8,7 @@ namespace Inbrisk.Platform.Windows.Capture;
 ///   window/monitor/region → WGC when supported (falls back to GDI),
 ///   multi-monitor full desktop → GDI (WGC is per-item).
 /// </summary>
-public sealed class CaptureService : ICaptureService
+public sealed class CaptureService : ICaptureService, IWindowContentCapture
 {
     /// <summary>Why the last session creation fell back from WGC (null = WGC used or never tried).</summary>
     public static string? LastWgcFallbackReason => WgcSession.LastInitError;
@@ -31,6 +31,12 @@ public sealed class CaptureService : ICaptureService
         _gdi.CaptureWindow(hwnd, maxImageWidth);
 
     public RawFrame CaptureRaw(RectPx region) => _gdi.CaptureRaw(region);
+
+    /// <summary>Window-content capture (occlusion-safe PrintWindow path) —
+    /// used by window-scoped OCR/observation so a covered window's own
+    /// pixels are read instead of the occluder's.</summary>
+    public RawFrame CaptureWindowContent(long hwnd) =>
+        _gdi.CaptureWindowContent(hwnd);
 
     /// <summary>Background first-touch of capture plumbing: GDI+ init plus the
     /// WGC capability probe (warms the WinRT/D3D activation path without

@@ -257,6 +257,9 @@ internal static class NativeMethods
     [DllImport("gdi32.dll")] internal static extern bool DeleteDC(IntPtr hdc);
     [DllImport("user32.dll")] internal static extern IntPtr GetDC(IntPtr hWnd);
     [DllImport("user32.dll")] internal static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
+    // ---- window-content capture (occlusion-safe) ----
+    public const uint PW_RENDERFULLCONTENT = 0x00000002;
+    [DllImport("user32.dll")] internal static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
     [DllImport("user32.dll", SetLastError = true)]
     internal static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst,
         ref POINT pptDst, ref SIZE psize, IntPtr hdcSrc, ref POINT pptSrc,

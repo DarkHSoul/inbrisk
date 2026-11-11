@@ -26,4 +26,30 @@ public static class CoordinateMapper
         var y = (int)Math.Round((dy - virtualDesktop.Y) * 65535.0 / (virtualDesktop.Height - 1));
         return (Math.Clamp(x, 0, 65535), Math.Clamp(y, 0, 65535));
     }
+
+    /// <summary>
+    /// Whether a desktop-space point lies inside the virtual desktop bounds.
+    /// Callers must check this BEFORE injecting a click — an out-of-bounds
+    /// point silently clamps to a screen edge and steals focus/clicks a
+    /// random window.
+    /// </summary>
+    public static bool IsOnVirtualDesktop(int dx, int dy, RectPx virtualDesktop)
+        => virtualDesktop.Contains(dx, dy);
+
+    /// <summary>
+    /// Like <see cref="DesktopToSendInputAbsolute"/> but rejects points
+    /// outside the virtual desktop instead of clamping them onto the
+    /// desktop edge.
+    /// </summary>
+    public static bool TryDesktopToSendInputAbsolute(int dx, int dy,
+        RectPx virtualDesktop, out (int X, int Y) normalized)
+    {
+        if (!IsOnVirtualDesktop(dx, dy, virtualDesktop))
+        {
+            normalized = (0, 0);
+            return false;
+        }
+        normalized = DesktopToSendInputAbsolute(dx, dy, virtualDesktop);
+        return true;
+    }
 }

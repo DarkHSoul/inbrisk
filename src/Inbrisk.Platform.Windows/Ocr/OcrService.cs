@@ -106,12 +106,26 @@ public sealed class OcrService : IOcrService
         if (w.State == WindowState.Minimized)
             throw new InbriskException(ErrorCode.CaptureFailed,
                 "window is minimized");
-        var region = w.Bounds.Intersect(_windows.GetVirtualDesktopBounds());
-        if (region.IsEmpty)
-            throw new InbriskException(ErrorCode.CaptureFailed,
-                "window has no visible area");
-        var raw = _capture.CaptureRaw(region);
-        raw = raw with { Transform = raw.Transform with { SourceHwnd = hwnd } };
+        // Window-scoped OCR must read the WINDOW's own pixels, not whatever
+        // is composited at its screen rect — a clipped screen capture would
+        // pick up occluding windows sitting on top of (or "behind") the
+        // target. Prefer the occlusion-safe PrintWindow path; fall back to a
+        // clipped screen capture only when the capture service cannot
+        // provide window content.
+        RawFrame raw;
+        if (_capture is Capture.IWindowContentCapture wcc)
+        {
+            raw = wcc.CaptureWindowContent(hwnd);
+        }
+        else
+        {
+            var region = w.Bounds.Intersect(_windows.GetVirtualDesktopBounds());
+            if (region.IsEmpty)
+                throw new InbriskException(ErrorCode.CaptureFailed,
+                    "window has no visible area");
+            raw = _capture.CaptureRaw(region);
+            raw = raw with { Transform = raw.Transform with { SourceHwnd = hwnd } };
+        }
         return Recognize(raw, language, timeout);
     }
 

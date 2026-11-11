@@ -8,10 +8,24 @@ using Inbrisk.Platform.Windows.Topology;
 namespace Inbrisk.Platform.Windows.Capture;
 
 /// <summary>
+/// Optional capability: capture a window's OWN content even while it is
+/// occluded or off-screen (PrintWindow). Callers that need window-scoped
+/// pixels (window OCR, window screenshots) must prefer this over a screen
+/// rect capture — a clipped CopyFromScreen reads whatever is composited on
+/// top of the window, i.e. the occluder's pixels, not the window's.
+/// </summary>
+public interface IWindowContentCapture
+{
+    /// <summary>BGRA frame of the window's own rendered content. The frame's
+    /// transform SourceRect is the window's desktop rect.</summary>
+    RawFrame CaptureWindowContent(long hwnd);
+}
+
+/// <summary>
 /// M1 capture: GDI CopyFromScreen. Honest "basic capture" — WGC arrives in M2.
 /// Physical px in, PNG + FrameTransform out.
 /// </summary>
-public sealed class GdiCapture : ICaptureService
+public sealed class GdiCapture : ICaptureService, IWindowContentCapture
 {
     private readonly IWindowService _windows;
 
@@ -92,6 +106,81 @@ public sealed class GdiCapture : ICaptureService
                 new FrameTransform(region, w, h), DateTimeOffset.Now);
         }
         finally { bmp.UnlockBits(data); }
+    }
+
+    /// <summary>
+    /// Capture the window's OWN bitmap via PrintWindow(PW_RENDERFULLCONTENT):
+    /// the returned pixels belong to the window regardless of which windows
+    /// cover it on screen. Falls back to a clipped screen capture when
+    /// PrintWindow fails or produces an empty image (a few apps refuse it).
+    /// </summary>
+    public RawFrame CaptureWindowContent(long hwnd)
+    {
+        var w = _windows.GetWindow(hwnd)
+            ?? throw new InbriskException(ErrorCode.NotFound, $"window 0x{hwnd:X} not found");
+        if (w.State == WindowState.Minimized)
+            throw new InbriskException(ErrorCode.CaptureFailed, "window is minimized");
+        var bounds = w.Bounds;
+        if (bounds.IsEmpty)
+            throw new InbriskException(ErrorCode.CaptureFailed, "window has no area");
+
+        if (TryPrintWindow(new IntPtr(hwnd), bounds, out var bytes, out var bw, out var bh))
+            return new RawFrame(bytes, bw, bh, bw * 4,
+                new FrameTransform(bounds, bw, bh, hwnd), DateTimeOffset.Now);
+
+        // PrintWindow refused — degrade to the screen rect (documented caveat:
+        // results then reflect the occluder, exactly like a region capture).
+        var clipped = bounds.Intersect(_windows.GetVirtualDesktopBounds());
+        if (clipped.IsEmpty)
+            throw new InbriskException(ErrorCode.CaptureFailed, "window has no visible area");
+        var raw = CaptureRaw(clipped);
+        return raw with { Transform = raw.Transform with { SourceHwnd = hwnd } };
+    }
+
+    private static bool TryPrintWindow(IntPtr hwnd, RectPx bounds,
+        out byte[] bytes, out int w, out int h)
+    {
+        w = Math.Max(1, bounds.Width);
+        h = Math.Max(1, bounds.Height);
+        bytes = Array.Empty<byte>();
+
+        IntPtr screenDc = NativeMethods.GetDC(IntPtr.Zero);
+        if (screenDc == IntPtr.Zero) return false;
+        IntPtr memDc = IntPtr.Zero, dib = IntPtr.Zero, old = IntPtr.Zero;
+        try
+        {
+            memDc = NativeMethods.CreateCompatibleDC(screenDc);
+            if (memDc == IntPtr.Zero) return false;
+            var bmi = new NativeMethods.BITMAPINFOHEADER
+            {
+                BiSize = System.Runtime.InteropServices.Marshal.SizeOf<NativeMethods.BITMAPINFOHEADER>(),
+                BiWidth = w,
+                BiHeight = -h, // top-down rows
+                BiPlanes = 1,
+                BiBitCount = 32,
+                BiCompression = NativeMethods.BI_RGB,
+            };
+            dib = NativeMethods.CreateDIBSection(screenDc, ref bmi,
+                NativeMethods.DIB_RGB_COLORS, out var bits, IntPtr.Zero, 0);
+            if (dib == IntPtr.Zero) return false;
+            old = NativeMethods.SelectObject(memDc, dib);
+            if (!NativeMethods.PrintWindow(hwnd, memDc, NativeMethods.PW_RENDERFULLCONTENT))
+                return false;
+            bytes = new byte[w * 4 * h];
+            System.Runtime.InteropServices.Marshal.Copy(bits, bytes, 0, bytes.Length);
+            // An app that declines to paint leaves an all-zero bitmap — treat
+            // that as a failure so the caller falls back to the screen rect.
+            for (var i = 0; i < bytes.Length; i += 4096)
+                if (bytes[i] != 0) return true;
+            return bytes[^1] != 0;
+        }
+        finally
+        {
+            if (old != IntPtr.Zero) NativeMethods.SelectObject(memDc, old);
+            if (dib != IntPtr.Zero) NativeMethods.DeleteObject(dib);
+            if (memDc != IntPtr.Zero) NativeMethods.DeleteDC(memDc);
+            NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
+        }
     }
 
     /// <summary>Pays the one-time GDI+ startup cost (gdiplus.dll init, JIT)
