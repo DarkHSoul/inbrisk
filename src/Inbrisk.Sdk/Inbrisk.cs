@@ -229,6 +229,7 @@ public sealed class InbriskRuntime : IDisposable
             catalogService: opt.CatalogService,
             launchCache: opt.LaunchCache,
             processTracker: _processTracker);
+        _apps.Provenance = _provenance;
 
         _executor = new Executor(_windows, _integrity, _input, _capture,
             _agentBackends, _registry, _policy, _telemetry, _activity,

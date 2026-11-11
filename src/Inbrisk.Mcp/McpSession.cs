@@ -348,6 +348,14 @@ public sealed class McpSession : IDisposable
         // Confirmer for CONFIRM classes, LocalConsent for dangerous ones.
         Rt.Policy.Confirmer = Confirm.Confirmer;
         Rt.Policy.LocalConsent = Confirm.LocalConsent;
+        // Unsigned-binary launches (path:/executable: catalog misses) share
+        // the same pending-approval channel: a refusal registers a pending
+        // the tray/manager consent surface can approve; the retry with
+        // confirmed:"<approvalId>" then consumes it at the launch gate.
+        if (Rt.Parts.Apps is Inbrisk.Platform.Windows.Apps.AppService appsSvc)
+            appsSvc.UnsignedBinaryConsent = target => Confirm.RequireConsent(
+                $"launch unsigned binary '{System.IO.Path.GetFileName(target)}'",
+                "launch:" + target.ToLowerInvariant());
         Rt.Event += OnEvent;
         // Stamp every process this session spawns with our id — Dispose then
         // reaps only this session's launches.

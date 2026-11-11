@@ -148,17 +148,18 @@ public class PhaseEBatchingTests
         Assert.Equal(2, root.GetProperty("total").GetInt32());
         var results = root.GetProperty("results");
 
-        // First item (valid hex, but fake window) -> inspect ok (returns 0 elements for fake hwnd)
+        // First item (valid hex, but fake window) -> error (no live window)
         Assert.Equal(0, results[0].GetProperty("index").GetInt32());
-        Assert.Equal("ok", results[0].GetProperty("status").GetString());
+        Assert.Equal("error", results[0].GetProperty("status").GetString());
+        Assert.Contains("window not found", results[0].GetProperty("error").GetString());
 
         // Second item -> invalid hwnd error
         Assert.Equal(1, results[1].GetProperty("index").GetInt32());
         Assert.Equal("error", results[1].GetProperty("status").GetString());
         Assert.Contains("Invalid window handle", results[1].GetProperty("error").GetString());
 
-        // Overall status is partial because 1 ok and 1 error
-        Assert.Equal("partial", root.GetProperty("status").GetString());
+        // Overall status is error because both failed
+        Assert.Equal("error", root.GetProperty("status").GetString());
     }
 
     [Fact]
@@ -189,8 +190,9 @@ public class PhaseEBatchingTests
         Assert.NotNull(res);
 
         var text = ((TextContentBlock)res.Content[0]).Text;
-        // Legacy single inspect returns formatted window inspection text
-        Assert.Contains("window 0x1234", text);
+        // Fake hwnd names no live window -> explicit error, not silent 0 elements
+        Assert.Contains("0x1234", text);
+        Assert.Contains("invalid hwnd", text);
         Assert.DoesNotContain("\"results\":", text);
     }
 

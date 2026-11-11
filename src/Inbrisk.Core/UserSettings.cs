@@ -56,6 +56,13 @@ public sealed class UserSettings
     /// </summary>
     public bool AllowScriptLaunch { get; set; } = false;
     /// <summary>
+    /// Per-target launch allowlist for unsigned executables — file names or
+    /// full paths that may launch without the all-or-nothing
+    /// allowScriptLaunch switch. Example: ["Mad Games Tycoon 2.exe"].
+    /// Human-edited only; the MCP surface never writes this setting.
+    /// </summary>
+    public List<string> AllowLaunch { get; set; } = new();
+    /// <summary>
     /// Processes protected from AI close/kill/termination actions.
     /// Immutable to AI; only editable by the human user via settings.
     /// </summary>

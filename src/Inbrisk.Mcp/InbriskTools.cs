@@ -1724,13 +1724,22 @@ public sealed class InbriskTools
                         "args now — do not narrate");
                 }
             }
+            // Emit the structured error ONCE — feeding a serialized blob into
+            // Error()'s `detail` field double-encodes it (detail becomes a
+            // stringified JSON document instead of the readable message).
             var errObj = new Dictionary<string, object?>
             {
-                ["error"] = r.Error,
+                ["error"] = r.Error ?? kind.ToString(),
                 ["detail"] = sb.ToString(),
-                ["candidates"] = candidatesList.Count > 0 ? candidatesList : null
+                ["durationMs"] = sw.ElapsedMilliseconds,
             };
-            return Error(kind, JsonSerializer.Serialize(errObj, J));
+            if (candidatesList.Count > 0) errObj["candidates"] = candidatesList;
+            return new CallToolResult
+            {
+                IsError = true,
+                Content = [new TextContentBlock
+                    { Text = JsonSerializer.Serialize(errObj, J) }],
+            };
         }
 
         // record the window as session scope so a following
@@ -2578,6 +2587,15 @@ public sealed class InbriskTools
             }
             pid = w.Pid;
         }
+        // An explicit hwnd (arg or hwnd-shaped within) that names no live
+        // window is a hard error — letting it reach UIA either throws a raw
+        // COM exception or silently reports "0 elements".
+        var explicitFindHwnd = ParseHwnd(hwnd) ?? (within != null ? ParseHwnd(within) : null);
+        if (explicitFindHwnd is { } efh && !WindowExists(efh))
+        {
+            return ([], Error(OutcomeKind.TargetNotFound,
+                $"window not found — invalid hwnd '{hwnd ?? within}' (no live window with that handle)"));
+        }
         var spec = new FindSpec(Hwnd: scopeHwnd ?? ParseHwnd(hwnd), Pid: pid,
             Role: r, Name: name, AutomationId: automationId,
             ScopeElementId: scopeId, ValueContains: valueContains,
@@ -2666,6 +2684,13 @@ public sealed class InbriskTools
                 return [];
             }
             pid = w.Pid;
+        }
+        var explicitHwnd = ParseHwnd(hwnd) ?? (within != null ? ParseHwnd(within) : null);
+        if (explicitHwnd is { } eh && !WindowExists(eh))
+        {
+            error = Error(OutcomeKind.TargetNotFound,
+                $"window not found — invalid hwnd '{hwnd ?? within}' (no live window with that handle)");
+            return [];
         }
         var spec = new FindSpec(Hwnd: scopeHwnd ?? ParseHwnd(hwnd), Pid: pid,
             Role: r, Name: name, AutomationId: automationId,
@@ -2791,6 +2816,11 @@ public sealed class InbriskTools
                             inspResults[idx] = new BatchInspectItemResult(idx, rawHwnd, "error", Error: $"Invalid window handle '{rawHwnd}'");
                             return;
                         }
+                        if (!WindowExists(parsed.Value))
+                        {
+                            inspResults[idx] = new BatchInspectItemResult(idx, rawHwnd, "error", Error: $"window not found — invalid hwnd '{rawHwnd}' (no live window with that handle)");
+                            return;
+                        }
 
                         var rootH = WindowService.GetRootHwnd(parsed.Value);
                         var win = _s.Rt.Window(rootH);
@@ -2895,6 +2925,9 @@ public sealed class InbriskTools
             }
             var h = ParseHwnd(hwnd) ?? _s.Rt.ForegroundWindow()?.Hwnd;
             if (h == null) return Error(OutcomeKind.Malformed, "no hwnd and no active window");
+            if (ParseHwnd(hwnd) is { } requestedHwnd && !WindowExists(requestedHwnd))
+                return Error(OutcomeKind.TargetNotFound,
+                    $"window not found — invalid hwnd '{hwnd}' (no live window with that handle)");
 
             var rootH = WindowService.GetRootHwnd(h.Value);
             var modal = _s.Rt.WindowService.GetActiveBlockingPopup(rootH);
@@ -3235,6 +3268,20 @@ public sealed class InbriskTools
             if (err != null) return err;
         }
 
+        // A bare coordinate click that lands outside the virtual screen hits
+        // nothing — report Malformed with the real bounds instead of a
+        // fabricated success (SendInput happily "clicks" offscreen).
+        if (el == null && point is { } clickPt)
+        {
+            var vb = _s.Rt.WindowService.GetVirtualDesktopBounds();
+            if (clickPt.X < vb.X || clickPt.Y < vb.Y ||
+                clickPt.X >= vb.X + vb.Width || clickPt.Y >= vb.Y + vb.Height)
+                return Error(OutcomeKind.Malformed,
+                    $"click point ({clickPt.X},{clickPt.Y}) is outside the " +
+                    $"virtual screen ({vb.X},{vb.Y} {vb.Width}x{vb.Height}) — " +
+                    "re-observe for fresh coordinates");
+        }
+
         var res = await Act(new AgentAction(button?.Equals("right", StringComparison.OrdinalIgnoreCase) == true
                 ? AgentActionKind.RightClick
                 : button?.Equals("double", StringComparison.OrdinalIgnoreCase) == true
@@ -3342,6 +3389,10 @@ public sealed class InbriskTools
             return await _s.GhostCoordinator.TypeAsync(text, submit, ct).ConfigureAwait(false);
         }
 
+        if (string.IsNullOrEmpty(text))
+            return Error(OutcomeKind.Malformed,
+                "computer_type requires non-empty text — an empty string types nothing");
+
         _s.Telemetry.IncSequentialSingleAction();
         Inbrisk.Core.PerfTrace.Count("sequentialSingleAction");
         var normArgs = $"{text}|{elementId}|{target?.ToString()}|{mode}|{position}|{submit}|{observe}|{silent}";
@@ -3413,6 +3464,18 @@ public sealed class InbriskTools
             if (ocrPoint != null && el == null)
                 steps.Insert(0, new AgentAction(AgentActionKind.Click,
                     Point: ocrPoint));
+            // An explicit window target (target:{hwnd|window|process})
+            // means the text is destined for THAT window — focus it first;
+            // without this the keystrokes blind-hit whatever is foreground.
+            if (el == null && ocrPoint == null)
+            {
+                var (winSpecified, winHwnd) = ResolveExplicitWindow(target, null);
+                if (winSpecified && winHwnd == null)
+                    return Error(OutcomeKind.TargetNotFound,
+                        "type target window not found — the named hwnd/title/process resolves to no live window");
+                if (winHwnd is { } focusHwnd)
+                    steps.Insert(0, new AgentAction(AgentActionKind.FocusWindow, Hwnd: focusHwnd));
+            }
         }
         var res = await ActChain(steps, el?.Id, ct, observe);
         _s.Deduplicator.RecordMutation(operationId, "computer_type", normArgs, res);
@@ -8318,13 +8381,15 @@ public sealed class InbriskTools
 
     [McpServerTool(Name = "computer_hotkey"), Description(
         "Press a key combination — key=\"s\" modifiers=[\"ctrl\"] or the " +
-        "shorthand keys=\"ctrl+s\" sends Ctrl+S to the FOREGROUND window. " +
-        "Focus the target window first (computer_focus_window) — SendInput " +
-        "cannot route keys to a background window. For multi-step interactions, PREFER computer_batch.")]
+        "shorthand keys=\"ctrl+s\" sends Ctrl+S to the FOREGROUND window, or " +
+        "to a specific window via window/target (hwnd, title substring, or " +
+        "process — the window is focused first). For multi-step interactions, PREFER computer_batch.")]
     public Task<CallToolResult> Hotkey(
         [Description("key name")] string? key = null,
         [Description("modifier names: ctrl,shift,alt,win")] string[]? modifiers = null,
         [Description("combo shorthand like \"ctrl+s\" — alternative to key+modifiers")] string? keys = null,
+        [Description("deliver the keystroke to a specific window: hwnd (hex/decimal) or title substring — focuses it first so keys don't blind-hit whatever is foreground")] string? window = null,
+        [Description("window target object: {hwnd, window, process} — alternative to window")] TargetSpec? target = null,
         [Description("optional client operation ID for safe transport retry deduplication")] string? operationId = null,
         [Description("deliver via background window message — no focus theft. Hotkeys have no message-only equivalent: this fails NotSupported instead of falling back to SendInput")] bool? silent = null,
         CancellationToken ct = default)
@@ -8341,9 +8406,20 @@ public sealed class InbriskTools
         if (key == null)
             return Task.FromResult(Error(OutcomeKind.Malformed,
                 "hotkey requires key+modifiers, or keys shorthand like \"ctrl+s\""));
-        return Act(new AgentAction(AgentActionKind.Hotkey, Key: key,
-            Modifiers: modifiers, Silent: silent == true),
-            ct, operationId: operationId);
+
+        // Explicit window routing: focus the named hwnd/title/process window
+        // first so the keystroke reaches it instead of the blind foreground.
+        var (winSpecified, winHwnd) = ResolveExplicitWindow(target, window);
+        if (winSpecified && winHwnd == null)
+            return Task.FromResult(Error(OutcomeKind.TargetNotFound,
+                "hotkey target window not found — the named hwnd/title/process resolves to no live window"));
+
+        var action = new AgentAction(AgentActionKind.Hotkey, Key: key,
+            Modifiers: modifiers, Silent: silent == true);
+        if (winHwnd is { } wh)
+            return ActChain([new AgentAction(AgentActionKind.FocusWindow, Hwnd: wh), action],
+                null, ct);
+        return Act(action, ct, operationId: operationId);
     }
 
     [McpServerTool(Name = "computer_scroll"), Description(
@@ -8492,14 +8568,17 @@ public sealed class InbriskTools
         => Act(new AgentAction(AgentActionKind.Wait, Ms: ms), ct);
 
     [McpServerTool(Name = "computer_wait_for"), Description(
-        "Wait until an element matching query/target appears in the active or target window, or until a condition (gone, state, value) is met.")]
-    public Task<CallToolResult> WaitFor(
-        [Description("element name or query to wait for — accepts \"map:app.element\" (e.g. \"map:notepad.document\", \"map:calculator.equals\")")] string? query = null,
+        "Wait until an element matching query/target appears, a window/process condition is met, or until a condition (gone, state, value) holds. " +
+        "query accepts a string (\"Paint\" — matches element names AND window titles) or an object ({process, role, name, hwnd, window}). " +
+        "process alone waits for that process to own a window; pid waits on a numeric process id. Polls live state each ~200ms — already-open windows/elements satisfy immediately.")]
+    public async Task<CallToolResult> WaitFor(
+        [Description("element name or query to wait for — string (\"map:app.element\" e.g. \"map:calculator.equals\") or object ({process,role,name,hwnd,window})")] JsonElement? query = null,
         [Description("element name alias for query")] string? name = null,
         [Description("element text alias for query")] string? text = null,
         [Description("structured target specification")] TargetSpec? target = null,
         [Description("window hwnd to observe in background (defaults to target.hwnd or scoped/active window)")] string? hwnd = null,
-        [Description("target process name to observe in background")] string? process = null,
+        [Description("target process name (or numeric pid) to wait on")] string? process = null,
+        [Description("numeric process id to wait on")] int? pid = null,
         [Description("expected element state (e.g. 'selected', 'checked', 'enabled', 'disabled')")] string? expectedState = null,
         [Description("expected element value")] string? expectedValue = null,
         [Description("element value alias for expectedValue")] string? value = null,
@@ -8510,32 +8589,188 @@ public sealed class InbriskTools
         [Description("alias of ms — models often write timeoutMs")] int? timeoutMs = null,
         CancellationToken ct = default)
     {
-        var targetQuery = query ?? name ?? text ?? target?.Name ?? target?.NameContains
-            ?? MapQuery(target?.Map);
-        var targetVal = expectedValue ?? value;
-        long? explicitHwnd = ParseHwnd(hwnd ?? target?.Hwnd);
-        int? explicitPid = explicitHwnd.HasValue && explicitHwnd.Value > 0 ? _s.Rt.Window(explicitHwnd.Value)?.Pid : null;
-        if (!explicitHwnd.HasValue && !string.IsNullOrWhiteSpace(process))
+        // query accepts a string OR a target object — object form crashed the
+        // string binder ("Cannot get the value of a token type 'StartObject'").
+        string? queryStr = null;
+        TargetSpec? qObj = null;
+        if (query is { } qe)
         {
-            var win = _s.Rt.Windows().FirstOrDefault(w => string.Equals(w.ProcessName, process, StringComparison.OrdinalIgnoreCase));
-            if (win != null)
+            if (qe.ValueKind == JsonValueKind.String)
+                queryStr = qe.GetString();
+            else if (qe.ValueKind == JsonValueKind.Object)
             {
-                explicitHwnd = win.Hwnd;
-                explicitPid = win.Pid;
+                try { qObj = qe.Deserialize<TargetSpec>(J); }
+                catch (Exception ex)
+                {
+                    return Error(OutcomeKind.Malformed,
+                        $"wait_for query object is not a valid target: {ex.Message}");
+                }
+            }
+            else
+            {
+                return Error(OutcomeKind.Malformed,
+                    "wait_for query must be a string or a target object ({process,role,name,hwnd,window})");
             }
         }
-        return Act(new AgentAction(AgentActionKind.WaitFor,
-            Query: targetQuery,
-            ElementId: target?.ElementId,
-            ScopeElementId: target?.Within,
-            ExpectedState: expectedState,
-            ExpectedValue: targetVal,
-            Gone: gone,
-            Count: minCount,
-            StopOnUnexpectedDialog: stopOnDialog,
-            Hwnd: explicitHwnd,
-            Pid: explicitPid,
-            Ms: timeoutMs ?? ms), ct);
+
+        process ??= qObj?.Process;
+        hwnd ??= qObj?.Hwnd;
+        var within = target?.Within ?? qObj?.Within;
+        var elId = target?.ElementId ?? qObj?.ElementId;
+        var autoId = target?.AutomationId ?? qObj?.AutomationId;
+        var roleStr = qObj?.Role ?? target?.Role;
+        Core.Role? roleF = null;
+        if (roleStr != null)
+        {
+            if (!Enum.TryParse<Core.Role>(roleStr, true, out var rr))
+                return Error(OutcomeKind.Malformed, $"unknown role '{roleStr}'");
+            roleF = rr;
+        }
+        // a non-numeric window field is a window-TITLE condition
+        var titleQ = (qObj?.Window ?? target?.Window) is { } tw && ParseHwnd(tw) == null
+            ? tw : null;
+        hwnd ??= ParseHwnd(qObj?.Window ?? target?.Window)?.ToString();
+        // numeric process = a pid condition
+        int? pidCond = pid;
+        if (pidCond == null && int.TryParse(process, out var procPid)) pidCond = procPid;
+        var processName = pidCond != null && !string.IsNullOrWhiteSpace(process) && int.TryParse(process, out _)
+            ? null : process;
+
+        var targetQuery = queryStr ?? name ?? text ?? qObj?.Name ?? qObj?.NameContains
+            ?? target?.Name ?? target?.NameContains ?? MapQuery(target?.Map);
+        var targetVal = expectedValue ?? value;
+        long? explicitHwnd = ParseHwnd(hwnd ?? target?.Hwnd);
+
+        // hwnd-shaped 'within' narrows the element scan to that window
+        long? withinHwnd = null;
+        string? withinScopeId = null;
+        if (!string.IsNullOrWhiteSpace(within))
+        {
+            if (ParseHwnd(within) is { } wh2) withinHwnd = wh2;
+            else if (_s.Rt.Parts.Registry.EnsureAlive(within) is { } container)
+            {
+                withinScopeId = container.Handle.BackendRef;
+                withinHwnd = container.Handle.Recipe.Hwnd ?? container.Hwnd;
+            }
+        }
+
+        var hasCondition = targetQuery != null || elId != null || titleQ != null
+            || expectedState != null || targetVal != null
+            || explicitHwnd != null || processName != null || pidCond != null;
+        if (!hasCondition)
+            return Error(OutcomeKind.Malformed,
+                "wait_for requires query or condition (query/name/text, target, process, pid, hwnd, or expected state/value)");
+
+        var timeout = timeoutMs ?? ms;
+        var want = Math.Max(1, minCount ?? 1);
+        var sw = Stopwatch.StartNew();
+        var label = targetQuery ?? titleQ ?? processName
+            ?? (pidCond != null ? $"pid:{pidCond}" : null)
+            ?? (explicitHwnd != null ? $"0x{explicitHwnd.Value:X}" : null)
+            ?? elId ?? "condition";
+
+        try
+        {
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+
+                // ---- resolve current state each poll: windows, processes,
+                // elements — never event-only, so a pre-existing match
+                // satisfies immediately.
+                WindowInfo? winHit = null;
+                if (explicitHwnd is { } eh)
+                    winHit = _s.Rt.WindowService.GetTopLevelWindow(eh);
+                if (winHit == null && pidCond is { } pc)
+                    winHit = _s.Rt.Windows().FirstOrDefault(w => w.Pid == pc);
+                if (winHit == null && !string.IsNullOrWhiteSpace(processName))
+                    winHit = FindBestWindowForProcess(processName);
+                var titleHit = titleQ != null
+                    ? _s.Rt.Windows().FirstOrDefault(w =>
+                        w.Title.Contains(titleQ, StringComparison.OrdinalIgnoreCase))
+                    : null;
+                // element-name queries also match already-open window titles
+                // ("Paint" hits "Adsız - Paint") — a wait for a window must
+                // see windows that existed before the call.
+                if (titleHit == null && targetQuery != null && elId == null)
+                    titleHit = _s.Rt.Windows().FirstOrDefault(w =>
+                        w.Title.Contains(targetQuery, StringComparison.OrdinalIgnoreCase));
+
+                int found = 0;
+                UiElement? elMatch = null;
+                var wantsElements = elId != null || targetQuery != null
+                    || expectedState != null || targetVal != null;
+                if (elId != null)
+                {
+                    elMatch = _s.Rt.Parts.Registry.EnsureAlive(elId);
+                    if (elMatch != null) found++;
+                }
+                else if (wantsElements)
+                {
+                    int? pidF = pidCond ?? winHit?.Pid;
+                    var spec = new FindSpec(
+                        Hwnd: withinHwnd ?? explicitHwnd ?? winHit?.Hwnd ?? _s.ScopeHwnd,
+                        Pid: pidF,
+                        Role: roleF, Name: targetQuery, AutomationId: autoId,
+                        ScopeElementId: withinScopeId,
+                        FirstOnly: minCount == null);
+                    var els = await _s.Rt.FindAsync(spec, ct).ConfigureAwait(false);
+                    IEnumerable<UiElement> filtered = els;
+                    if (!string.IsNullOrWhiteSpace(targetQuery))
+                        filtered = filtered.Where(e =>
+                            e.Name?.Contains(targetQuery, StringComparison.OrdinalIgnoreCase) == true);
+                    if (!string.IsNullOrWhiteSpace(targetVal))
+                        filtered = filtered.Where(e =>
+                            (Prop(e, "value")?.ToString() ?? "").Contains(targetVal, StringComparison.OrdinalIgnoreCase));
+                    if (!string.IsNullOrWhiteSpace(expectedState))
+                        filtered = filtered.Where(e =>
+                            (Prop(e, "state")?.ToString() ?? "").Contains(expectedState, StringComparison.OrdinalIgnoreCase));
+                    var fList = filtered.ToList();
+                    found += fList.Count;
+                    elMatch = fList.FirstOrDefault();
+                }
+                if (winHit != null || titleHit != null) found += want; // window condition counts fully
+
+                var present = found >= want;
+                var satisfied = gone ? !present : present;
+                if (satisfied)
+                {
+                    var w = winHit ?? titleHit;
+                    return Text(JsonSerializer.Serialize(new
+                    {
+                        action = $"wait_for(\"{label}\")",
+                        status = "Ok",
+                        success = true,
+                        method = "wait_for",
+                        durationMs = sw.ElapsedMilliseconds,
+                        matched = w != null
+                            ? (object)new { hwnd = $"0x{w.Hwnd:X}", title = w.Title, pid = w.Pid, process = w.ProcessName }
+                            : elMatch != null
+                                ? new { elementId = elMatch.Id, name = elMatch.Name, role = elMatch.Role.ToString() }
+                                : null,
+                        provenance = Provenance("uia"),
+                    }, J));
+                }
+
+                if (sw.ElapsedMilliseconds >= timeout)
+                    return Error(OutcomeKind.Timeout,
+                        $"timeout ({timeout}ms) waiting for '{label}'" +
+                        (gone ? " to disappear" : " to appear"), sw);
+
+                if (stopOnDialog &&
+                    _s.Rt.WindowService.GetActiveBlockingPopup() is { } dlg)
+                    return Error(OutcomeKind.Failed,
+                        $"unexpected dialog 0x{dlg.Hwnd:X} \"{dlg.Title}\" ({dlg.ProcessName}) appeared while waiting for '{label}'", sw);
+
+                await Task.Delay(200, ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            return _s.Control.State == ComputerControlState.EmergencyStopped
+                ? Error(OutcomeKind.EmergencyStopped, StoppedDetail, sw)
+                : Error(OutcomeKind.Cancelled, "request cancelled", sw);
+        }
     }
 
     [McpServerTool(Name = "computer_wait_for_change"), Description(
@@ -10516,9 +10751,31 @@ public sealed class InbriskTools
             // 2. Menu / ComboBox
             if (post.Role is Inbrisk.Core.Role.ComboBox or Inbrisk.Core.Role.MenuItem || post.Props.GetValueOrDefault("expandCollapseState")?.ToString() == "Expanded")
             {
-                var menuItems = _s.Rt.Find(new FindSpec(Hwnd: scopeHwnd, Role: Inbrisk.Core.Role.MenuItem, MaxResults: 12));
+                // Menu popups are separate top-level windows owned by the
+                // SAME process — a loose/foreground find leaks another
+                // app's menu items into the view. Scope to the popup owned
+                // by scopeHwnd when one exists, then keep only elements
+                // whose pid matches the target window.
+                int? targetPid = null;
+                long findHwnd = scopeHwnd.Value;
+                try
+                {
+                    targetPid = _s.Rt.WindowService.GetWindow(scopeHwnd.Value)?.Pid;
+                    var popup = _s.Rt.WindowService.ListWindows()
+                        .Where(w => w.Hwnd != scopeHwnd.Value &&
+                                    w.OwnerHwnd == scopeHwnd.Value &&
+                                    (targetPid == null || w.Pid == targetPid))
+                        .Select(w => (long?)w.Hwnd)
+                        .FirstOrDefault();
+                    if (popup != null)
+                        findHwnd = popup.Value;
+                }
+                catch { /* pid filter/popup resolution optional */ }
+                var menuItems = _s.Rt.Find(new FindSpec(Hwnd: findHwnd, Role: Inbrisk.Core.Role.MenuItem, MaxResults: 12));
                 if (menuItems.Count == 0)
-                    menuItems = _s.Rt.Find(new FindSpec(Hwnd: scopeHwnd, Role: Inbrisk.Core.Role.ListItem, MaxResults: 12));
+                    menuItems = _s.Rt.Find(new FindSpec(Hwnd: findHwnd, Role: Inbrisk.Core.Role.ListItem, MaxResults: 12));
+                if (targetPid != null)
+                    menuItems = menuItems.Where(e => e.Pid == null || e.Pid == targetPid).ToList();
 
                 List<ContextualElementSummary> summaries = menuItems
                     .Select(e => new ContextualElementSummary(e.Id, e.Role.ToString(), e.Name, null, e.Actions))
@@ -10951,6 +11208,34 @@ public sealed class InbriskTools
         return true;
     }
 
+    /// <summary>Strict explicit-window resolution for input targeting
+    /// (computer_type target window, computer_hotkey window). Unlike
+    /// TryResolveWindowAnchor there is NO scope/foreground fallback — a
+    /// caller who named a window must never have keystrokes silently land
+    /// in whatever happens to be focused. Returns (specified, hwnd):
+    /// specified=true means the caller named a window (hwnd/title/process);
+    /// hwnd=null then means it resolved to no live window.</summary>
+    private (bool Specified, long? Hwnd) ResolveExplicitWindow(
+        TargetSpec? target, string? window)
+    {
+        var specified = !string.IsNullOrWhiteSpace(target?.Hwnd)
+            || !string.IsNullOrWhiteSpace(window)
+            || !string.IsNullOrWhiteSpace(target?.Window)
+            || !string.IsNullOrWhiteSpace(target?.Process);
+        if (!specified) return (false, null);
+        long? h = ParseHwnd(target?.Hwnd) ?? ParseHwnd(window)
+            ?? ParseHwnd(target?.Window);
+        if (h == null && !string.IsNullOrWhiteSpace(window))
+            h = _s.Rt.Windows().FirstOrDefault(w =>
+                w.Title.Contains(window, StringComparison.OrdinalIgnoreCase))?.Hwnd;
+        if (h == null && !string.IsNullOrWhiteSpace(target?.Window))
+            h = _s.Rt.Windows().FirstOrDefault(w =>
+                w.Title.Contains(target.Window, StringComparison.OrdinalIgnoreCase))?.Hwnd;
+        if (h == null && !string.IsNullOrWhiteSpace(target?.Process))
+            h = FindBestWindowForProcess(target.Process)?.Hwnd;
+        return (true, h != null && WindowExists(h.Value) ? h : null);
+    }
+
     /// <summary>Post-wraps a click result so a window-relative coordinate
     /// click reports its synthetic element id ("win:&lt;hwnd&gt;@(x,y)") in
     /// the same result shape element-targeted actions use. Kept as a wrapper
@@ -11164,4 +11449,12 @@ public sealed class InbriskTools
                 null, out var h) ? h : null;
         return long.TryParse(s, out var h2) ? h2 : null;
     }
+
+    /// <summary>hwnd liveness check — a caller-supplied handle that does not
+    /// resolve to a real window must be an explicit error, never a silent
+    /// "0 elements" (garbage hwnds like 0xDEADBEEF parse fine but name
+    /// nothing). Resolves through the top-level ancestor so child-control
+    /// handles count too.</summary>
+    private bool WindowExists(long hwnd) =>
+        hwnd > 0 && _s.Rt.WindowService.GetTopLevelWindow(hwnd) != null;
 }

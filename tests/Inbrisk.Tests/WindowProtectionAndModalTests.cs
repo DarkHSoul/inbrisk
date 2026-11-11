@@ -234,7 +234,13 @@ public sealed class WindowProtectionAndModalTests
         // Agent launched EpicGamesLauncher, but window hadn't appeared yet during timeout
         prov.RegisterAgentLaunch(1234 /* bootstrap pid */, "EpicGamesLauncher", null, "Epic Games Launcher");
 
-        // When the window is checked later, it is recognized as Agent-owned via process adoption
+        // Strict gate: a same-NAME window under a DIFFERENT pid is NOT
+        // closable via name-adoption alone (a user-opened second instance
+        // would otherwise inherit agent ownership). Real launcher→child
+        // handoff is covered because AppService registers the surviving
+        // descendant pid with RegisterAgentLaunch — simulate that here:
+        Assert.False(prov.CanAgentClose(epicHwnd, out _));
+        prov.RegisterAgentLaunch(epicPid, "EpicGamesLauncher", epicHwnd, "Epic Games Launcher");
         Assert.True(prov.CanAgentClose(epicHwnd, out var reason), reason ?? "null");
     }
 

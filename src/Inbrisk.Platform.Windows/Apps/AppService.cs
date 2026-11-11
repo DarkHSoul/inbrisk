@@ -58,6 +58,13 @@ public sealed class AppService : IAppService, IDisposable
             System.Text.RegularExpressions.Regex.IsMatch(n, @"^pythonw?\d*$");
     }
 
+    /// <summary>Optional consent hook consulted for unsigned executables
+    /// when env/settings consent is absent — hosts with a local approval
+    /// surface (the MCP ConfirmChannel) wire this; it must register a
+    /// pending request on refusal and return true only for an approved,
+    /// not-yet-consumed pending (one-shot).</summary>
+    public Func<string, bool>? UnsignedBinaryConsent;
+
     private readonly IWindowService _windows;
     private readonly Func<long, bool>? _uiaProbe;
     private readonly Func<string, bool> _isDeniedProcess;
@@ -70,6 +77,24 @@ public sealed class AppService : IAppService, IDisposable
     internal Func<ResolvedApp, IReadOnlyList<string>?, int?>? Spawner;
     internal Func<IReadOnlyList<ResolvedApp>>? PackageEnumerator;
     internal Func<int, bool>? ProcessAliveChecker;
+    /// <summary>Test seam for descendant discovery — production walks the
+    /// real Toolhelp process table; tests inject pid→children.</summary>
+    internal Func<int, IReadOnlyList<int>>? DescendantProbe;
+    /// <summary>Test seam for the "related process started after launch"
+    /// probe (publisher-correlated bootstrapper handoff).</summary>
+    internal Func<DateTime, IReadOnlyList<string>, string?, int?>? RelatedProcessProbe;
+
+    /// <summary>Provenance sink — the runtime installs its
+    /// IProcessProvenanceService here (constructor arg or post-hoc
+    /// assignment; <see cref="AmbientProvenance"/> is the process-wide
+    /// fallback). When set, every pid a launch verifiably created is
+    /// registered as agent-owned so a later close is never PolicyDenied for
+    /// something THIS call spawned.</summary>
+    public IProcessProvenanceService? Provenance { get; set; }
+    /// <summary>Process-wide fallback provenance sink, mirroring
+    /// SessionProcessTracker.Ambient — lets hosts wire launch ownership
+    /// without touching the AppService constructor signature.</summary>
+    public static IProcessProvenanceService? AmbientProvenance { get; set; }
 
     public sealed record ResolvedApp(LaunchMethod Method, string Identifier,
         string DisplayName, string[] ExeHints, int Score);
@@ -422,14 +447,17 @@ public sealed class AppService : IAppService, IDisposable
                 LooksLikePe(launchTarget) &&
                 !IsSignedBinary(launchTarget))
             {
-                if (!LaunchPathGate.ConsentGranted(out var consentSrc))
+                if (!LaunchPathGate.ConsentGranted(out var consentSrc) &&
+                    !LaunchAllowListed(launchTarget) &&
+                    !(UnsignedBinaryConsent?.Invoke(launchTarget) ?? false))
                     return Fail("ConfirmationRequired",
                         $"'{Path.GetFileName(launchTarget)}' is an unsigned " +
                         "binary outside the registered-app catalog — " +
                         "refusing to launch unverifiable code; set " +
-                        $"{LaunchPathGate.AllowEnvVar}=1 or " +
-                        "\"allowScriptLaunch\": true in settings.json to " +
-                        "permit unsigned launches", total,
+                        $"{LaunchPathGate.AllowEnvVar}=1, " +
+                        "\"allowScriptLaunch\": true in settings.json, or " +
+                        "add the file name to \"allowLaunch\" in " +
+                        "settings.json to permit unsigned launches", total,
                         resolvedName: chosen.DisplayName,
                         identifier: chosen.Identifier);
                 try
@@ -530,15 +558,67 @@ public sealed class AppService : IAppService, IDisposable
 
         // ---- readiness ----
         var launchStartUtc = DateTime.UtcNow;
+        var relatedCompany = RelatedCompanyNorm(chosen);
         var waitSw = Stopwatch.StartNew();
         var ready = WaitReady(chosen, spawnedPid, readiness.Value,
-            spec.TimeoutMs, ct, total, spec.App);
+            spec.TimeoutMs, ct, total, spec.App, launchStartUtc,
+            relatedCompany);
         timings.WindowWaitMs = waitSw.ElapsedMilliseconds;
         if (ready.error != null)
             return Fail(ready.error, ready.detail, total,
                 resolvedName: chosen.DisplayName,
                 identifier: chosen.Identifier, pid: ready.pid,
                 state: ready.state ?? "Started");
+        // "ProcessStarted" proves a spawn, not a surviving process —
+        // bootstrapper exes that need a missing launcher (a Steam game exe
+        // with no Steam running) exit within a second of Verified. A short
+        // settle + liveness check turns that silent loss into a real error.
+        // A live DESCENDANT of the spawned pid or a publisher-correlated
+        // successor that started after the spawn (leagueoflegends.exe →
+        // RiotClientServices.exe) IS the app — the spawn was a bootstrapper
+        // handoff, not a failure.
+        if (readiness == LaunchReadiness.Process && spawnedPid is > 0 &&
+            ProcessAliveChecker == null && Spawner == null)
+        {
+            var spawnedName = chosen.Method is LaunchMethod.ExplicitPath
+                or LaunchMethod.AppPath or LaunchMethod.Executable
+                ? Norm(Path.GetFileNameWithoutExtension(chosen.Identifier))
+                : null;
+            var nameHints = new List<string> { Norm(chosen.DisplayName) };
+            nameHints.AddRange(chosen.ExeHints.Select(Norm)
+                .Where(h => h.Length > 0));
+            var settleUntil = Environment.TickCount64 + 1500;
+            int? familyAlive;
+            bool spawnAlive;
+            do
+            {
+                ct.WaitHandle.WaitOne(300);
+                spawnAlive = ProcessAlive(spawnedPid) ||
+                    ProcessByName(nameHints, spawnedName);
+                familyAlive = LiveDescendantPid(spawnedPid.Value)
+                    ?? RelatedStartedAfter(launchStartUtc, nameHints,
+                        relatedCompany);
+            } while (!spawnAlive && familyAlive == null &&
+                     Environment.TickCount64 < settleUntil);
+            if (!spawnAlive && familyAlive == null)
+                return Fail("Failed",
+                    $"process {spawnedPid.Value} exited right after spawn — " +
+                    "the target may need a launcher/runtime that is not " +
+                    "running (e.g. Steam games need Steam; try a " +
+                    "steam://rungameid/<appid> uri)", total,
+                    resolvedName: chosen.DisplayName,
+                    identifier: chosen.Identifier, pid: spawnedPid,
+                    state: "ProcessExited");
+            // The bootstrapper died but a live descendant/publisher
+            // successor exists — the RESULT should carry the surviving pid
+            // (spawnedPid itself stays accurate for reaper bookkeeping;
+            // WaitReady may have returned the dead spawned pid when the
+            // exit raced the readiness return).
+            if (!ProcessAlive(spawnedPid) && familyAlive is { } fpv &&
+                ready.pid == spawnedPid)
+                ready = (ready.error, ready.detail, ready.state, fpv,
+                    ready.hwnd, ready.title, ready.procName);
+        }
         // Shell-launched targets (UseShellExecute + app-execution aliases like
         // Win11 Store notepad.exe) return null/no pid from Process.Start, so
         // `spawnedPid` is empty and the Track() above never ran. When readiness
@@ -558,6 +638,43 @@ public sealed class AppService : IAppService, IDisposable
             }
             catch { /* bookkeeping must never break a launch */ }
         }
+
+        // Provenance: stamp agent ownership on every pid THIS call
+        // verifiably created — the pid the spawn returned, plus the
+        // readiness pid when it started after this launch began (launcher
+        // handoff / shell-alias / UWP frames). This is what makes a later
+        // computer_close_window / close on the launched window closeable:
+        // it does not depend on the MCP-side pre-launch-snapshot evidence
+        // evaluator, which conservatively reports ownership:"user" whenever
+        // creation evidence is even slightly inconclusive (e.g. a window
+        // handle that predates the snapshot, or a start time that could
+        // not be read). ExistingInstance / AlreadyRunning results never
+        // reach this point — they return above before any spawn.
+        if ((Provenance ?? AmbientProvenance) is { } provSink)
+        {
+            try
+            {
+                var launchArg = chosen.DisplayName;
+                if (spawnedPid is > 0)
+                    provSink.RegisterAgentLaunch(spawnedPid.Value,
+                        ready.procName ?? chosen.DisplayName, ready.hwnd,
+                        launchArg);
+                if (ready.pid is > 0 && ready.pid != spawnedPid)
+                {
+                    try
+                    {
+                        using var proc = Process.GetProcessById(ready.pid.Value);
+                        if (proc.StartTime.ToUniversalTime() >=
+                            launchStartUtc.AddSeconds(-2))
+                            provSink.RegisterAgentLaunch(ready.pid.Value,
+                                ready.procName ?? chosen.DisplayName,
+                                ready.hwnd, launchArg);
+                    }
+                    catch { /* unreadable start time → not provably ours */ }
+                }
+            }
+            catch { /* provenance must never break a launch */ }
+        }
         return Done(chosen.Method, chosen.DisplayName, ready.procName,
             ready.pid, ready.hwnd, ready.title, ready.state!, total,
             readyMs: total.ElapsedMilliseconds - spawnMs,
@@ -568,6 +685,26 @@ public sealed class AppService : IAppService, IDisposable
         => ResolveAll(app)
             .Select(c => new AppCandidate(c.DisplayName, c.Method,
                 c.Identifier, c.Score)).ToList();
+
+    /// <summary>settings.json "allowLaunch" per-target allowlist — matches
+    /// on the full path or the bare file name, case-insensitive.</summary>
+    private static bool LaunchAllowListed(string target)
+    {
+        try
+        {
+            var list = UserSettings.LoadCached().AllowLaunch;
+            if (list == null) return false;
+            var leaf = Path.GetFileName(target);
+            foreach (var entry in list)
+            {
+                if (entry.Equals(target, StringComparison.OrdinalIgnoreCase) ||
+                    entry.Equals(leaf, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        catch { /* unreadable settings = not allow-listed */ }
+        return false;
+    }
 
     // ------------------------------------------------------------------
     //  resolution
@@ -708,6 +845,14 @@ public sealed class AppService : IAppService, IDisposable
                     ? "system" : "installed",
                 pkg.Identifier, pkg.ExeHints, 100, null);
 
+        // Steam games — the install-dir exe is a bootstrapper that dies
+        // without Steam; the rungameid URI starts Steam AND the game, so it
+        // is the correct catalog entry (signed-handler protocol launch).
+        foreach (var (gname, appid) in SteamGames())
+            Add(gname, LaunchMethod.Protocol,
+                $"uri:\"steam://rungameid/{appid}\"", "installed",
+                $"steam://rungameid/{appid}", [gname], 95, null);
+
         var list = byName.Values
             .OrderBy(a => a.Name, StringComparer.OrdinalIgnoreCase).ToList();
         return (list, entries, null);
@@ -832,6 +977,18 @@ public sealed class AppService : IAppService, IDisposable
                 if (s > 0)
                     found.Add(new ResolvedApp(LaunchMethod.Aumid, e.Identifier,
                         e.Name, e.ExeHints, s + 3));
+                break;
+            }
+            case LaunchMethod.Protocol:
+            {
+                // Registered-handler launches (steam://rungameid/…): score
+                // the display name; below StartMenu/AppPath/Aumid priority.
+                var s = Score(e.Name, app, Norm(e.Name), norm);
+                foreach (var hint in e.ExeHints)
+                    s = Math.Max(s, Score(hint, app, Norm(hint), norm));
+                if (s > 0)
+                    found.Add(new ResolvedApp(LaunchMethod.Protocol,
+                        e.Identifier, e.Name, e.ExeHints, s + 2));
                 break;
             }
         }
@@ -1375,6 +1532,69 @@ public sealed class AppService : IAppService, IDisposable
     private static string NormProc(string? processName)
         => Norm(Path.GetFileNameWithoutExtension(processName ?? ""));
 
+    /// <summary>Processes whose top-level window titles embed documents,
+    /// tabs, chats or session names from OTHER applications — IDEs,
+    /// terminals, editors, browsers-as-editors and the agent host itself
+    /// (Devin window titled "…Spotify/Chrome Açılmama Sorunu" is a chat
+    /// about Spotify, not Spotify). A TITLE-ONLY match against these can
+    /// never be evidence of the running app; process-name/exe-hint matches
+    /// are unaffected (a real "notepad" still resolves by process name).</summary>
+    private static readonly HashSet<string> DocumentTitleHosts = new(
+        StringComparer.Ordinal)
+    {
+        "devin", "devinexe", "windsurf", "code", "codeinsiders",
+        "devenv", "idea64", "rider64", "sublimetext", "notepadpp",
+        "notepad", "wordpad", "winword", "excel", "powerpnt",
+        "obsidian", "windowsterminal", "wt", "cmd", "powershell", "pwsh",
+        "conhost", "wsl", "bash", "ubuntu", "explorer", "totalcmd",
+        "七", // agent-host family listed in the triage report
+    };
+
+    /// <summary>Does <paramref name="title"/> contain the normalized app
+    /// name as a whole word-run at the START or END (or equal it)?
+    /// "Spotify" matches "Spotify", "Spotify Premium" and "Now playing —
+    /// Spotify"; it never matches "Fixing Spotify/Chrome Açılmama Sorunu".
+    /// Matching is on normalized tokens (letters/digits only), so
+    /// "… / Spotify" and "… - Spotify" both count as boundary positions.</summary>
+    internal static bool TitleBoundaryMatch(string? title, string normName)
+    {
+        if (string.IsNullOrEmpty(title) || normName.Length < 3) return false;
+        var tokens = new List<string>();
+        foreach (var raw in title.Split(' ', StringSplitOptions.RemoveEmptyEntries))
+            foreach (var t in raw.Split(_titleSeparators,
+                       StringSplitOptions.RemoveEmptyEntries))
+            {
+                var n = Norm(t);
+                if (n.Length > 0) tokens.Add(n);
+            }
+        if (tokens.Count == 0) return false;
+        // Leading run of tokens that concatenates to the name ("Spotify
+        // Premium" → ["spotify","premium"], first token completes it).
+        var acc = "";
+        for (var i = 0; i < tokens.Count && acc.Length < normName.Length; i++)
+        {
+            acc += tokens[i];
+            if (acc == normName) return true;
+            if (acc.Length >= normName.Length) break;
+        }
+        // Trailing run ("Now playing - Spotify").
+        acc = "";
+        for (var i = tokens.Count - 1; i >= 0 && acc.Length < normName.Length; i--)
+        {
+            acc = tokens[i] + acc;
+            if (acc == normName) return true;
+            if (acc.Length >= normName.Length) break;
+        }
+        return false;
+    }
+
+    private static readonly char[] _titleSeparators =
+    {
+        '-', '–', '—', '_', '.', ',', ';', ':', '/', '\\', '|', '·', '•',
+        '(', ')', '[', ']', '{', '}', '<', '>', '\'', '"', '‘', '’', '“',
+        '”', '!', '?', '&', '+', '=', '#', '@', '~', '*',
+    };
+
     // ------------------------------------------------------------------
     //  resolution sources
     // ------------------------------------------------------------------
@@ -1418,6 +1638,76 @@ public sealed class AppService : IAppService, IDisposable
                 var path = sub?.GetValue(null) as string;
                 if (!string.IsNullOrWhiteSpace(path))
                     yield return (key, path.Trim('"'));
+            }
+        }
+    }
+
+    /// <summary>Steam library roots: the Steam install dir plus every extra
+    /// library listed in steamapps\libraryfolders.vdf. Empty when Steam is
+    /// not installed — callers simply see no games.</summary>
+    internal static IEnumerable<string> SteamLibraryRoots()
+    {
+        string? steamPath = null;
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(
+                @"Software\Valve\Steam");
+            steamPath = key?.GetValue("SteamPath") as string;
+        }
+        catch { /* no Steam registry access → no games */ }
+        if (string.IsNullOrWhiteSpace(steamPath) || !Directory.Exists(steamPath))
+            yield break;
+        yield return steamPath;
+        var vdf = Path.Combine(steamPath, "steamapps", "libraryfolders.vdf");
+        if (!File.Exists(vdf)) yield break;
+        string[] lines;
+        try { lines = File.ReadAllLines(vdf); }
+        catch { yield break; }
+        foreach (var line in lines)
+        {
+            var t = line.Trim();
+            if (!t.StartsWith("\"path\"", StringComparison.Ordinal)) continue;
+            var seg = t.Split('"');
+            if (seg.Length > 3 && Directory.Exists(seg[3].Replace(@"\\", @"\")))
+                yield return seg[3].Replace(@"\\", @"\");
+        }
+    }
+
+    /// <summary>Installed Steam games as (display name, appid), read from
+    /// appmanifest_*.acf across all libraries. VDF is parsed line-wise —
+    /// only the flat "appid"/"name" pairs matter.</summary>
+    internal static IEnumerable<(string Name, int AppId)> SteamGames()
+    {
+        var seen = new HashSet<int>();
+        foreach (var root in SteamLibraryRoots())
+        {
+            IEnumerable<string> manifests;
+            try
+            {
+                manifests = Directory.EnumerateFiles(
+                    Path.Combine(root, "steamapps"), "appmanifest_*.acf");
+            }
+            catch { continue; }
+            foreach (var m in manifests)
+            {
+                string? name = null;
+                var appid = 0;
+                try
+                {
+                    foreach (var line in File.ReadLines(m))
+                    {
+                        var t = line.Trim();
+                        var seg = t.Split('"');
+                        if (seg.Length <= 3) continue;
+                        if (seg[1].Equals("appid", StringComparison.OrdinalIgnoreCase))
+                            int.TryParse(seg[3], out appid);
+                        else if (seg[1].Equals("name", StringComparison.OrdinalIgnoreCase))
+                            name = seg[3];
+                    }
+                }
+                catch { continue; }
+                if (name is { Length: > 0 } && appid > 0 && seen.Add(appid))
+                    yield return (name, appid);
             }
         }
     }
@@ -1681,8 +1971,15 @@ public sealed class AppService : IAppService, IDisposable
                 var pn = NormProc(w.ProcessName);
                 if (hints.Contains(pn)) return true;
                 if (pn == norm) return true;
-                return titleMatch && pn.Length > 0 &&
-                    Norm(w.Title).Contains(norm);
+                // Title match only counts at the title BOUNDARY as a whole
+                // word-run — a document title merely containing the app name
+                // ("…Spotify/Chrome Hatası…" in an IDE window) is not the
+                // running app. Windows owned by processes whose titles embed
+                // documents/tabs/chats (IDEs, terminals, editors, the agent
+                // host itself) are never attributed by title at all.
+                return titleMatch && pn.Length > 0 && norm.Length >= 3 &&
+                    !DocumentTitleHosts.Contains(pn) &&
+                    TitleBoundaryMatch(w.Title, norm);
             })
             .OrderByDescending(w => w.IsForeground)
             .ThenByDescending(w => w.Bounds.Width * w.Bounds.Height)
@@ -1855,11 +2152,17 @@ public sealed class AppService : IAppService, IDisposable
         return false;
     }
 
+    /// <summary>Grace period after the spawned pid exits for bootstrapper
+    /// children/publisher-related successors to appear before the launch is
+    /// declared dead.</summary>
+    private const long SpawnedDeadGraceMs = 5000;
+
     private (string? error, string? detail, string? state, int? pid,
         long? hwnd, string? title, string? procName)
         WaitReady(ResolvedApp app, int? spawnedPid, LaunchReadiness readiness,
             int timeoutMs, CancellationToken ct, Stopwatch total,
-            string? requestedName = null)
+            string? requestedName = null, DateTime spawnUtc = default,
+            string? relatedCompany = null)
     {
         if (readiness == LaunchReadiness.None)
             return (null, null, "Started", spawnedPid, null, null, null);
@@ -1896,14 +2199,46 @@ public sealed class AppService : IAppService, IDisposable
         long timeToFirstWinMs = 0;
         long lastPollTicks = 0;
 
+        // Launch family bookkeeping: a bootstrapper exe (League of Legends,
+        // Epic launcher stubs) exits right after spawning the REAL app as a
+        // child — or a differently-named same-publisher process. Union every
+        // descendant ever observed plus publisher-correlated successors so
+        // the handoff counts as this launch's process/window, not a failure.
+        var familyPids = new List<int>();
+        long? spawnedDeadAt = null;
+        int? relatedPid = null;
+        long familyProbeTicks = 0;
+        void RefreshFamily()
+        {
+            var now = Environment.TickCount64;
+            if (now - familyProbeTicks < 350) return;
+            familyProbeTicks = now;
+            familyPids.Clear();
+            if (spawnedPid is { } sp)
+            {
+                familyPids.Add(sp);
+                foreach (var d in DescendantsOf(sp)) familyPids.Add(d);
+            }
+            var rp = RelatedStartedAfter(spawnUtc == default
+                    ? DateTime.UtcNow : spawnUtc, hints, relatedCompany);
+            if (rp != null) { relatedPid = rp; familyPids.Add(rp.Value); }
+        }
+
         while (total.ElapsedMilliseconds < deadline)
         {
             ct.ThrowIfCancellationRequested();
             if (readiness == LaunchReadiness.Process)
             {
+                if (!ProcessAlive(spawnedPid) && spawnedPid.HasValue)
+                    RefreshFamily();
+                var familyAlive = familyPids
+                    .FirstOrDefault(p => p != spawnedPid.GetValueOrDefault());
                 if (ProcessAlive(spawnedPid) ||
-                    ProcessByName(hints, spawnedName))
-                    return (null, null, "ProcessStarted", spawnedPid,
+                    ProcessByName(hints, spawnedName) ||
+                    familyAlive > 0)
+                    return (null, null, "ProcessStarted",
+                        ProcessAlive(spawnedPid) ? spawnedPid
+                            : (familyAlive > 0 ? familyAlive : spawnedPid),
                         null, null, null);
                 ct.WaitHandle.WaitOne(Math.Min(150, (int)Math.Max(1, deadline - total.ElapsedMilliseconds)));
                 continue;
@@ -1912,15 +2247,32 @@ public sealed class AppService : IAppService, IDisposable
             // Early detection: process exited before becoming ready
             // Do not fail prematurely if spawnedPid exits for launcher stubs / AUMID / execution aliases.
             var isStubOrAlias = IsLauncherOrStub(app, spawnedName);
+            if (spawnedPid.HasValue &&
+                (isStubOrAlias || !ProcessAlive(spawnedPid)))
+                RefreshFamily();
             if (!isStubOrAlias && spawnedPid.HasValue && !ProcessAlive(spawnedPid) && !ProcessByName(hints, spawnedName))
             {
-                var winImmediate = MatchWindow(spawnedPid, hints, spawnedName, app.DisplayName, requestedName);
-                if (winImmediate == null)
+                var winImmediate = MatchWindow(spawnedPid, hints, spawnedName,
+                    app.DisplayName, requestedName, familyPids);
+                var familyAliveNow = familyPids
+                    .Any(p => p != spawnedPid.Value);
+                if (winImmediate == null && !familyAliveNow)
                 {
-                    return ("Failed",
-                        $"process {spawnedPid.Value} exited before becoming ready",
-                        "Failed", spawnedPid, null, null, null);
+                    // Bootstrapper children can materialize a beat after the
+                    // parent exits — hold a short grace before declaring the
+                    // spawn dead (the plain "spawn died, nothing came up"
+                    // Steam-game-without-Steam path still fails, just after
+                    // the grace/deadline instead of instantly).
+                    spawnedDeadAt ??= Environment.TickCount64;
+                    if (Environment.TickCount64 - spawnedDeadAt.Value >=
+                        SpawnedDeadGraceMs)
+                    {
+                        return ("Failed",
+                            $"process {spawnedPid.Value} exited before becoming ready",
+                            "Failed", spawnedPid, null, null, null);
+                    }
                 }
+                else spawnedDeadAt = null;
             }
 
             bool eventWoke = false;
@@ -1954,7 +2306,7 @@ public sealed class AppService : IAppService, IDisposable
             lastPollTicks = nowTicks;
 
             var win = MatchWindow(spawnedPid, hints, spawnedName,
-                app.DisplayName, requestedName);
+                app.DisplayName, requestedName, familyPids);
             if (win != null)
             {
                 Telemetry.IncLaunchCandidate();
@@ -1998,11 +2350,26 @@ public sealed class AppService : IAppService, IDisposable
         }
 
         // Final check right at the deadline
-        var finalWin = MatchWindow(spawnedPid, hints, spawnedName, app.DisplayName, requestedName);
+        RefreshFamily();
+        var finalWin = MatchWindow(spawnedPid, hints, spawnedName,
+            app.DisplayName, requestedName, familyPids);
         if (finalWin != null)
         {
             return (null, null, "Ready", finalWin.Pid, finalWin.Hwnd,
                 finalWin.Title, finalWin.ProcessName);
+        }
+
+        // A spawned process that died and left NO live descendants, no
+        // publisher-correlated successor and no matching window was a dead
+        // spawn (e.g. a game bootstrapper with its launcher absent) — report
+        // the real failure, not a misleading "still initializing" timeout.
+        if (spawnedPid.HasValue && !ProcessAlive(spawnedPid) &&
+            !ProcessByName(hints, spawnedName) &&
+            !familyPids.Any(p => p != spawnedPid.Value))
+        {
+            return ("Failed",
+                $"process {spawnedPid.Value} exited before becoming ready",
+                "Failed", spawnedPid, null, null, null);
         }
 
         // debugging telemetry: what windows were visible at the deadline
@@ -2037,7 +2404,8 @@ public sealed class AppService : IAppService, IDisposable
     }
 
     private WindowInfo? MatchWindow(int? pid, List<string> hints,
-        string? spawnedName, string displayName, string? requestedName = null)
+        string? spawnedName, string displayName, string? requestedName = null,
+        IReadOnlyCollection<int>? familyPids = null)
     {
         var wins = SnapshotWindows()
             .Where(w => !w.Bounds.IsEmpty && !string.IsNullOrEmpty(w.Title) &&
@@ -2085,19 +2453,26 @@ public sealed class AppService : IAppService, IDisposable
             return false;
         }
 
-        if (pid is { } p)
+        // The launch "family": the spawned pid plus any live descendant /
+        // publisher-correlated successor — a bootstrapper's child owns the
+        // window, not the exe we spawned.
+        var pidSet = new HashSet<int>();
+        if (pid is { } p) pidSet.Add(p);
+        if (familyPids != null) pidSet.UnionWith(familyPids);
+        if (pidSet.Count > 0)
         {
-            var byPid = wins.Where(w => w.Pid == p).ToList();
+            var byPid = wins.Where(w => pidSet.Contains(w.Pid)).ToList();
             if (byPid.Count > 0) return BestWindow(byPid);
 
             // Exact UWP attribution or frame matching by title / localized aliases without relying on EnumChildWindows
             var hosted = wins
                 .Where(w => NormProc(w.ProcessName) == "applicationframehost" &&
-                            (HostedProcessId(w.Hwnd) == p || MatchesFrameWindow(w)))
+                            (pidSet.Contains(HostedProcessId(w.Hwnd)) ||
+                             MatchesFrameWindow(w)))
                 .ToList();
             if (hosted.Count > 0 &&
                 BestWindow(hosted) is { } frame)
-                return frame with { Pid = p };
+                return frame with { Pid = pid ?? frame.Pid };
 
             // spawned pid may be a launcher that exited or handed off —
             // fall through to name/title matching
@@ -2111,10 +2486,17 @@ public sealed class AppService : IAppService, IDisposable
             if (hints.Count > 0 && (hints.Contains(pn) || hints.Any(h => h.Length >= 4 && (h.StartsWith(pn) || pn.StartsWith(h))))) return true;
             if (pn == norm || (norm.Length >= 4 && (norm.StartsWith(pn) || pn.StartsWith(norm)))) return true;
 
-            // 2. Title matching fallback
-            var winTitle = Norm(w.Title);
-            if (winTitle.Contains(norm) || (reqNorm != null && winTitle.Contains(reqNorm))) return true;
-            if (hints.Any(h => h.Length >= 4 && (winTitle.Contains(h) || pn.Contains(h)))) return true;
+            // 2. Title matching fallback. A process that embeds document/
+            //    tab/chat titles (IDE, terminal, editor, the agent host) can
+            //    contain the requested name mid-title without being the app
+            //    — for those a word-boundary position match is required.
+            var docHost = DocumentTitleHosts.Contains(pn);
+            bool TitleHit(string normTerm)
+                => normTerm.Length >= 3 && (docHost
+                    ? TitleBoundaryMatch(w.Title, normTerm)
+                    : Norm(w.Title).Contains(normTerm));
+            if (TitleHit(norm) || (reqNorm != null && TitleHit(reqNorm))) return true;
+            if (hints.Any(h => h.Length >= 4 && (TitleHit(h) || pn.Contains(h)))) return true;
 
             // 3. UWP / ApplicationFrameHost special handling without relying on EnumChildWindows
             if (pn == "applicationframehost")
@@ -2122,11 +2504,14 @@ public sealed class AppService : IAppService, IDisposable
                 if (MatchesFrameWindow(w)) return true;
             }
 
-            // 4. Localized aliases fallback for regular windows
+            // 4. Localized aliases fallback for regular windows — same
+            //    document-host guard on the title side (process-name side
+            //    stays a real match).
+            var winTitle = Norm(w.Title);
             if (reqNorm != null && WellKnownLocalizedAliases.TryGetValue(reqNorm, out var rAliases) &&
-                rAliases.Any(a => winTitle.Contains(Norm(a)) || pn.Contains(Norm(a)))) return true;
+                rAliases.Any(a => TitleHit(Norm(a)) || pn.Contains(Norm(a)))) return true;
             if (WellKnownLocalizedAliases.TryGetValue(norm, out var nAliases) &&
-                nAliases.Any(a => winTitle.Contains(Norm(a)) || pn.Contains(Norm(a)))) return true;
+                nAliases.Any(a => TitleHit(Norm(a)) || pn.Contains(Norm(a)))) return true;
 
             return false;
         }).ToList();
@@ -2160,6 +2545,135 @@ public sealed class AppService : IAppService, IDisposable
         if (names == null) return false;
         return (spawnedName != null && names.Contains(spawnedName)) ||
             names.Overlaps(hints);
+    }
+
+    /// <summary>Live descendant processes of <paramref name="rootPid"/>,
+    /// resolved through the Toolhelp parent-chain — works even after
+    /// <paramref name="rootPid"/> itself exited (a child's recorded parent
+    /// pid is immutable), which is exactly the bootstrapper case: League of
+    /// Legends' launcher exe dies while its RiotClientServices child keeps
+    /// running. Returns an empty list when the chain has no survivors.</summary>
+    internal IReadOnlyList<int> DescendantsOf(int rootPid)
+    {
+        if (DescendantProbe != null)
+            return DescendantProbe(rootPid) ?? [];
+        var parentOf = ProcessParentMap();
+        var found = new List<int>();
+        foreach (var pid in parentOf.Keys)
+        {
+            var cur = pid;
+            var hops = 0;
+            while (hops++ < 32 && parentOf.TryGetValue(cur, out var parent) &&
+                   parent > 0)
+            {
+                if (parent == rootPid) { found.Add(pid); break; }
+                cur = parent;
+            }
+        }
+        return found;
+    }
+
+    /// <summary>First live descendant of <paramref name="rootPid"/>, or
+    /// null. Callers re-probe while polling because bootstrapper children
+    /// materialize a beat after the parent exits.</summary>
+    private int? LiveDescendantPid(int rootPid)
+        => DescendantsOf(rootPid).FirstOrDefault(p => p > 0) is { } d && d > 0
+            ? d : null;
+
+    /// <summary>pid → parentPid for every process in a fresh Toolhelp
+    /// snapshot. A dead parent still appears as the VALUE — which is what
+    /// lets descendants of an exited bootstrapper resolve.</summary>
+    private static Dictionary<int, int> ProcessParentMap()
+    {
+        var map = new Dictionary<int, int>();
+        var snap = Native.NativeMethods.CreateToolhelp32Snapshot(
+            Native.NativeMethods.TH32CS_SNAPPROCESS, 0);
+        if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return map;
+        try
+        {
+            var e = new Native.NativeMethods.PROCESSENTRY32W
+            {
+                dwSize = (uint)Marshal.SizeOf<
+                    Native.NativeMethods.PROCESSENTRY32W>()
+            };
+            if (Native.NativeMethods.Process32FirstW(snap, ref e))
+            {
+                do
+                {
+                    map[(int)e.th32ProcessID] = (int)e.th32ParentProcessID;
+                } while (Native.NativeMethods.Process32NextW(snap, ref e));
+            }
+        }
+        catch { }
+        finally { Native.NativeMethods.CloseHandle(snap); }
+        return map;
+    }
+
+    /// <summary>A process that started AFTER the launch began and correlates
+    /// to the target — same normalized process name as a hint, or (the
+    /// bootstrapper-redirect case) the same PE publisher as the spawned exe
+    /// (Riot Games launcher dying into RiotClientServices). Processes that
+    /// merely pre-existed (a Steam that was already running) never qualify:
+    /// their start time precedes <paramref name="sinceUtc"/>.</summary>
+    private int? RelatedStartedAfter(DateTime sinceUtc,
+        IReadOnlyList<string> nameHints, string? companyNorm)
+    {
+        if (RelatedProcessProbe != null)
+            return RelatedProcessProbe(sinceUtc, nameHints, companyNorm);
+        if (ProcessAliveChecker != null) return null; // synthetic test env
+        try
+        {
+            foreach (var p in Process.GetProcesses())
+            {
+                using (p)
+                {
+                    DateTime started;
+                    try { started = p.StartTime.ToUniversalTime(); }
+                    catch { continue; }
+                    if (started < sinceUtc.AddSeconds(-2)) continue;
+                    var pn = NormProc(p.ProcessName);
+                    if (nameHints.Contains(pn)) return p.Id;
+                    if (companyNorm == null) continue;
+                    try
+                    {
+                        var path = p.MainModule?.FileName;
+                        if (path == null) continue;
+                        var company = FileVersionInfo.GetVersionInfo(path)
+                            .CompanyName;
+                        if (!string.IsNullOrWhiteSpace(company) &&
+                            Norm(company) == companyNorm)
+                            return p.Id;
+                    }
+                    catch { /* protected/foreign-bitness process */ }
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    /// <summary>Normalized publisher (CompanyName) of the resolved launch
+    /// target — the correlation key that lets a bootstrapper's differently
+    /// named successor (leagueoflegends.exe → RiotClientServices.exe, both
+    /// "Riot Games, Inc.") count as the launched app. null when the target
+    /// is not a local exe or its version info is unreadable.</summary>
+    private static string? RelatedCompanyNorm(ResolvedApp app)
+    {
+        try
+        {
+            if (app.Method is not (LaunchMethod.ExplicitPath
+                or LaunchMethod.AppPath or LaunchMethod.Executable
+                or LaunchMethod.StartMenu))
+                return null;
+            var target = ResolveLaunchTarget(app);
+            if (target == null ||
+                !target.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ||
+                !File.Exists(target))
+                return null;
+            var company = FileVersionInfo.GetVersionInfo(target).CompanyName;
+            return string.IsNullOrWhiteSpace(company) ? null : Norm(company);
+        }
+        catch { return null; }
     }
 
     /// <summary>Normalized process-name set, refreshed at most every 250 ms

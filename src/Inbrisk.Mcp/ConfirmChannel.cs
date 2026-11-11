@@ -91,8 +91,13 @@ public sealed class ConfirmChannel
     /// otherwise register/refresh the pending and refuse. The request path
     /// (tool arguments, run options, flags) is never read here.</summary>
     private bool Gate(ActionIntent intent, UiElement? element, WindowInfo? window, bool dangerous)
+        => GateCore(Fingerprint(intent, element, window),
+            Summarize(intent, element, window), dangerous);
+
+    /// <summary>Shared gate body: approved+fingerprint+live → consume once;
+    /// otherwise register/refresh the pending and refuse.</summary>
+    private bool GateCore(string fp, string summary, bool dangerous)
     {
-        var fp = Fingerprint(intent, element, window);
         lock (_gate)
         {
             var now = DateTimeOffset.UtcNow;
@@ -109,7 +114,7 @@ public sealed class ConfirmChannel
             if (p == null)
             {
                 p = new PendingConfirmation(NewId(), fp,
-                    Summarize(intent, element, window), dangerous, now)
+                    summary, dangerous, now)
                 {
                     LastDeniedAt = now,
                     ExpiresAt = now + PendingTtl,
@@ -129,6 +134,22 @@ public sealed class ConfirmChannel
             Audit("require", p, "no local approval — confirmation required");
             return false;
         }
+    }
+
+    /// <summary>Consent gate for non-UI decisions that never pass through
+    /// the executor's ActionIntent pipeline — e.g. unsigned-binary launches.
+    /// The caller picks a fingerprint seed ("launch:C:\...\game.exe") so an
+    /// approval binds to exactly that target. Denials register a pending
+    /// the tray/manager surface can approve; a retry then consumes it.</summary>
+    public bool RequireConsent(string summary, string fingerprintSeed,
+        bool dangerous = true)
+    {
+        try
+        {
+            return GateCore("ext:" + fingerprintSeed,
+                Trunc(summary, 200) ?? "", dangerous);
+        }
+        catch { return false; }
     }
 
     // ---------------- local consent surface ----------------
