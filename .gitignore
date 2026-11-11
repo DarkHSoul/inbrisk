@@ -60,3 +60,10 @@ target/
 
 # Chat bridge runtime state
 .chat_bridge/
+
+# Model weights
+*.gguf
+*.safetensors
+
+# Local build / test output
+out/
