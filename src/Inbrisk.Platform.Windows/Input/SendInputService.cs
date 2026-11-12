@@ -337,6 +337,32 @@ public sealed class SendInputService : IInputService
             throw new InbriskException(ErrorCode.InputBlocked, "SetCursorPos failed");
     }
 
+    /// <summary>Relative pointer movement (raw counts) — what games that
+    /// capture the cursor read for camera look. Sent in small slices so a
+    /// large turn is smooth and no single event is clamped by the game.</summary>
+    public void MoveMouseRelative(int dx, int dy)
+    {
+        using var txn = BeginTransaction(InputTxnKind.Move);
+        var slices = Math.Clamp(Math.Max(Math.Abs(dx), Math.Abs(dy)) / 40, 1, 60);
+        int sx = 0, sy = 0;
+        for (var i = 1; i <= slices; i++)
+        {
+            var tx = dx * i / slices;
+            var ty = dy * i / slices;
+            SendBatch(txn, new[] { new INPUT
+            {
+                Type = NativeMethods.INPUT_MOUSE,
+                U = new INPUTUNION { Mi = new MOUSEINPUT
+                {
+                    Dx = tx - sx, Dy = ty - sy,
+                    DwFlags = NativeMethods.MOUSEEVENTF_MOVE,
+                } },
+            } });
+            sx = tx; sy = ty;
+            if (i < slices) Thread.Sleep(8);
+        }
+    }
+
     public void Click(int x, int y, MouseButton button = MouseButton.Left, int count = 1)
     {
         using var txn = BeginTransaction(InputTxnKind.Click);

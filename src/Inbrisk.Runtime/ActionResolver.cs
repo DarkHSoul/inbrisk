@@ -272,6 +272,7 @@ public sealed class ActionResolver
             AgentActionKind.FocusElement
                 => a.ElementId != null ? ResolveElement(a.ElementId, out error) : null,
             AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey
+                or AgentActionKind.Look
                 => a.ElementId != null ? ResolveElement(a.ElementId, out error) : null,
             _ => null,
         };
@@ -294,12 +295,13 @@ public sealed class ActionResolver
             AgentActionKind.Type => ActionKind.TypeText,
             AgentActionKind.Key => ActionKind.KeyPress,
             AgentActionKind.Hotkey => ActionKind.Hotkey,
+            AgentActionKind.Look => ActionKind.MouseLook,
             _ => (ActionKind?)null,
         };
         if (kind == null) { error = $"unhandled action kind {a.Kind}"; return null; }
 
         if (target == null && kind is not (ActionKind.TypeText or ActionKind.KeyPress
-            or ActionKind.Hotkey))
+            or ActionKind.Hotkey or ActionKind.MouseLook))
         { error = $"{a.Kind} requires elementId or image point"; return null; }
 
         var args = new Dictionary<string, object?>();
@@ -314,6 +316,15 @@ public sealed class ActionResolver
                 args["key"] = key.ToString();
                 if (a.Modifiers != null) args["modifiers"] = a.Modifiers;
                 if (a.Count is > 1) args["count"] = a.Count.Value;
+                // key: hold the key down this long instead of an instant tap
+                if (kind.Value == ActionKind.KeyPress && a.Ms is > 0)
+                    args["holdMs"] = a.Ms.Value;
+                break;
+            case ActionKind.MouseLook:
+                if (a.Dx is null && a.Dy is null)
+                { error = "look requires dx and/or dy"; return null; }
+                args["dx"] = a.Dx ?? 0;
+                args["dy"] = a.Dy ?? 0;
                 break;
             case ActionKind.Scroll:
                 args["delta"] = a.Delta ?? -120; break;

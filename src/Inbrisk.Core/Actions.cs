@@ -5,6 +5,9 @@ public enum ActionKind
     Click, RightClick, DoubleClick, MiddleClick, Drag, Scroll, MouseMove,
     Invoke, SetValue, Toggle, Select, Expand, Collapse, ScrollIntoView,
     TypeText, KeyPress, Hotkey,
+    /// <summary>Relative mouse movement (args dx, dy) into the targeted window —
+    /// camera look for games that capture the cursor.</summary>
+    MouseLook,
     FocusWindow, FocusElement, ClipboardRead, ClipboardWrite,
     /// <summary>Graceful window close (WM_CLOSE). The tool layer's
     /// provenance gates still decide whether a close is allowed — this is

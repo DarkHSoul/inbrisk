@@ -165,7 +165,8 @@ public sealed class Executor
                     ?? throw new InbriskException(ErrorCode.NotFound, $"window 0x{wh:X} not found");
                 targetDesc = $"window '{window.Title}'";
             }
-            else if (intent.Kind is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText)
+            else if (intent.Kind is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText
+                or ActionKind.MouseLook)
             {
                 window = _windows.GetForegroundWindow();
                 if (window != null) targetDesc = $"foreground window '{window.Title}'";
@@ -174,7 +175,7 @@ public sealed class Executor
             // no target at all) is delivered to whatever has focus —
             // the policy/danger checks must evaluate THAT window
             if (window == null && element == null && intent.Kind is ActionKind.KeyPress
-                or ActionKind.Hotkey or ActionKind.TypeText)
+                or ActionKind.Hotkey or ActionKind.TypeText or ActionKind.MouseLook)
             {
                 window = _windows.GetForegroundWindow();
                 if (window != null && targetDesc == "")
@@ -565,6 +566,30 @@ public sealed class Executor
                 var key = ParseKey(intent.Args);
                 var count = Math.Clamp(
                     Convert.ToInt32(intent.Args?.TryGetValue("count", out var c) == true ? c : 1), 1, 200);
+                // holdMs > 0: key DOWN, wait, key UP — games read held state
+                // per tick, so an instant tap barely registers. Bounded so a
+                // plan can never hold input for long: ≤10 s per hold, ≤30 s
+                // total. The key is always released, even on cancel.
+                var holdMs = Math.Clamp(
+                    Convert.ToInt32(intent.Args?.TryGetValue("holdMs", out var hm) == true ? hm : 0),
+                    0, 10_000);
+                if (holdMs > 0)
+                {
+                    count = Math.Min(count, Math.Max(1, 30_000 / holdMs));
+                    attempts.Add(Do(() =>
+                    {
+                        for (var i = 0; i < count; i++)
+                        {
+                            ct.ThrowIfCancellationRequested();
+                            _input.KeyDown(key);
+                            try { ct.WaitHandle.WaitOne(holdMs); }
+                            finally { _input.KeyUp(key); }
+                            ct.ThrowIfCancellationRequested();
+                            if (i + 1 < count) ct.WaitHandle.WaitOne(30);
+                        }
+                    }, BackendId.Win32, "SendInput.keyhold"));
+                    return Ok(BackendId.Win32, "SendInput.keyhold", attempts, sw);
+                }
                 attempts.Add(Do(() =>
                 {
                     for (var i = 0; i < count; i++)
@@ -575,6 +600,22 @@ public sealed class Executor
                     }
                 }, BackendId.Win32, "SendInput.key"));
                 return Ok(BackendId.Win32, "SendInput.key", attempts, sw);
+            }
+
+            case ActionKind.MouseLook:
+            {
+                // relative pointer motion into the targeted (or foreground)
+                // window — the focus guard keeps it from landing elsewhere
+                if (window != null) GuardFocus(window, attempts);
+                var dx = Math.Clamp(
+                    Convert.ToInt32(intent.Args?.TryGetValue("dx", out var ldx) == true ? ldx : 0),
+                    -4000, 4000);
+                var dy = Math.Clamp(
+                    Convert.ToInt32(intent.Args?.TryGetValue("dy", out var ldy) == true ? ldy : 0),
+                    -4000, 4000);
+                attempts.Add(Do(() => _input.MoveMouseRelative(dx, dy),
+                    BackendId.Win32, "SendInput.look"));
+                return Ok(BackendId.Win32, "SendInput.look", attempts, sw);
             }
 
             case ActionKind.Hotkey:

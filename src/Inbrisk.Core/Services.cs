@@ -114,6 +114,10 @@ public interface IInputService
     void KeyPress(KeyCode key);
     void KeyDown(KeyCode key);
     void KeyUp(KeyCode key);
+    /// <summary>Relative pointer movement in raw counts. Backends that cannot
+    /// do it keep this default and the action fails as unsupported.</summary>
+    void MoveMouseRelative(int dx, int dy) =>
+        throw new NotSupportedException("relative mouse movement is not supported by this input backend");
     void Hotkey(IReadOnlyList<KeyCode> modifiers, KeyCode key);
     void TypeText(string text);
     (int X, int Y) CursorPosition();

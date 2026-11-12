@@ -195,7 +195,8 @@ public sealed class ConfirmChannel
     private DateTimeOffset _promptUnusableUntil;
 
     private static bool IsGrantableKind(ActionKind k) =>
-        k is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText;
+        k is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText
+            or ActionKind.MouseLook;
 
     /// <summary>Live grants, for a local surface to list.</summary>
     public IReadOnlyList<WindowGrant> WindowGrants

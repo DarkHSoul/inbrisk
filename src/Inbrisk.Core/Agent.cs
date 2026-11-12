@@ -14,6 +14,9 @@ public enum AgentActionKind
     Click, RightClick, DoubleClick, Drag, Scroll, Hover,
     Invoke, SetValue, Toggle, Select, ScrollIntoView,
     Type, Key, Hotkey,
+    /// <summary>Relative mouse movement (camera look in games that capture
+    /// the cursor) — dx/dy in raw mouse counts.</summary>
+    Look,
     FocusWindow, FocusElement,
     Wait, WaitFor, WaitForChange, WaitForStable,
     Finish,
@@ -55,16 +58,20 @@ public sealed record AgentAction(
     /// <summary>Deliver via background window messages instead of
     /// foreground SendInput — no focus theft. All safety gates still
     /// apply; unsupported kinds return NotSupported.</summary>
-    bool Silent = false)
+    bool Silent = false,
+    /// <summary>look: relative mouse delta in raw counts (x right+, y down+).</summary>
+    int? Dx = null,
+    int? Dy = null)
 {
     public string Summary() => Kind switch
     {
+        AgentActionKind.Look => $"look({Dx ?? 0},{Dy ?? 0})",
         AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick
             or AgentActionKind.Invoke or AgentActionKind.Toggle or AgentActionKind.Select
             or AgentActionKind.ScrollIntoView
             => $"{Kind.ToString().ToLower()}({ElementId ?? (Point != null ? $"img:{Point.X},{Point.Y}@{Point.FrameId}" : "?")})",
         AgentActionKind.SetValue or AgentActionKind.Type => $"{Kind.ToString().ToLower()}({ElementId ?? "focus"}, \"{Short(Text)}\")",
-        AgentActionKind.Key => $"key({Key}{Mods()})",
+        AgentActionKind.Key => $"key({Key}{Mods()}{(Ms is > 0 ? $", hold {Ms}ms" : "")})",
         AgentActionKind.Hotkey => $"hotkey({Key}{Mods()})",
         AgentActionKind.Scroll => $"scroll({Delta ?? -120}@{ElementId ?? "pt"})",
         AgentActionKind.Drag => $"drag({ElementId ?? "pt"} -> {(To != null ? $"img:{To.X},{To.Y}" : "?")})",
