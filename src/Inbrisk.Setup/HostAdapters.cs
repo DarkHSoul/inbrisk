@@ -40,7 +40,9 @@ public static class PathSearch
         foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "")
             .Split(';', StringSplitOptions.RemoveEmptyEntries))
         {
-            foreach (var ext in new[] { "", ".exe", ".cmd", ".bat" })
+            // No bare "" entry: npm drops an extensionless shell shim next to
+            // name.cmd, and Windows cannot execute it (Win32Exception 193).
+            foreach (var ext in new[] { ".exe", ".cmd", ".bat" })
             {
                 var p = Path.Combine(dir.Trim(), name + ext);
                 if (File.Exists(p)) return p;
@@ -57,7 +59,13 @@ public static class PathSearch
             RedirectStandardOutput = true, RedirectStandardError = true,
             UseShellExecute = false, CreateNoWindow = true,
         };
-        using var p = Process.Start(psi)!;
+        Process p;
+        try { p = Process.Start(psi)!; }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            return (-1, "", $"could not start '{file}': {ex.Message}");
+        }
+        using var _ = p;
         var so = p.StandardOutput.ReadToEndAsync();
         var se = p.StandardError.ReadToEndAsync();
         if (!p.WaitForExit(timeoutMs))
