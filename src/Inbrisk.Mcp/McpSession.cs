@@ -719,6 +719,8 @@ public sealed class McpSession : IDisposable
         if (e.Kind == EventKind.WindowClosed && e.Hwnd.HasValue)
         {
             HwndMetadata.InvalidateHwnd(e.Hwnd.Value);
+            // a per-window input grant lives exactly as long as its window
+            Confirm.RevokeWindow(e.Hwnd.Value);
         }
 
         if (e.Kind == EventKind.ForegroundChanged && e.Hwnd.HasValue)

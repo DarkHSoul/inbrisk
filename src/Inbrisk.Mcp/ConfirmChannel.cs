@@ -91,8 +91,173 @@ public sealed class ConfirmChannel
     /// otherwise register/refresh the pending and refuse. The request path
     /// (tool arguments, run options, flags) is never read here.</summary>
     private bool Gate(ActionIntent intent, UiElement? element, WindowInfo? window, bool dangerous)
-        => GateCore(Fingerprint(intent, element, window),
+    {
+        // Per-window keyboard grant: never for dangerous classes (shell
+        // input, destructive chords) — those keep demanding a one-shot
+        // local approval.
+        if (!dangerous)
+        {
+            if (TryUseWindowGrant(intent, window)) return true;
+            if (TryPromptWindowGrant(intent, window)) return true;
+        }
+        return GateCore(Fingerprint(intent, element, window),
             Summarize(intent, element, window), dangerous);
+    }
+
+    // ---------------- per-window input grants ----------------
+    // A grant lets keyboard-class input into ONE window pass the CONFIRM
+    // gate until that window closes. It is minted only by the user's answer
+    // to an MCP elicitation request (the client renders it to the human; the
+    // model never sees or answers it) — never by tool arguments. A grant is
+    // bound to hwnd + pid + process start time so a recycled handle or pid
+    // cannot inherit it, and it dies with the window.
+
+    /// <summary>Show-the-user callback: true = allowed, false = declined,
+    /// null = no elicitation channel (client lacks the capability).</summary>
+    public Func<string, CancellationToken, Task<bool?>>? WindowConsentPrompt { get; set; }
+
+    public sealed class WindowGrant
+    {
+        public long Hwnd { get; init; }
+        public int Pid { get; init; }
+        public long ProcessStartTicks { get; init; }
+        public string? ProcessName { get; init; }
+        public DateTimeOffset GrantedAt { get; init; }
+        public int Uses;
+    }
+
+    private readonly Dictionary<long, WindowGrant> _windowGrants = new();
+    private readonly Dictionary<long, DateTimeOffset> _windowDeclined = new();
+    private readonly object _promptGate = new();
+    private static readonly TimeSpan DeclineCooldown = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan PromptTimeout = TimeSpan.FromSeconds(90);
+
+    private static bool IsGrantableKind(ActionKind k) =>
+        k is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText;
+
+    /// <summary>Live grants, for a local surface to list.</summary>
+    public IReadOnlyList<WindowGrant> WindowGrants
+    {
+        get { lock (_gate) return _windowGrants.Values.ToArray(); }
+    }
+
+    /// <summary>Drop the grant for a window (it closed, or the user revoked).</summary>
+    public bool RevokeWindow(long hwnd, string why = "window closed")
+    {
+        lock (_gate)
+        {
+            if (!_windowGrants.Remove(hwnd, out var g)) return false;
+            Audit("windowGrantRevoked", null,
+                $"hwnd 0x{hwnd:X} ({g.ProcessName}) — {why}; {g.Uses} use(s)");
+            return true;
+        }
+    }
+
+    private bool GrantStillValid(WindowGrant g, WindowInfo window)
+        => g.Pid == window.Pid
+           && IsWindow(new IntPtr(g.Hwnd))
+           && ProcessStartTicks(window.Pid) == g.ProcessStartTicks;
+
+    private bool TryUseWindowGrant(ActionIntent intent, WindowInfo? window)
+    {
+        if (window == null || !IsGrantableKind(intent.Kind)) return false;
+        lock (_gate)
+        {
+            if (!_windowGrants.TryGetValue(window.Hwnd, out var g)) return false;
+            if (!GrantStillValid(g, window))
+            {
+                RevokeWindow(window.Hwnd, "window gone, or handle/pid reused");
+                return false;
+            }
+            if (Interlocked.Increment(ref g.Uses) == 1)
+                Audit("windowGrantUse", null,
+                    $"first use on hwnd 0x{g.Hwnd:X} ({g.ProcessName}) — {intent.Kind}");
+            return true;
+        }
+    }
+
+    private bool TryPromptWindowGrant(ActionIntent intent, WindowInfo? window)
+    {
+        if (window == null || !IsGrantableKind(intent.Kind)) return false;
+        var prompt = WindowConsentPrompt;
+        if (prompt == null) return false;
+
+        // one prompt at a time; a call queued behind it re-checks the result
+        lock (_promptGate)
+        {
+            lock (_gate)
+            {
+                if (_windowGrants.TryGetValue(window.Hwnd, out var existing)
+                    && GrantStillValid(existing, window)) return true;
+                if (_windowDeclined.TryGetValue(window.Hwnd, out var at)
+                    && DateTimeOffset.UtcNow - at < DeclineCooldown) return false;
+            }
+            var startTicks = ProcessStartTicks(window.Pid);
+            if (startTicks == 0) return false; // cannot bind the grant safely
+
+            var msg = $"Allow keyboard input into the window \"{Clean(window.Title, 60)}\" " +
+                      $"({Clean(window.ProcessName, 30)}) until that window is closed? " +
+                      "Only this window is covered. Shells, passwords and " +
+                      "destructive shortcuts still ask separately.";
+            bool? answer;
+            try
+            {
+                using var cts = new CancellationTokenSource(PromptTimeout);
+                answer = Task.Run(() => prompt(msg, cts.Token), cts.Token)
+                    .GetAwaiter().GetResult();
+            }
+            catch { answer = null; }
+
+            lock (_gate)
+            {
+                if (answer == true)
+                {
+                    _windowDeclined.Remove(window.Hwnd);
+                    _windowGrants[window.Hwnd] = new WindowGrant
+                    {
+                        Hwnd = window.Hwnd,
+                        Pid = window.Pid,
+                        ProcessStartTicks = startTicks,
+                        ProcessName = window.ProcessName,
+                        GrantedAt = DateTimeOffset.UtcNow,
+                    };
+                    Audit("windowGrant", null,
+                        $"user allowed keyboard input into hwnd 0x{window.Hwnd:X} " +
+                        $"({window.ProcessName}) until it closes");
+                    return true;
+                }
+                if (answer == false)
+                {
+                    _windowDeclined[window.Hwnd] = DateTimeOffset.UtcNow;
+                    Audit("windowGrantDeclined", null,
+                        $"user declined hwnd 0x{window.Hwnd:X} ({window.ProcessName})");
+                }
+                return false;
+            }
+        }
+    }
+
+    private static long ProcessStartTicks(int pid)
+    {
+        try
+        {
+            using var p = System.Diagnostics.Process.GetProcessById(pid);
+            return p.StartTime.ToUniversalTime().Ticks;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>Window titles are screen-supplied data: strip control
+    /// characters and quotes and bound the length before showing them.</summary>
+    private static string Clean(string? s, int n)
+    {
+        if (string.IsNullOrEmpty(s)) return "?";
+        var t = new string(s.Where(c => !char.IsControl(c) && c != '"').ToArray());
+        return t.Length > n ? t[..n] + "…" : t;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool IsWindow(IntPtr hWnd);
 
     /// <summary>Shared gate body: approved+fingerprint+live → consume once;
     /// otherwise register/refresh the pending and refuse.</summary>

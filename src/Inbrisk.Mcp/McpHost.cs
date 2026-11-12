@@ -307,6 +307,26 @@ public static class McpHost
                 // events as MCP notifications during long-running calls
                 session?.BindNotifications((m, p, c) =>
                     req.Server.SendNotificationAsync(m, p, cancellationToken: c));
+                // Per-window input consent: ask the HUMAN through MCP
+                // elicitation (the client renders it; the model cannot
+                // answer). Only wired when the client advertises the
+                // capability; INBRISK_NO_ELICIT=1 opts out.
+                if (session != null && string.IsNullOrEmpty(
+                        Environment.GetEnvironmentVariable("INBRISK_NO_ELICIT")))
+                {
+                    var server = req.Server;
+                    session.Confirm.WindowConsentPrompt = async (msg, c) =>
+                    {
+                        if (server.ClientCapabilities?.Elicitation == null) return null;
+                        var r = await server.ElicitAsync(new ElicitRequestParams
+                        {
+                            Message = msg,
+                            RequestedSchema = new ElicitRequestParams.RequestSchema(),
+                        }, c);
+                        return string.Equals(r.Action, "accept",
+                            StringComparison.OrdinalIgnoreCase);
+                    };
+                }
                 var callStarted = DateTimeOffset.UtcNow;
                 // F04: client arguments may only *claim* an approval id —
                 // a string id marks an already-locally-approved pending as
