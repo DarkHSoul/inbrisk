@@ -27,6 +27,8 @@ public sealed class TrayIconService : IDisposable
     private const uint CmdPreviewHud = 2007;
     private const uint CmdApproveBase = 2100;
     private const uint CmdDenyBase = 2200;
+    private const uint CmdAllowWindowBase = 2300;
+    private const uint CmdRevokeGrantBase = 2400;
     private const int MaxMenuPendings = 8;
 
     private readonly object _gate = new();
@@ -69,7 +71,19 @@ public sealed class TrayIconService : IDisposable
     /// <summary>A confirmation request waiting on local consent — the tray
     /// menu renders approve/deny items for each entry. Defined here (not
     /// in Inbrisk.Mcp) so this assembly stays free of MCP types.</summary>
-    public sealed record PendingApprovalItem(string Id, string Summary, bool Dangerous);
+    public sealed record PendingApprovalItem(string Id, string Summary, bool Dangerous,
+        bool CanAllowWindow = false);
+
+    /// <summary>An active per-window keyboard grant, listed so the user can
+    /// revoke it before the window closes.</summary>
+    public sealed record WindowGrantItem(long Hwnd, string Label);
+
+    public Func<IReadOnlyList<WindowGrantItem>>? WindowGrants { get; set; }
+    /// <summary>Local gesture: allow the pending request's whole window
+    /// until it closes. Must call ConfirmChannel.ApproveWindowLocal.</summary>
+    public Action<string>? OnAllowWindowPending { get; set; }
+    public Action<long>? OnRevokeWindowGrant { get; set; }
+    private readonly List<long> _menuGrantHwnds = new();
 
     /// <summary>Local-consent surface hook: supplies the pending approvals
     /// to render in the context menu. Wired by the MCP host to the
@@ -467,12 +481,34 @@ public sealed class TrayIconService : IDisposable
                         (UIntPtr)0, $"{tag}{label}");
                     NativeMethods.AppendMenuW(sub, NativeMethods.MF_STRING,
                         (UIntPtr)(CmdApproveBase + shown), "   ✓ Onayla (Approve)");
+                    if (p.CanAllowWindow)
+                        NativeMethods.AppendMenuW(sub, NativeMethods.MF_STRING,
+                            (UIntPtr)(CmdAllowWindowBase + shown),
+                            "   ✓✓ Bu pencere kapanana kadar izin ver (Allow this window until closed)");
                     NativeMethods.AppendMenuW(sub, NativeMethods.MF_STRING,
                         (UIntPtr)(CmdDenyBase + shown), "   ✗ Reddet (Deny)");
                     shown++;
                 }
                 NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | NativeMethods.MF_POPUP,
                     (UIntPtr)sub, $"⏳ Bekleyen onaylar ({pendings.Count})");
+            }
+
+            // active per-window keyboard grants — revocable before the window closes
+            _menuGrantHwnds.Clear();
+            IReadOnlyList<WindowGrantItem>? grants = null;
+            try { grants = WindowGrants?.Invoke(); } catch { }
+            if (grants is { Count: > 0 })
+            {
+                var gsub = NativeMethods.CreatePopupMenu();
+                foreach (var g in grants.Take(MaxMenuPendings))
+                {
+                    _menuGrantHwnds.Add(g.Hwnd);
+                    NativeMethods.AppendMenuW(gsub, NativeMethods.MF_STRING,
+                        (UIntPtr)(CmdRevokeGrantBase + (uint)(_menuGrantHwnds.Count - 1)),
+                        $"   ✗ İzni kaldır (Revoke): {g.Label}");
+                }
+                NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_STRING | NativeMethods.MF_POPUP,
+                    (UIntPtr)gsub, $"🔓 Pencere izinleri ({grants.Count})");
             }
 
             NativeMethods.AppendMenuW(hMenu, NativeMethods.MF_SEPARATOR, (UIntPtr)0, null);
@@ -506,6 +542,24 @@ public sealed class TrayIconService : IDisposable
             if (idx < _menuPendingIds.Count)
             {
                 try { OnApprovePending?.Invoke(_menuPendingIds[idx]); } catch { }
+            }
+            return;
+        }
+        if (cmd >= CmdAllowWindowBase && cmd < CmdAllowWindowBase + MaxMenuPendings)
+        {
+            var idx = (int)(cmd - CmdAllowWindowBase);
+            if (idx < _menuPendingIds.Count)
+            {
+                try { OnAllowWindowPending?.Invoke(_menuPendingIds[idx]); } catch { }
+            }
+            return;
+        }
+        if (cmd >= CmdRevokeGrantBase && cmd < CmdRevokeGrantBase + MaxMenuPendings)
+        {
+            var idx = (int)(cmd - CmdRevokeGrantBase);
+            if (idx < _menuGrantHwnds.Count)
+            {
+                try { OnRevokeWindowGrant?.Invoke(_menuGrantHwnds[idx]); } catch { }
             }
             return;
         }

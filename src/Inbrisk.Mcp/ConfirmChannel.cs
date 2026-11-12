@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -50,6 +51,11 @@ public sealed class ConfirmChannel
         /// <summary>The client echoed this id on a retry — observational
         /// only; approval state never depends on it.</summary>
         public bool ClientClaimed { get; internal set; }
+        /// <summary>The window a keyboard-class request targeted — lets a
+        /// LOCAL surface approve "this window until it closes" instead of
+        /// just this one action. Null for non-grantable requests.</summary>
+        internal WindowInfo? GrantWindow { get; set; }
+        public bool CanAllowWindow => GrantWindow != null;
     }
 
     /// <summary>How long a pending request stays live before it must be
@@ -100,8 +106,61 @@ public sealed class ConfirmChannel
             if (TryUseWindowGrant(intent, window)) return true;
             if (TryPromptWindowGrant(intent, window)) return true;
         }
-        return GateCore(Fingerprint(intent, element, window),
-            Summarize(intent, element, window), dangerous);
+        var fp = Fingerprint(intent, element, window);
+        var ok = GateCore(fp, Summarize(intent, element, window), dangerous);
+        if (!ok && !dangerous && window != null && IsGrantableKind(intent.Kind))
+        {
+            // remember which window this pending is about so the local
+            // consent surface can offer "allow this window until closed"
+            lock (_gate)
+            {
+                var p = _pending.FirstOrDefault(x =>
+                    x.Fingerprint == fp && !x.Consumed && !x.DeniedByUser);
+                if (p != null) p.GrantWindow = window;
+            }
+        }
+        return ok;
+    }
+
+    /// <summary>LOCAL consent surface only (tray): approve a pending
+    /// keyboard request as a grant for its whole window, until that window
+    /// closes. Never bind this to a tool, notification or request argument.</summary>
+    public bool ApproveWindowLocal(string approvalId)
+    {
+        lock (_gate)
+        {
+            var p = Find(approvalId);
+            if (p is not { Consumed: false, DeniedByUser: false, Dangerous: false }
+                || p.GrantWindow is not { } w
+                || p.ExpiresAt <= DateTimeOffset.UtcNow)
+            {
+                Audit("approveRejected", p,
+                    "window approval for unknown/expired/ineligible id — refused");
+                return false;
+            }
+            var startTicks = ProcessStartTicks(w.Pid);
+            if (startTicks == 0 || !IsWindow(new IntPtr(w.Hwnd)))
+            {
+                Audit("approveRejected", p, "window gone or process unreadable — refused");
+                return false;
+            }
+            _windowDeclined.Remove(w.Hwnd);
+            _windowGrants[w.Hwnd] = new WindowGrant
+            {
+                Hwnd = w.Hwnd,
+                Pid = w.Pid,
+                ProcessStartTicks = startTicks,
+                ProcessName = w.ProcessName,
+                GrantedAt = DateTimeOffset.UtcNow,
+            };
+            // the grant supersedes every pending for this window
+            foreach (var other in _pending.Where(x => x.GrantWindow?.Hwnd == w.Hwnd))
+                other.Consumed = true;
+            Audit("windowGrant", p,
+                $"LOCAL consent surface allowed keyboard input into hwnd " +
+                $"0x{w.Hwnd:X} ({w.ProcessName}) until it closes");
+            return true;
+        }
     }
 
     // ---------------- per-window input grants ----------------
@@ -131,6 +190,9 @@ public sealed class ConfirmChannel
     private readonly object _promptGate = new();
     private static readonly TimeSpan DeclineCooldown = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan PromptTimeout = TimeSpan.FromSeconds(90);
+    private const long MinHumanAnswerMs = 300;
+    private static readonly TimeSpan PromptUnusableFor = TimeSpan.FromMinutes(10);
+    private DateTimeOffset _promptUnusableUntil;
 
     private static bool IsGrantableKind(ActionKind k) =>
         k is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText;
@@ -181,6 +243,10 @@ public sealed class ConfirmChannel
         if (window == null || !IsGrantableKind(intent.Kind)) return false;
         var prompt = WindowConsentPrompt;
         if (prompt == null) return false;
+        lock (_gate)
+        {
+            if (DateTimeOffset.UtcNow < _promptUnusableUntil) return false;
+        }
 
         // one prompt at a time; a call queued behind it re-checks the result
         lock (_promptGate)
@@ -200,6 +266,7 @@ public sealed class ConfirmChannel
                       "Only this window is covered. Shells, passwords and " +
                       "destructive shortcuts still ask separately.";
             bool? answer;
+            var sw = Stopwatch.StartNew();
             try
             {
                 using var cts = new CancellationTokenSource(PromptTimeout);
@@ -207,6 +274,23 @@ public sealed class ConfirmChannel
                     .GetAwaiter().GetResult();
             }
             catch { answer = null; }
+            sw.Stop();
+
+            // A human cannot decline in a fraction of a second: an instant
+            // "no" means the client auto-answered without showing anything.
+            // Don't record that as the user's choice, and stop asking for a
+            // while — the local (tray) surface remains available.
+            if (answer == false && sw.ElapsedMilliseconds < MinHumanAnswerMs)
+            {
+                lock (_gate)
+                {
+                    _promptUnusableUntil = DateTimeOffset.UtcNow + PromptUnusableFor;
+                    Audit("windowGrantPromptNotShown", null,
+                        $"client answered in {sw.ElapsedMilliseconds} ms — treated as " +
+                        "not displayed; elicitation paused, use the tray to allow a window");
+                }
+                return false;
+            }
 
             lock (_gate)
             {

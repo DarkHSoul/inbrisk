@@ -28,15 +28,17 @@ public sealed class WindowInputGrantTests
 
     private static ActionIntent Key() => new(ActionKind.KeyPress, TargetRef.At(0, 0));
 
-    private static ConfirmChannel Channel(Func<bool?> answer, out int[] prompts)
+    private static ConfirmChannel Channel(Func<bool?> answer, out int[] prompts,
+        int delayMs = 0)
     {
         var count = new int[1];
         prompts = count;
         var ch = new ConfirmChannel("test");
-        ch.WindowConsentPrompt = (_, _) =>
+        ch.WindowConsentPrompt = async (_, _) =>
         {
             Interlocked.Increment(ref count[0]);
-            return Task.FromResult(answer());
+            if (delayMs > 0) await Task.Delay(delayMs);
+            return answer();
         };
         return ch;
     }
@@ -65,10 +67,50 @@ public sealed class WindowInputGrantTests
     [Fact]
     public void Decline_denies_and_does_not_reprompt_during_cooldown()
     {
-        var ch = Channel(() => false, out var prompts);
+        var ch = Channel(() => false, out var prompts, delayMs: 400); // human-speed "no"
         Assert.False(ch.Confirmer(Key(), null, Win(HwndA)));
         Assert.False(ch.Confirmer(Key(), null, Win(HwndA)));
         Assert.Equal(1, prompts[0]);
+        Assert.Empty(ch.WindowGrants);
+    }
+
+    [Fact]
+    public void Instant_client_decline_is_not_a_user_choice_and_pauses_prompting()
+    {
+        var ch = Channel(() => false, out var prompts); // answers in ~0 ms
+        Assert.False(ch.Confirmer(Key(), null, Win(HwndA)));
+        Assert.False(ch.Confirmer(Key(), null, Win(HwndB)));
+        Assert.Equal(1, prompts[0]); // prompting paused after the first instant answer
+    }
+
+    [Fact]
+    public void Tray_can_allow_a_pending_window_until_it_closes()
+    {
+        var ch = new ConfirmChannel("test"); // no elicitation channel at all
+        Assert.False(ch.Confirmer(Key(), null, Win(HwndA)));
+        var pending = Assert.Single(ch.Pending);
+        Assert.True(pending.CanAllowWindow);
+
+        Assert.True(ch.ApproveWindowLocal(pending.Id));
+        Assert.True(ch.Confirmer(Key(), null, Win(HwndA)));
+        Assert.True(ch.Confirmer(
+            new ActionIntent(ActionKind.Hotkey, TargetRef.At(0, 0)), null, Win(HwndA)));
+        Assert.Empty(ch.Pending);
+
+        Assert.False(ch.Confirmer(Key(), null, Win(HwndB))); // other window still gated
+        Assert.True(ch.RevokeWindow(HwndA, "test"));
+        Assert.False(ch.Confirmer(Key(), null, Win(HwndA)));
+    }
+
+    [Fact]
+    public void Tray_window_approval_refuses_dangerous_and_unknown_ids()
+    {
+        var ch = new ConfirmChannel("test");
+        Assert.False(ch.LocalConsent(Key(), null, Win(HwndA)));
+        var dangerous = Assert.Single(ch.Pending);
+        Assert.False(dangerous.CanAllowWindow);
+        Assert.False(ch.ApproveWindowLocal(dangerous.Id));
+        Assert.False(ch.ApproveWindowLocal("appr_doesnotexist"));
         Assert.Empty(ch.WindowGrants);
     }
 

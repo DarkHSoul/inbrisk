@@ -250,8 +250,21 @@ public static class McpHost
             var session = app.Services.GetRequiredService<McpSession>();
             tray.PendingApprovals = () => session.Confirm.Pending
                 .Select(p => new TrayIconService.PendingApprovalItem(
-                    p.Id, p.Summary, p.Dangerous))
+                    p.Id, p.Summary, p.Dangerous, p.CanAllowWindow))
                 .ToArray();
+            // "allow this window until it closes" — LOCAL gesture only
+            tray.OnAllowWindowPending = id =>
+            {
+                try { session.Confirm.ApproveWindowLocal(id); } catch { }
+            };
+            tray.WindowGrants = () => session.Confirm.WindowGrants
+                .Select(g => new TrayIconService.WindowGrantItem(
+                    g.Hwnd, $"{g.ProcessName} (0x{g.Hwnd:X})"))
+                .ToArray();
+            tray.OnRevokeWindowGrant = hwnd =>
+            {
+                try { session.Confirm.RevokeWindow(hwnd, "revoked from tray"); } catch { }
+            };
             tray.OnApprovePending = id =>
             {
                 try { session.Confirm.ApproveLocal(id); } catch { }
@@ -323,8 +336,12 @@ public static class McpHost
                             Message = msg,
                             RequestedSchema = new ElicitRequestParams.RequestSchema(),
                         }, c);
-                        return string.Equals(r.Action, "accept",
-                            StringComparison.OrdinalIgnoreCase);
+                        if (string.Equals(r.Action, "accept",
+                                StringComparison.OrdinalIgnoreCase)) return true;
+                        // "decline" is a choice; "cancel"/anything else means
+                        // the user never answered
+                        return string.Equals(r.Action, "decline",
+                            StringComparison.OrdinalIgnoreCase) ? false : null;
                     };
                 }
                 var callStarted = DateTimeOffset.UtcNow;
