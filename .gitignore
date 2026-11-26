@@ -67,3 +67,9 @@ target/
 
 # Local build / test output
 out/
+.tmp/
+
+# Generated dumps & probe outputs
+inbrisk_full_dump.md
+_raw_tools_list.json
+_pretty_tools_list.json

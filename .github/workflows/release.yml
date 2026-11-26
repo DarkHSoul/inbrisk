@@ -1,0 +1,202 @@
+name: Test, Sign & Release
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v0.1.0-alpha.1). Leave empty to auto-derive from tag/CHANGELOG.'
+        required: false
+        default: ''
+      ui_access:
+        description: 'Build with uiAccess="true" manifest (requires signing secrets)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Build & Tier 1 Tests
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore & Build (Release)
+        run: dotnet build inbrisk.sln -c Release
+
+      - name: Run Tier 1 Headless Tests
+        run: |
+          dotnet test tests/Inbrisk.Tests/Inbrisk.Tests.csproj -c Release --no-build `
+            --filter "Category!=Desktop&Category!=GhostInteractive&Category!=Benchmark" `
+            --logger "trx;LogFileName=tier1-results.trx" `
+            --results-directory TestResults
+
+      - name: Upload Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier1-test-results
+          path: TestResults/**/*.trx
+          retention-days: 14
+
+  build-sign-release:
+    name: Publish, Sign & Release Setup
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - name: Checkout (full history for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $isccDir = "${env:ProgramFiles(x86)}\Inno Setup 6"
+          if (Test-Path $isccDir) {
+            Add-Content -Path $env:GITHUB_PATH -Value $isccDir
+          }
+
+      - name: Determine Version & Prerelease Flag
+        id: meta
+        shell: pwsh
+        run: |
+          $raw = "${{ github.event.inputs.version }}"
+          if ([string]::IsNullOrWhiteSpace($raw)) {
+            if ("${{ github.ref_type }}" -eq "tag") {
+              $raw = "${{ github.ref_name }}"
+            } elseif (Test-Path CHANGELOG.md) {
+              $m = Select-String -Path CHANGELOG.md -Pattern '^## \[(v?[^\]]+)\]' | Select-Object -First 1
+              if ($m) { $raw = $m.Matches[0].Groups[1].Value }
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($raw)) {
+            $raw = "v0.1.0-alpha.1"
+          }
+          $tag = if ($raw.StartsWith('v')) { $raw } else { "v$raw" }
+          $semver = $tag.TrimStart('v')
+          $numericVersion = ($semver -split '-')[0]
+          $isPrerelease = ($tag -match '-(alpha|beta|rc)') ? 'true' : 'false'
+
+          # For normal branch pushes (non-tag), publish/update a rolling prerelease tag unless explicitly tagged
+          if ("${{ github.ref_type }}" -ne "tag" -and [string]::IsNullOrWhiteSpace("${{ github.event.inputs.version }}")) {
+            $isPrerelease = 'true'
+          }
+
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "semver=$semver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "numeric_version=$numericVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "prerelease=$isPrerelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Release Tag: $tag (Numeric: $numericVersion, Prerelease: $isPrerelease)"
+
+      - name: Prepare Signing Material (if configured)
+        id: signprep
+        shell: pwsh
+        env:
+          INBRISK_SIGN_PFX_B64: ${{ secrets.INBRISK_SIGN_PFX_B64 }}
+          INBRISK_SIGN_PFX_PASSWORD: ${{ secrets.INBRISK_SIGN_PFX_PASSWORD }}
+          INBRISK_AZURE_SIGNING_METADATA_B64: ${{ secrets.INBRISK_AZURE_SIGNING_METADATA_B64 }}
+        run: |
+          $canSign = $false
+          if (-not [string]::IsNullOrWhiteSpace($env:INBRISK_SIGN_PFX_B64)) {
+            $pfxPath = Join-Path $env:RUNNER_TEMP "inbrisk-sign.pfx"
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:INBRISK_SIGN_PFX_B64))
+            "INBRISK_SIGN_PFX=$pfxPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $canSign = $true
+            Write-Host "PFX signing certificate loaded."
+          } elseif (-not [string]::IsNullOrWhiteSpace($env:INBRISK_AZURE_SIGNING_METADATA_B64)) {
+            $metaPath = Join-Path $env:RUNNER_TEMP "azure-signing-metadata.json"
+            [IO.File]::WriteAllBytes($metaPath, [Convert]::FromBase64String($env:INBRISK_AZURE_SIGNING_METADATA_B64))
+            "INBRISK_AZURE_SIGNING_METADATA=$metaPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+            $canSign = $true
+            Write-Host "Azure Trusted Signing metadata loaded."
+          } else {
+            Write-Warning "No Authenticode signing secrets configured (INBRISK_SIGN_PFX_B64 or INBRISK_AZURE_SIGNING_METADATA_B64). Building unsigned release."
+          }
+          "enabled=$($canSign.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Publish, Sign & Build Setup.exe
+        shell: pwsh
+        env:
+          INBRISK_SIGN_PFX_PASSWORD: ${{ secrets.INBRISK_SIGN_PFX_PASSWORD }}
+        run: |
+          $argsList = @('-Version', '${{ steps.meta.outputs.numeric_version }}')
+          if ('${{ steps.signprep.outputs.enabled }}' -eq 'true') {
+            $argsList += '-Sign'
+            if ('${{ github.event.inputs.ui_access }}' -eq 'true') {
+              $argsList += '-UiAccess'
+            }
+          }
+          & .\tools\publish.ps1 @argsList
+
+      - name: Generate SHA256 Checksums
+        shell: pwsh
+        run: |
+          $relDir = "artifacts/release"
+          $files = Get-ChildItem $relDir -File | Where-Object { $_.Extension -in '.exe','.zip','.json' }
+          $lines = foreach ($f in $files) {
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$h  $($f.Name)"
+          }
+          $lines | Set-Content -Path (Join-Path $relDir "SHA256SUMS.txt") -Encoding UTF8
+
+      - name: Extract Changelog Notes
+        shell: pwsh
+        run: |
+          $tag = '${{ steps.meta.outputs.tag }}'
+          $notesPath = Join-Path $env:RUNNER_TEMP "release-notes.md"
+          $signedBanner = if ('${{ steps.signprep.outputs.enabled }}' -eq 'true') {
+            "> **Authenticode:** Bu sürümdeki `inbrisk.exe` ve `InbriskSetup.exe` dijital olarak imzalanmıştır."
+          } else {
+            "> **Not:** GitHub Secrets üzerinde kod imzalama sertifikası tanımlı olmadığı için bu ön-sürüm imzasız üretildi."
+          }
+
+          $extracted = @()
+          if (Test-Path CHANGELOG.md) {
+            $inSection = $false
+            foreach ($line in Get-Content CHANGELOG.md -Encoding UTF8) {
+              if ($line -match "^## \[$([regex]::Escape($tag))\]") {
+                $inSection = $true
+                continue
+              }
+              if ($inSection -and $line -match '^## \[') { break }
+              if ($inSection) { $extracted += $line }
+            }
+          }
+
+          if ($extracted.Count -eq 0) {
+            $commits = git log -n 15 --pretty=format:"- %s (\`%h\`)"
+            $extracted = @("### Değişiklikler", "") + $commits
+          }
+
+          @($signedBanner, "", ($extracted -join "`n").Trim()) -join "`n" |
+            Set-Content -Path $notesPath -Encoding UTF8
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: Inbrisk ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          body_path: ${{ runner.temp }}/release-notes.md
+          files: |
+            artifacts/release/InbriskSetup*.exe
+            artifacts/release/Inbrisk-*.zip
+            artifacts/release/manifest.json
+            artifacts/release/SHA256SUMS.txt
