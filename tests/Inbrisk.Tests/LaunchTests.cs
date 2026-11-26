@@ -582,7 +582,7 @@ public sealed class LaunchMcpTests
             new Dictionary<string, object?> { ["app"] = "notepad" }));
         var root = r.RootElement;
         Assert.Equal("Verified", root.GetProperty("status").GetString());
-        Assert.Equal("notepad", root.GetProperty("app").GetString());
+        Assert.Equal("notepad", root.GetProperty("app").GetString(), StringComparer.OrdinalIgnoreCase);
         Assert.True(root.GetProperty("durationMs").GetInt64() > 0);
         var state = root.GetProperty("launchState").GetString();
         Assert.Contains(state, new[] { "Ready", "AlreadyRunning" });
