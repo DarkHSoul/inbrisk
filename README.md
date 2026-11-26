@@ -114,8 +114,20 @@ end-to-end driver tests. The MCP entry point is `inbrisk.exe mcp`
 
 See ARCHITECTURE.md for the computer-control design.
 
+## Code Signing Policy
+
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- **Scope:** Official release binaries (`inbrisk.exe`, `InbriskSetup.exe`) are built exclusively from this public repository via GitHub Actions (`.github/workflows/release.yml`) and accompanied by GitHub Build Provenance Attestations and `SHA256SUMS.txt`.
+- **Team & Review:** Committers and approvers are the repository maintainers (`DarkHSoul`).
+- **Privacy:** Inbrisk is a 100% local Windows computer-control MCP server communicating over local stdio / local named pipes. It does not transmit user screen data, keystrokes, or telemetry to any external server.
+
 ## License
 
-Copyright (c) 2026 DarkHSoul. All rights reserved.
+Copyright (c) 2026 DarkHSoul.
 
-This project is licensed under a proprietary / source-available license. See the [LICENSE](LICENSE) file for detailed restrictions and terms. Source is view/review only; distributed binaries (InbriskSetup.exe / inbrisk.exe) may be installed and run for your own internal business or personal use. Unauthorized copying, modification, or redistribution is prohibited. Third-party components are listed in [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**. See the [LICENSE](LICENSE) file for the full license text.
+
+- Anyone using, modifying, or integrating Inbrisk (including over a network/SaaS service) must release their complete corresponding source code under AGPL-3.0.
+- **Commercial / Dual Licensing:** If you wish to embed or redistribute Inbrisk in a proprietary/closed-source product without AGPL-3.0 obligations, please contact the author for a commercial license.
+- Third-party components are listed in [NOTICE](NOTICE) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

@@ -17,6 +17,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   test:
@@ -136,14 +138,16 @@ jobs:
         env:
           INBRISK_SIGN_PFX_PASSWORD: ${{ secrets.INBRISK_SIGN_PFX_PASSWORD }}
         run: |
-          $argsList = @('-Version', '${{ steps.meta.outputs.numeric_version }}')
+          $publishParams = @{
+            Version = '${{ steps.meta.outputs.numeric_version }}'
+          }
           if ('${{ steps.signprep.outputs.enabled }}' -eq 'true') {
-            $argsList += '-Sign'
+            $publishParams.Sign = $true
             if ('${{ github.event.inputs.ui_access }}' -eq 'true') {
-              $argsList += '-UiAccess'
+              $publishParams.UiAccess = $true
             }
           }
-          & .\tools\publish.ps1 @argsList
+          & .\tools\publish.ps1 @publishParams
 
       - name: Generate SHA256 Checksums
         shell: pwsh
@@ -187,6 +191,13 @@ jobs:
 
           @($signedBanner, "", ($extracted -join "`n").Trim()) -join "`n" |
             Set-Content -Path $notesPath -Encoding UTF8
+
+      - name: Attest Build Provenance (GitHub Free SLSA)
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            artifacts/release/InbriskSetup*.exe
+            artifacts/release/Inbrisk-*.zip
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
