@@ -13,6 +13,7 @@ namespace Inbrisk.Tests;
 /// Verifies bounded MTA parallel reading, apartment preservation, cancellation, deterministic aggregation,
 /// authoritative FIFO mutation serialization, DesktopArbiter integration, and starvation-free fairness.
 /// </summary>
+[Trait("Category", "Unit")]
 public sealed class PhaseHRound2ConcurrencyTests
 {
     [Fact]

@@ -20,6 +20,7 @@ namespace Inbrisk.Tests;
 /// 10. Toolset_AnnotationsRemainCorrect: Preserves ReadOnly, Idempotent, and Destructive hints across core & contextual tools.
 /// 11. Toolset_CompatibilityModeRemainsUsable: Legacy compatibility mode provides deterministic usable toolset without flapping.
 /// </summary>
+[Trait("Category", "Contract")]
 public sealed class PhaseHRound5DynamicToolsetTests
 {
     // =========================================================================

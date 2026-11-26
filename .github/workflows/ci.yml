@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tier1-headless:
+    name: Tier 1 — Build & Headless Unit/Contract Tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore inbrisk.sln
+
+      - name: Build solution (Release)
+        run: dotnet build inbrisk.sln -c Release --no-restore --nologo
+
+      - name: Run Tier 1 headless unit and contract tests
+        run: >-
+          dotnet test tests/Inbrisk.Tests/Inbrisk.Tests.csproj
+          -c Release
+          --no-build
+          --nologo
+          --filter "Category!=Desktop&Category!=GhostInteractive&Category!=Benchmark"
+          --collect:"XPlat Code Coverage"
+          --logger "trx;LogFileName=tier1-results.trx"
+          --results-directory out/test-results
+
+      - name: Upload Tier 1 test results and coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier1-test-results
+          path: |
+            out/test-results/**/*.trx
+            out/test-results/**/coverage.cobertura.xml
+          if-no-files-found: warn
+          retention-days: 14

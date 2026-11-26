@@ -9,6 +9,7 @@ namespace Inbrisk.Tests;
 /// Windows runtime underneath (UIA, SendInput, capture, waits) is real.
 /// </summary>
 [Collection("desktop")]
+[Trait("Category", "Desktop")]
 public class AgentTests
 {
     private readonly DesktopFixture _fx;

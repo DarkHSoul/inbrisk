@@ -7,6 +7,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "GhostInteractive")]
+
 public class GhostDesktopCaptureTests
 {
     [Fact]

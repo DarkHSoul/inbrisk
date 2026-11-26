@@ -23,6 +23,7 @@ namespace Inbrisk.Tests;
 /// 9. Stdio output is strictly JSON-RPC protocol clean (logs go to stderr).
 /// 10. Clean daemon shutdown disposes all shared resources.
 /// </summary>
+[Trait("Category", "Contract")]
 public sealed class PhaseHRound1RuntimeProxyTests
 {
     [Fact]

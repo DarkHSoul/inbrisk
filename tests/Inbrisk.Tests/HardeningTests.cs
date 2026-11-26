@@ -15,6 +15,7 @@ namespace Inbrisk.Tests;
 /// Model turns are scripted; everything below is the real Windows runtime.
 /// </summary>
 [Collection("desktop")]
+[Trait("Category", "Desktop")]
 public class HardeningTests
 {
     private readonly DesktopFixture _fx;

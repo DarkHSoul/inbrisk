@@ -116,6 +116,8 @@ public sealed class TestCdpTransport : ICdpTransport
     }
 }
 
+[Trait("Category", "Unit")]
+
 public class PhaseFRound3CdpTests
 {
     // =========================================================================
@@ -1706,6 +1708,7 @@ public class PhaseFRound3CdpTests
     }
 
     [Fact]
+    [Trait("Category", "Desktop")]
     public async Task CdpIntegration_RealWebSocket_ReusesConnectionAcrossReadCommands()
     {
         // Integration test against real Chromium WebSocket if reachable

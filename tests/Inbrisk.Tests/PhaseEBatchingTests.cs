@@ -8,6 +8,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Contract")]
+
 public class PhaseEBatchingTests
 {
     private static UiElement CreateTestElement(string id, long hwnd, int pid, string name, Inbrisk.Core.Role role, string? value = null, bool enabled = true)

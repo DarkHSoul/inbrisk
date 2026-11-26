@@ -13,6 +13,7 @@ namespace Inbrisk.Tests;
 /// the wire.
 /// </summary>
 [Collection("McpStdioProcess")]
+[Trait("Category", "Desktop")]
 public sealed class McpTests
 {
     private static readonly Lazy<DesktopFixture> _fxLazy = new(() => new DesktopFixture());

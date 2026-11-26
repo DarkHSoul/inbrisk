@@ -1,0 +1,56 @@
+name: desktop-e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'Optional xUnit --filter expression (leave empty to run full desktop suite)'
+        required: false
+        default: ''
+        type: string
+      hang_timeout_sec:
+        description: 'Per-test hang timeout in seconds'
+        required: false
+        default: '120'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  tier2-desktop-e2e:
+    name: Tier 2 — Desktop Integration & E2E Tests
+    runs-on: [self-hosted, windows]
+    timeout-minutes: 100
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure output directory exists
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path out | Out-Null
+
+      - name: Run desktop test suite via run_tests.ps1
+        shell: pwsh
+        run: |
+          $args = @('-HangTimeoutSec', '${{ inputs.hang_timeout_sec || 120 }}')
+          $filter = '${{ inputs.filter }}'
+          if (-not [string]::IsNullOrWhiteSpace($filter)) {
+              $args += @('-Filter', $filter)
+          }
+          & .\run_tests.ps1 @args
+
+      - name: Upload desktop test logs and TRX artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier2-desktop-e2e-results-${{ github.run_id }}
+          path: |
+            out/test.out
+            out/test.err
+            out/testrun/**/*.trx
+            out/testrun/**/*.dmp
+            out/testrun/**/*.xml
+          if-no-files-found: warn
+          retention-days: 30

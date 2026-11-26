@@ -14,6 +14,7 @@ namespace Inbrisk.Tests;
 /// spawned unless a test says so. Real-machine integration lives in the
 /// desktop collection further down.
 /// </summary>
+[Trait("Category", "Unit")]
 public sealed class LaunchUnitTests
 {
     private sealed class FakeWindows : IWindowService
@@ -353,6 +354,7 @@ public sealed class LaunchUnitTests
 /// gracefully (e.g. no Calculator package → no-op, not failure).
 /// </summary>
 [Collection("desktop")]
+[Trait("Category", "Desktop")]
 public sealed class LaunchIntegrationTests
 {
     private readonly DesktopFixture _fx;
@@ -511,6 +513,7 @@ public sealed class LaunchIntegrationTests
 /// stop, and the computer_run launch step must bind a usable window scope.
 /// </summary>
 [Collection("McpStdioProcess")]
+[Trait("Category", "Contract")]
 public sealed class LaunchMcpTests
 {
     private static async Task<McpClient> ConnectAsync()

@@ -6,6 +6,7 @@ using Xunit;
 namespace Inbrisk.Tests;
 
 [Collection("desktop")]
+[Trait("Category", "Desktop")]
 public class CaptureTests
 {
     private readonly DesktopFixture _fx;

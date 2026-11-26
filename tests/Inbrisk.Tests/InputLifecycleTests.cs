@@ -12,6 +12,7 @@ namespace Inbrisk.Tests;
 /// fixture-scoped TestApp interactions.
 /// </summary>
 [Collection("desktop")]
+[Trait("Category", "Desktop")]
 public class InputLifecycleTests
 {
     private const int VK_LCTRL = 0xA2, VK_LSHIFT = 0xA0, VK_LBUTTON = 0x01;

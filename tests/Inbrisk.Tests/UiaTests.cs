@@ -4,6 +4,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Desktop")]
+
 public class UiaTests
 {
     private static readonly Lazy<DesktopFixture> _fxLazy = new(() => new DesktopFixture());

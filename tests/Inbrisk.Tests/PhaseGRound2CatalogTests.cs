@@ -12,6 +12,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public sealed class PhaseGRound2CatalogTests : IDisposable
 {
     private readonly string _tempDir;

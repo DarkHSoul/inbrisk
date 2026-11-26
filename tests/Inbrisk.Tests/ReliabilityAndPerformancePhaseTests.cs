@@ -15,6 +15,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Desktop")]
+
 public class ReliabilityAndPerformancePhaseTests
 {
     // =========================================================================
@@ -3096,15 +3098,14 @@ public class ReliabilityAndPerformancePhaseTests
         int pid = 2002;
         var lane = scheduler.GetOrCreateLane(pid);
 
-        try
+        Assert.Throws<InvalidOperationException>((Action)(() =>
         {
             using (scheduler.EnterMutationBarrier(pid))
             {
                 Assert.Equal(1, Volatile.Read(ref lane.ActiveWrites));
                 throw new InvalidOperationException("Simulated mutation failure");
             }
-        }
-        catch (InvalidOperationException) { }
+        }));
 
         // Barrier must be completely clear
         Assert.Equal(0, Volatile.Read(ref lane.ActiveWrites));
@@ -3123,7 +3124,7 @@ public class ReliabilityAndPerformancePhaseTests
         var lane = scheduler.GetOrCreateLane(pid);
         using var cts = new CancellationTokenSource();
 
-        try
+        Assert.Throws<OperationCanceledException>((Action)(() =>
         {
             using (scheduler.EnterMutationBarrier(pid))
             {
@@ -3131,8 +3132,7 @@ public class ReliabilityAndPerformancePhaseTests
                 cts.Cancel();
                 cts.Token.ThrowIfCancellationRequested();
             }
-        }
-        catch (OperationCanceledException) { }
+        }));
 
         Assert.Equal(0, Volatile.Read(ref lane.ActiveWrites));
         Assert.Equal(0, Volatile.Read(ref lane.PendingWrites));
@@ -3189,7 +3189,7 @@ public class ReliabilityAndPerformancePhaseTests
         {
             int pid = 2010 + i;
             var started = new TaskCompletionSource();
-            try
+            var ex = await Assert.ThrowsAsync<InbriskException>(async () =>
             {
                 await scheduler.ScheduleReadAsync(pid, _ =>
                 {
@@ -3197,8 +3197,8 @@ public class ReliabilityAndPerformancePhaseTests
                     Thread.Sleep(300);
                     return "hung";
                 }, timeoutMs: 40);
-            }
-            catch (InbriskException) { }
+            });
+            Assert.Equal(ErrorCode.Timeout, ex.Code);
             await started.Task;
         }
 

@@ -13,6 +13,8 @@ using Xunit.Abstractions;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Benchmark")]
+
 public sealed class PhaseGRound2BenchmarkTests : IDisposable
 {
     private readonly ITestOutputHelper _output;

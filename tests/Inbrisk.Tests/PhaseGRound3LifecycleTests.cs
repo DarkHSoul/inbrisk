@@ -24,6 +24,7 @@ namespace Inbrisk.Tests;
 /// 5. CDP Target/Session Cache (session lifetime, targetCreated/targetDestroyed, disposal).
 /// 6. Whole Phase G Ownership and Live-UI-State Guardrails (no blind mutable state caching).
 /// </summary>
+[Trait("Category", "Unit")]
 public sealed class PhaseGRound3LifecycleTests
 {
     // =========================================================================
@@ -424,10 +425,20 @@ public sealed class PhaseGRound3LifecycleTests
 
         try
         {
+            var watcherField = typeof(UserSettings).GetField("_watcher",
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+            Assert.NotNull(watcherField);
+
             UserSettings.EnsureWatcher();
+            Assert.NotNull(watcherField!.GetValue(null));
+
             UserSettings.DisposeWatcher();
+            Assert.Null(watcherField.GetValue(null));
+
             // Dispose again to ensure idempotency
-            UserSettings.DisposeWatcher();
+            var ex = Record.Exception(() => UserSettings.DisposeWatcher());
+            Assert.Null(ex);
+            Assert.Null(watcherField.GetValue(null));
         }
         finally
         {

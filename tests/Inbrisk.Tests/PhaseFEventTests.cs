@@ -8,6 +8,8 @@ using Role = Inbrisk.Core.Role;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public sealed class PhaseFEventTests
 {
     private sealed class DummyEventSource : IEventSource

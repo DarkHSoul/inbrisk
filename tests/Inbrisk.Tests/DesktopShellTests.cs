@@ -12,6 +12,7 @@ namespace Inbrisk.Tests;
 // McpTools_* tests spin up a REAL InbriskRuntime (UIA dispatcher, WinEvent
 // hooks, HUD/indicator threads). Running them in parallel with the desktop
 // collection's UI-touching tests made AppStatus flaky under load — every
+[Trait("Category", "Contract")]
 public class DesktopShellTests
 {
     public DesktopShellTests() { }

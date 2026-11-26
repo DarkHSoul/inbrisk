@@ -7,6 +7,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public class DesktopArbiterTests
 {
     private static InbriskTools CreateToolsWithArbiter(DesktopArbiter arbiter)
@@ -144,7 +146,7 @@ public class DesktopArbiterTests
         // Wait up to 10s for watchdog tick (timer ticks every 1000ms) — full
         // suite runs under heavy load can starve a single tick past 3s
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (lease.IsActive && sw.ElapsedMilliseconds < 10000)
+        while ((lease.IsActive || !cleanupCalled) && sw.ElapsedMilliseconds < 10000)
         {
             await Task.Delay(100);
         }

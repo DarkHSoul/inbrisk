@@ -6,6 +6,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public sealed class PerimeterActivityLifecycleTests
 {
     [Fact]
@@ -64,14 +66,13 @@ public sealed class PerimeterActivityLifecycleTests
         using var act = new ComputerControlActivityService(idleGraceMs: 50);
         act.SetConnected(true);
 
-        try
+        Assert.Throws<InvalidOperationException>((Action)(() =>
         {
             using var token = act.BeginActivity("computer_find", "sess-1");
             Assert.True(act.PerimeterVisible);
             // Simulate tool failure
             throw new InvalidOperationException("Element not found");
-        }
-        catch (InvalidOperationException) { }
+        }));
 
         // Failure completes -> settles and hides completely without leaving stale visual
         Assert.True(SpinWait.SpinUntil(() => !act.PerimeterVisible, 1500),
@@ -86,14 +87,13 @@ public sealed class PerimeterActivityLifecycleTests
         act.SetConnected(true);
 
         using var cts = new CancellationTokenSource();
-        try
+        Assert.Throws<OperationCanceledException>((Action)(() =>
         {
             using var token = act.BeginActivity("computer_read", "sess-1");
             Assert.True(act.PerimeterVisible);
             cts.Cancel();
             cts.Token.ThrowIfCancellationRequested();
-        }
-        catch (OperationCanceledException) { }
+        }));
 
         Assert.True(SpinWait.SpinUntil(() => !act.PerimeterVisible, 1500),
             "Cancelled tool must clear activity token and hide perimeter");
@@ -106,12 +106,11 @@ public sealed class PerimeterActivityLifecycleTests
         using var act = new ComputerControlActivityService(idleGraceMs: 50);
         act.SetConnected(true);
 
-        try
+        Assert.Throws<Exception>((Action)(() =>
         {
             using var token = act.BeginActivity("computer_launch", "sess-1");
             throw new Exception("Unexpected process crash");
-        }
-        catch { }
+        }));
 
         Assert.Equal(0, act.ActiveLeases);
         Assert.True(SpinWait.SpinUntil(() => !act.PerimeterVisible, 1500));

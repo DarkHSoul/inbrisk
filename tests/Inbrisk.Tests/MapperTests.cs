@@ -5,6 +5,7 @@ using Xunit;
 namespace Inbrisk.Tests;
 
 /// <summary>Pure coordinate-math tests — no screen interaction needed.</summary>
+[Trait("Category", "Unit")]
 public class MapperTests
 {
     [Fact]

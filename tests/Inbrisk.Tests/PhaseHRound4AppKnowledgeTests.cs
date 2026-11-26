@@ -29,6 +29,7 @@ namespace Inbrisk.Tests;
 /// 10. Canonical plan executor reuse for post-launch continuation steps.
 /// 11. Unexpected modal handling returning a single meaningful pause rather than failing catastrophically.
 /// </summary>
+[Trait("Category", "Unit")]
 public sealed class PhaseHRound4AppKnowledgeTests : IDisposable
 {
     private readonly string _tempDir;

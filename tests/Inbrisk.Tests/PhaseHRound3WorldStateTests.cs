@@ -16,6 +16,7 @@ namespace Inbrisk.Tests;
 /// 7. Bounded event storm coalescing preventing infinite coalescing and 1:1 explosion.
 /// 8. Seamless composition of expect + guards with composite batch execution.
 /// </summary>
+[Trait("Category", "Unit")]
 public sealed class PhaseHRound3WorldStateTests
 {
     // =========================================================================

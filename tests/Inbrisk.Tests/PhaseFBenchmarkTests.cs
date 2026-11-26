@@ -8,6 +8,8 @@ using Role = Inbrisk.Core.Role;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Benchmark")]
+
 public sealed class PhaseFBenchmarkTests
 {
     private readonly ITestOutputHelper _output;
@@ -107,11 +109,15 @@ public sealed class PhaseFBenchmarkTests
 
                 var res = task.Result;
                 sw.Stop();
+                Assert.True(res.Success, $"Scenario A iteration {i} failed to find element on event wake");
                 latencies.Add(res.Elapsed.TotalMilliseconds);
                 totalEventWakes += wait.Telemetry.EventWakeCount;
                 totalFallbackPolls += wait.Telemetry.FallbackPollCount;
                 totalPropertyChecks += wait.Telemetry.PropertyCheckCount;
             }
+
+            Assert.True(totalEventWakes >= N, $"Expected at least {N} event wakes across {N} runs, got {totalEventWakes}");
+            Assert.True(P90(latencies) < 500, $"Scenario A P90 latency {P90(latencies):F1}ms exceeded 500ms budget");
 
             results["ScenarioA"] = new
             {
@@ -148,11 +154,14 @@ public sealed class PhaseFBenchmarkTests
 
                 var res = task.Result;
                 sw.Stop();
+                Assert.True(res.Success, $"Scenario B iteration {i} failed to discover element via fallback polling");
                 latencies.Add(res.Elapsed.TotalMilliseconds);
                 totalEventWakes += wait.Telemetry.EventWakeCount;
                 totalFallbackPolls += wait.Telemetry.FallbackPollCount;
                 totalPropertyChecks += wait.Telemetry.PropertyCheckCount;
             }
+
+            Assert.True(totalFallbackPolls >= N, $"Expected at least {N} fallback polls across {N} runs, got {totalFallbackPolls}");
 
             results["ScenarioB"] = new
             {
@@ -196,11 +205,14 @@ public sealed class PhaseFBenchmarkTests
 
                 var res = task.Result;
                 sw.Stop();
+                Assert.True(res.Success, $"Scenario C iteration {i} failed to find target after event storm");
                 latencies.Add(res.Elapsed.TotalMilliseconds);
                 totalEventWakes += wait.Telemetry.EventWakeCount;
                 totalIgnoredEvents += wait.Telemetry.IgnoredEvents;
                 totalPropertyChecks += wait.Telemetry.PropertyCheckCount;
             }
+
+            Assert.True(totalIgnoredEvents > 0, "Expected irrelevant event storm to increment IgnoredEvents");
 
             results["ScenarioC"] = new
             {
@@ -242,6 +254,8 @@ public sealed class PhaseFBenchmarkTests
                 if (res.InterruptedByDialog) interruptedCount++;
             }
 
+            Assert.Equal(N, interruptedCount);
+
             results["ScenarioD"] = new
             {
                 Description = "Unexpected dialog event-gated detection (N=100)",
@@ -265,9 +279,12 @@ public sealed class PhaseFBenchmarkTests
                 var wait = new WaitService(spec => [], new BenchCaptureService(), events, new ElementRegistry([]));
 
                 var res = wait.ForElement(new FindSpec(Name: "NeverFound"), timeoutMs: 150);
+                Assert.False(res.Success, $"Scenario E iteration {i} unexpectedly succeeded on missing element");
                 latencies.Add(res.Elapsed.TotalMilliseconds);
                 totalFallbackPolls += wait.Telemetry.FallbackPollCount;
             }
+
+            Assert.True(P50(latencies) >= 130, $"Scenario E P50 timeout {P50(latencies):F1}ms returned too early (<130ms)");
 
             results["ScenarioE"] = new
             {

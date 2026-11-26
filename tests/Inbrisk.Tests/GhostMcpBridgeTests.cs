@@ -13,6 +13,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Contract")]
+
 public sealed class GhostMcpBridgeTests
 {
     [Fact]

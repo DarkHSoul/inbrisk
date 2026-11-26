@@ -15,6 +15,7 @@ namespace Inbrisk.Tests;
 /// both directions — six real outcomes were never published, and one name was
 /// published that no client could ever observe. Nothing failed loudly.
 /// </summary>
+[Trait("Category", "Contract")]
 public sealed class ErrorVocabularyTests
 {
     /// <summary>Outcomes published separately under `verification` — an action

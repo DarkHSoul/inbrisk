@@ -8,6 +8,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public class ApplicationAdapterTests
 {
     private static InbriskTools CreateToolsWithoutRuntime(ApplicationAdapterRegistry? registry = null)
@@ -286,6 +288,7 @@ public class ApplicationAdapterTests
     }
 
     [Fact]
+    [Trait("Category", "Desktop")]
     public async Task ChromeDevToolsAdapter_LiveChrome_Integration()
     {
         var chromePath = @"C:\Program Files\Google\Chrome\Application\chrome.exe";

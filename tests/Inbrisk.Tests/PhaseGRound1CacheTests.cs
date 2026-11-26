@@ -15,6 +15,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public sealed class PhaseGRound1CacheTests
 {
     private static UiElement CreateTestElement(string id, string? name = null, Role role = Role.Button, long? hwnd = 100, int? pid = 10, RectPx? bounds = null, IReadOnlyList<string>? actions = null, IReadOnlyDictionary<string, object?>? props = null)

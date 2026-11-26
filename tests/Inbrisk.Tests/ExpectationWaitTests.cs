@@ -4,6 +4,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public sealed class ExpectationWaitTests
 {
     private sealed class DummyEventSource : IEventSource

@@ -8,6 +8,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public sealed class WindowProtectionAndModalTests
 {
     private sealed class MockWindowService : IWindowService

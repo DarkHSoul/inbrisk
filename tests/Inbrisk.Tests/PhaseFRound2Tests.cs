@@ -10,6 +10,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public sealed class PhaseFRound2Tests
 {
     private sealed class DummyWindowService : IWindowService

@@ -9,6 +9,7 @@ namespace Inbrisk.Tests;
 /// Windows cannot execute (Win32Exception 193) and crashed `inbrisk setup`.
 /// </summary>
 [Collection("PathEnv")]
+[Trait("Category", "Unit")]
 public sealed class PathSearchTests : IDisposable
 {
     private readonly string _dir = Path.Combine(

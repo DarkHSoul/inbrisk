@@ -15,6 +15,8 @@ using Xunit.Abstractions;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Benchmark")]
+
 public sealed class PhaseGRound1CacheBenchmarkTests
 {
     private readonly ITestOutputHelper _output;

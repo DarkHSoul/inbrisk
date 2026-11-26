@@ -8,6 +8,7 @@ namespace Inbrisk.Tests;
 /// McpSelfTest does a real handshake and flags any non-JSON-RPC stdout line —
 /// a stray banner/Console.WriteLine fails here immediately.
 /// </summary>
+[Trait("Category", "Contract")]
 public sealed class StdioHygieneTests
 {
 

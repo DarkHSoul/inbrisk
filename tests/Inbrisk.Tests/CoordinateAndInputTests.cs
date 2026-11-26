@@ -5,6 +5,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public class CoordinateAndInputTests
 {
     [Fact]

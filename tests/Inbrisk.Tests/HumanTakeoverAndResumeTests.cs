@@ -9,6 +9,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public class HumanTakeoverAndResumeTests
 {
     private static InbriskTools CreateToolsForTakeover(out McpSession session, out RunState state)

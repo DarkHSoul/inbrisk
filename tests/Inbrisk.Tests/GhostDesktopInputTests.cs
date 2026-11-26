@@ -7,6 +7,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "GhostInteractive")]
+
 public class GhostDesktopInputTests
 {
     [Fact]
@@ -197,6 +199,7 @@ public class GhostDesktopInputTests
         using var injector = new GhostDesktopInput(testDesktop, autoStart: true);
 
         // Test PiP event forwarding
+        Assert.True(injector.IsPipInteractive);
         injector.SendPipMouseMove(160, 90);
         injector.SendPipMouseDown(160, 90, MouseButton.Left);
         injector.SendPipMouseUp(160, 90, MouseButton.Left);
@@ -212,6 +215,7 @@ public class GhostDesktopInputTests
 
         // When IsPipInteractive is false, events are discarded without error
         injector.IsPipInteractive = false;
+        Assert.False(injector.IsPipInteractive);
         injector.SendPipMouseMove(10, 10);
         injector.SendPipMouseClick(10, 10);
         injector.ForwardPipInput(new PipInputEventArgs(PipInputEventType.MouseMove, 10, 10));
@@ -226,8 +230,13 @@ public class GhostDesktopInputTests
 
         using var injector = new GhostDesktopInput(autoStart: false);
 
-        injector.AttachToPipHost(pipHost);
-        injector.DetachFromPipHost(pipHost);
+        var attachEx = Record.Exception(() => injector.AttachToPipHost(pipHost));
+        Assert.Null(attachEx);
+        Assert.Equal(320, pipHost.Width);
+        Assert.Equal(180, pipHost.Height);
+
+        var detachEx = Record.Exception(() => injector.DetachFromPipHost(pipHost));
+        Assert.Null(detachEx);
     }
 
     [Fact]

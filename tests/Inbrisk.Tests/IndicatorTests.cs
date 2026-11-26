@@ -10,6 +10,7 @@ namespace Inbrisk.Tests;
 /// metrics + breathing wave (pure), and live overlay windows on the real
 /// desktop.
 /// </summary>
+[Trait("Category", "Desktop")]
 public class IndicatorTests
 {
     private static readonly Lazy<DesktopFixture> _fxLazy = new(() => new DesktopFixture());

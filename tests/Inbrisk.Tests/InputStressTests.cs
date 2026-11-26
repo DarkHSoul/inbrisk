@@ -16,6 +16,8 @@ namespace Inbrisk.Tests;
 /// for quick runs.
 /// </summary>
 [Collection("desktop")]
+[Trait("Category", "Desktop")]
+[Trait("Category", "Benchmark")]
 public class InputStressTests
 {
     private const int VK_LCTRL = 0xA2, VK_LSHIFT = 0xA0, VK_LALT = 0xA4,

@@ -9,6 +9,8 @@ using Xunit.Abstractions;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Benchmark")]
+
 public sealed class PhaseFRound2BenchmarkTests
 {
     private readonly ITestOutputHelper _output;

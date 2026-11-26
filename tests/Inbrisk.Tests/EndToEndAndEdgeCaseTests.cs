@@ -14,6 +14,7 @@ namespace Inbrisk.Tests;
 /// Part B: Large product experiment (single plan -> local execution -> safe human pause -> resume -> recipe creation & replay).
 /// </summary>
 [Collection("desktop")]
+[Trait("Category", "Desktop")]
 public sealed class EndToEndAndEdgeCaseTests : IDisposable
 {
     private readonly DesktopFixture _fx;

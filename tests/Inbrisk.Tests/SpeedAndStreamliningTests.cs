@@ -8,6 +8,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Desktop")]
+
 public class SpeedAndStreamliningTests
 {
     private sealed class FakeWindows : IWindowService

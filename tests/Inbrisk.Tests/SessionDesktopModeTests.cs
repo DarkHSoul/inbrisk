@@ -18,6 +18,7 @@ namespace Inbrisk.Tests;
 /// nothing on the other. Switching without dropping them would silently
 /// resolve against a window that isn't there.
 /// </summary>
+[Trait("Category", "Contract")]
 public sealed class SessionDesktopModeTests
 {
     private static string TextOf(CallToolResult r) => string.Join("\n",

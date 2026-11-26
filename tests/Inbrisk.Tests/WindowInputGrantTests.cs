@@ -12,6 +12,7 @@ namespace Inbrisk.Tests;
 /// that window is gone. Pins what it allows and, more importantly, what it
 /// must not: other windows, dangerous classes, declined/unavailable prompts.
 /// </summary>
+[Trait("Category", "Unit")]
 public sealed class WindowInputGrantTests
 {
     [DllImport("user32.dll")] private static extern IntPtr GetDesktopWindow();
@@ -161,8 +162,8 @@ public sealed class WindowInputGrantTests
     {
         var ch = Channel(() => true, out var prompts);
         Assert.True(ch.Confirmer(Key(), null, Win(HwndA)));
-        // same hwnd now reported under another pid → grant must not apply
+        // same hwnd now reported under another pid â†’ grant must not apply
         Assert.False(ch.Confirmer(Key(), null, Win(HwndA, pid: Pid + 100000)));
-        Assert.Equal(1, prompts[0]); // no start time for a bogus pid → no prompt
+        Assert.Equal(1, prompts[0]); // no start time for a bogus pid â†’ no prompt
     }
 }

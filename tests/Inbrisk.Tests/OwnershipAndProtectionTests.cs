@@ -9,6 +9,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Contract")]
+
 public sealed class OwnershipAndProtectionTests
 {
     private sealed class FakeWindowService : IWindowService

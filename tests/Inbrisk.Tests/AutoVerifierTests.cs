@@ -4,6 +4,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public class AutoVerifierTests
 {
     private sealed class DummyWindowService : IWindowService

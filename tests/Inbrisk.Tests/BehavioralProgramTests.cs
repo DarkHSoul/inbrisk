@@ -9,6 +9,8 @@ using Role = Inbrisk.Core.Role;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public class BehavioralProgramTests
 {
     private static InbriskTools.RunStep S(

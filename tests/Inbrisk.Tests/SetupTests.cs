@@ -10,6 +10,7 @@ namespace Inbrisk.Tests;
 /// profile. Invariants under test: other servers survive, malformed configs
 /// are refused, connect is idempotent, disconnect removes only Inbrisk.
 /// </summary>
+[Trait("Category", "Unit")]
 public sealed class SetupTests : IDisposable
 {
     private readonly string _root = Path.Combine(

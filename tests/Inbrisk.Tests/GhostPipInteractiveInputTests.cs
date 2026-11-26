@@ -8,6 +8,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "GhostInteractive")]
+
 public class GhostPipInteractiveInputTests
 {
     private sealed class MockInputService : IInputService, GhostDesktopInput.ILocalMouseControl
@@ -232,10 +234,9 @@ public class GhostPipInteractiveInputTests
     [Fact]
     public void GhostPipWindowHost_HasValidFrame_DefaultsFalseAndCanBeSet()
     {
-        if (!System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
-        {
-            return;
-        }
+        Assert.True(
+            System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows),
+            "GhostPipWindowHost tests require Windows.");
 
         using var host = new Inbrisk.Platform.Windows.GhostPipWindowHost(width: 320, height: 180, initialOpacity: 255, clickThrough: true, autoStart: true);
         Assert.True(host.WaitForReady(3000));

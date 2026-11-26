@@ -17,6 +17,7 @@ namespace Inbrisk.Tests;
 /// approve. These tests pin the narrowed exemption AND, just as
 /// importantly, pin everything it must NOT let through.
 /// </summary>
+[Trait("Category", "Unit")]
 public sealed class PolicyOwnershipAndCapabilitiesTests
 {
     private const long AgentHwnd = 0x2D0772;

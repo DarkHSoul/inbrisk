@@ -9,6 +9,7 @@ namespace Inbrisk.Tests;
 /// Phase F Round 3 Performance and Architecture Benchmarks (Scenarios A through F).
 /// Classification: Production-path synthetic using controlled duplex in-memory CDP transport.
 /// </summary>
+[Trait("Category", "Benchmark")]
 public class PhaseFRound3CdpBenchmarkTests
 {
     private readonly ITestOutputHelper _output;

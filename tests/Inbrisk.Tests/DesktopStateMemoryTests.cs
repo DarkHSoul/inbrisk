@@ -4,6 +4,8 @@ using Xunit;
 
 namespace Inbrisk.Tests;
 
+[Trait("Category", "Unit")]
+
 public sealed class DesktopStateMemoryTests
 {
     private static UiElement MakeEl(string id, string name, Role role, bool isSelected = false)

@@ -25,6 +25,7 @@ namespace Inbrisk.Tests;
 /// 7. ErrorReadyArguments: deterministic retry-ready arguments for TargetNotFound, Ambiguous, and Malformed errors.
 /// 8. Final Architecture Smoke: holistic end-to-end integration across proxy, read/mutation lanes, stateVersion, profiles, dynamic toolsets, and telemetry.
 /// </summary>
+[Trait("Category", "Contract")]
 public sealed class PhaseHRound6TelemetryAndPolishTests
 {
     // =========================================================================
