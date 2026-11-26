@@ -8,6 +8,9 @@ public enum ActionKind
     /// <summary>Relative mouse movement (args dx, dy) into the targeted window —
     /// camera look for games that capture the cursor.</summary>
     MouseLook,
+    /// <summary>Press and hold a mouse button for args.holdMs without moving
+    /// the pointer (mining/attacking in games).</summary>
+    MouseHold,
     FocusWindow, FocusElement, ClipboardRead, ClipboardWrite,
     /// <summary>Graceful window close (WM_CLOSE). The tool layer's
     /// provenance gates still decide whether a close is allowed — this is

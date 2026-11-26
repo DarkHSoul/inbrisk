@@ -166,7 +166,7 @@ public sealed class Executor
                 targetDesc = $"window '{window.Title}'";
             }
             else if (intent.Kind is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText
-                or ActionKind.MouseLook)
+                or ActionKind.MouseLook or ActionKind.MouseHold)
             {
                 window = _windows.GetForegroundWindow();
                 if (window != null) targetDesc = $"foreground window '{window.Title}'";
@@ -175,7 +175,8 @@ public sealed class Executor
             // no target at all) is delivered to whatever has focus —
             // the policy/danger checks must evaluate THAT window
             if (window == null && element == null && intent.Kind is ActionKind.KeyPress
-                or ActionKind.Hotkey or ActionKind.TypeText or ActionKind.MouseLook)
+                or ActionKind.Hotkey or ActionKind.TypeText or ActionKind.MouseLook
+                or ActionKind.MouseHold)
             {
                 window = _windows.GetForegroundWindow();
                 if (window != null && targetDesc == "")
@@ -576,14 +577,26 @@ public sealed class Executor
                 if (holdMs > 0)
                 {
                     count = Math.Min(count, Math.Max(1, 30_000 / holdMs));
+                    // extra keys held together with the main one (keys:"w+space")
+                    var together = ParseKeys(intent.Args, "modifiers");
                     attempts.Add(Do(() =>
                     {
                         for (var i = 0; i < count; i++)
                         {
                             ct.ThrowIfCancellationRequested();
-                            _input.KeyDown(key);
-                            try { ct.WaitHandle.WaitOne(holdMs); }
-                            finally { _input.KeyUp(key); }
+                            var downed = new List<KeyCode>();
+                            try
+                            {
+                                foreach (var k in together) { _input.KeyDown(k); downed.Add(k); }
+                                _input.KeyDown(key); downed.Add(key);
+                                ct.WaitHandle.WaitOne(holdMs);
+                            }
+                            finally
+                            {
+                                // release everything pressed, in reverse, even on cancel
+                                for (var j = downed.Count - 1; j >= 0; j--)
+                                    try { _input.KeyUp(downed[j]); } catch { }
+                            }
                             ct.ThrowIfCancellationRequested();
                             if (i + 1 < count) ct.WaitHandle.WaitOne(30);
                         }
@@ -600,6 +613,49 @@ public sealed class Executor
                     }
                 }, BackendId.Win32, "SendInput.key"));
                 return Ok(BackendId.Win32, "SendInput.key", attempts, sw);
+            }
+
+            case ActionKind.MouseHold:
+            {
+                // button DOWN, wait, button UP - the pointer never moves.
+                // Bounded (<=10 s) and always released, even on cancel.
+                if (window != null) GuardFocus(window, attempts);
+                var hold = Math.Clamp(
+                    Convert.ToInt32(intent.Args?.TryGetValue("holdMs", out var mh) == true ? mh : 0),
+                    1, 10_000);
+                var btn = (intent.Args?.TryGetValue("button", out var mb) == true ? mb?.ToString() : null)
+                    ?.ToLowerInvariant() switch
+                {
+                    "right" => MouseButton.Right,
+                    "middle" => MouseButton.Middle,
+                    _ => MouseButton.Left,
+                };
+                // keys held for the same duration (keys:"space", keys:"w+space")
+                var heldKeys = ParseKeys(intent.Args, "modifiers");
+                if (intent.Args?.TryGetValue("key", out var hk) == true &&
+                    Enum.TryParse<KeyCode>(hk?.ToString(), true, out var hkk))
+                    heldKeys.Add(hkk);
+                attempts.Add(Do(() =>
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var downed = new List<KeyCode>();
+                    var mouseDown = false;
+                    try
+                    {
+                        foreach (var k2 in heldKeys) { _input.KeyDown(k2); downed.Add(k2); }
+                        _input.MouseDown(btn); mouseDown = true;
+                        ct.WaitHandle.WaitOne(hold);
+                    }
+                    finally
+                    {
+                        // release everything pressed, in reverse, even on cancel
+                        if (mouseDown) try { _input.MouseUp(btn); } catch { }
+                        for (var j = downed.Count - 1; j >= 0; j--)
+                            try { _input.KeyUp(downed[j]); } catch { }
+                    }
+                    ct.ThrowIfCancellationRequested();
+                }, BackendId.Win32, "SendInput.mousehold"));
+                return Ok(BackendId.Win32, "SendInput.mousehold", attempts, sw);
             }
 
             case ActionKind.MouseLook:

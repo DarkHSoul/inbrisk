@@ -331,8 +331,8 @@ public sealed class SafetyPolicy
                 return PolicyDecision.Confirm(PolicyReason.KeystrokeIntoWindow,
                     DescribeTarget(window, "keystroke delivery"));
 
-            case ActionKind.MouseLook:
-                // synthetic relative mouse motion is input injection into
+            case ActionKind.MouseLook or ActionKind.MouseHold:
+                // synthetic relative mouse motion / button hold is input injection into
                 // whatever window has focus — same consent as keystrokes
                 return PolicyDecision.Confirm(PolicyReason.KeystrokeIntoWindow,
                     DescribeTarget(window, "relative mouse movement"));

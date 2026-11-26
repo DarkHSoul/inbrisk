@@ -17,6 +17,8 @@ public enum AgentActionKind
     /// <summary>Relative mouse movement (camera look in games that capture
     /// the cursor) — dx/dy in raw mouse counts.</summary>
     Look,
+    /// <summary>Hold a mouse button down for Ms without moving the pointer.</summary>
+    MouseHold,
     FocusWindow, FocusElement,
     Wait, WaitFor, WaitForChange, WaitForStable,
     Finish,
@@ -61,11 +63,14 @@ public sealed record AgentAction(
     bool Silent = false,
     /// <summary>look: relative mouse delta in raw counts (x right+, y down+).</summary>
     int? Dx = null,
-    int? Dy = null)
+    int? Dy = null,
+    /// <summary>mouse hold: left|right|middle (default left).</summary>
+    string? Button = null)
 {
     public string Summary() => Kind switch
     {
         AgentActionKind.Look => $"look({Dx ?? 0},{Dy ?? 0})",
+        AgentActionKind.MouseHold => $"mouse({Button ?? "left"}, hold {Ms ?? 0}ms)",
         AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick
             or AgentActionKind.Invoke or AgentActionKind.Toggle or AgentActionKind.Select
             or AgentActionKind.ScrollIntoView

@@ -35,6 +35,7 @@ internal sealed class WgcSession : ICaptureSession
 
     private ID3D11Texture2D? _staging;
     private uint _stagingW, _stagingH;
+    private global::Windows.Graphics.SizeInt32 _poolSize;
     private RawFrame? _latest;
     private long _seq, _arrived, _emitted;
     private double _fpsEma;
@@ -62,8 +63,9 @@ internal sealed class WgcSession : ICaptureSession
         _regionCrop = regionCrop;
         _sourceRectProvider = srcProvider;
 
+        _poolSize = item.Size;
         _pool = Direct3D11CaptureFramePool.CreateFreeThreaded(
-            device, DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, item.Size);
+            device, DirectXPixelFormat.B8G8R8A8UIntNormalized, 2, _poolSize);
         _pool.FrameArrived += OnFrameArrived;
         _session = _pool.CreateCaptureSession(item);
         _item.Closed += (_, _) => Stop();
@@ -167,11 +169,12 @@ internal sealed class WgcSession : ICaptureSession
             using var frame = pool.TryGetNextFrame();
             if (frame == null) return;
 
-            if (frame.ContentSize.Width != _item.Size.Width ||
-                frame.ContentSize.Height != _item.Size.Height)
+            if (frame.ContentSize.Width != _poolSize.Width ||
+                frame.ContentSize.Height != _poolSize.Height)
             {
+                _poolSize = frame.ContentSize;
                 _pool.Recreate(_device, DirectXPixelFormat.B8G8R8A8UIntNormalized,
-                    2, frame.ContentSize);
+                    2, _poolSize);
             }
 
             var raw = Readback(frame);
@@ -196,56 +199,68 @@ internal sealed class WgcSession : ICaptureSession
     private unsafe RawFrame? Readback(Direct3D11CaptureFrame frame)
     {
         var tex = WgcInterop.SurfaceAsTexture(frame.Surface);
-        var desc = new D3D11_TEXTURE2D_DESC();
-        tex.GetDesc(&desc);
-        uint w = desc.Width, h = desc.Height;
-        if (w == 0 || h == 0) return null;
-
-        lock (_d3dLock)
+        try
         {
-            if (_staging == null || _stagingW != w || _stagingH != h)
+            var desc = new D3D11_TEXTURE2D_DESC();
+            tex.GetDesc(&desc);
+            uint w = desc.Width, h = desc.Height;
+            if (w == 0 || h == 0) return null;
+
+            lock (_d3dLock)
             {
-                _staging = null;
-                var sd = new D3D11_TEXTURE2D_DESC
+                if (_disposed) return null;
+                if (_staging == null || _stagingW != w || _stagingH != h)
                 {
-                    Width = w, Height = h, MipLevels = 1, ArraySize = 1,
-                    Format = DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
-                    SampleDesc = new DXGI_SAMPLE_DESC { Count = 1, Quality = 0 },
-                    Usage = D3D11_USAGE.D3D11_USAGE_STAGING,
-                    BindFlags = 0,
-                    CPUAccessFlags = D3D11_CPU_ACCESS_FLAG.D3D11_CPU_ACCESS_READ,
-                    MiscFlags = 0,
-                };
-                ID3D11Texture2D_unmanaged* stg;
-                _d3dDevice.CreateTexture2D(&sd, null, &stg);
-                var stgPtr = (IntPtr)stg;
-                _staging = (ID3D11Texture2D)Marshal.GetObjectForIUnknown(stgPtr);
-                Marshal.Release(stgPtr);
-                _stagingW = w; _stagingH = h;
+                    if (_staging != null)
+                    {
+                        try { Marshal.ReleaseComObject(_staging); } catch { }
+                        _staging = null;
+                    }
+                    var sd = new D3D11_TEXTURE2D_DESC
+                    {
+                        Width = w, Height = h, MipLevels = 1, ArraySize = 1,
+                        Format = DXGI_FORMAT.DXGI_FORMAT_B8G8R8A8_UNORM,
+                        SampleDesc = new DXGI_SAMPLE_DESC { Count = 1, Quality = 0 },
+                        Usage = D3D11_USAGE.D3D11_USAGE_STAGING,
+                        BindFlags = 0,
+                        CPUAccessFlags = D3D11_CPU_ACCESS_FLAG.D3D11_CPU_ACCESS_READ,
+                        MiscFlags = 0,
+                    };
+                    ID3D11Texture2D_unmanaged* stg;
+                    _d3dDevice.CreateTexture2D(&sd, null, &stg);
+                    var stgPtr = (IntPtr)stg;
+                    _staging = (ID3D11Texture2D)Marshal.GetObjectForIUnknown(stgPtr);
+                    Marshal.Release(stgPtr);
+                    _stagingW = w; _stagingH = h;
+                }
+
+                _d3dContext.CopyResource((ID3D11Resource)(object)_staging!, (ID3D11Resource)(object)tex);
+
+                var mapped = new D3D11_MAPPED_SUBRESOURCE();
+                _d3dContext.Map((ID3D11Resource)(object)_staging!, 0,
+                    D3D11_MAP.D3D11_MAP_READ, 0, &mapped);
+                try
+                {
+                    var bytes = new byte[w * 4 * h];
+                    var src = (byte*)mapped.pData;
+                    for (var row = 0; row < h; row++)
+                        Marshal.Copy((IntPtr)(src + row * mapped.RowPitch), bytes,
+                            row * (int)w * 4, (int)w * 4);
+
+                    var srcRect = _sourceRectProvider();
+                    var transform = new FrameTransform(
+                        new RectPx(srcRect.X, srcRect.Y, (int)w, (int)h), (int)w, (int)h,
+                        Target is CaptureTarget.Window wt ? wt.Hwnd : null);
+                    Interlocked.Increment(ref _seq);
+                    return new RawFrame(bytes, (int)w, (int)h, (int)w * 4,
+                        transform, DateTimeOffset.Now, _seq - 1);
+                }
+                finally { _d3dContext.Unmap((ID3D11Resource)(object)_staging!, 0); }
             }
-
-            _d3dContext.CopyResource((ID3D11Resource)(object)_staging!, (ID3D11Resource)(object)tex);
-
-            var mapped = new D3D11_MAPPED_SUBRESOURCE();
-            _d3dContext.Map((ID3D11Resource)(object)_staging!, 0,
-                D3D11_MAP.D3D11_MAP_READ, 0, &mapped);
-            try
-            {
-                var bytes = new byte[w * 4 * h];
-                var src = (byte*)mapped.pData;
-                for (var row = 0; row < h; row++)
-                    Marshal.Copy((IntPtr)(src + row * mapped.RowPitch), bytes,
-                        row * (int)w * 4, (int)w * 4);
-
-                var srcRect = _sourceRectProvider();
-                var transform = new FrameTransform(
-                    new RectPx(srcRect.X, srcRect.Y, (int)w, (int)h), (int)w, (int)h,
-                    Target is CaptureTarget.Window wt ? wt.Hwnd : null);
-                Interlocked.Increment(ref _seq);
-                return new RawFrame(bytes, (int)w, (int)h, (int)w * 4,
-                    transform, DateTimeOffset.Now, _seq - 1);
-            }
-            finally { _d3dContext.Unmap((ID3D11Resource)(object)_staging!, 0); }
+        }
+        finally
+        {
+            try { Marshal.ReleaseComObject(tex); } catch { }
         }
     }
 
@@ -260,7 +275,19 @@ internal sealed class WgcSession : ICaptureSession
         _disposed = true;
         Stop();
         _watchdog?.Dispose();
+        try { _pool.FrameArrived -= OnFrameArrived; } catch { }
         try { _pool.Dispose(); } catch { }
+        lock (_d3dLock)
+        {
+            if (_staging != null)
+            {
+                try { Marshal.ReleaseComObject(_staging); } catch { }
+                _staging = null;
+            }
+            try { Marshal.ReleaseComObject(_d3dContext); } catch { }
+            try { Marshal.ReleaseComObject(_d3dDevice); } catch { }
+        }
+        _latest = null;
         try { (_item as IWinRTObject)?.NativeObject.Dispose(); } catch { }
         try { (_device as IWinRTObject)?.NativeObject.Dispose(); } catch { }
     }

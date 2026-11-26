@@ -299,8 +299,11 @@ public sealed class McpSession : IDisposable
     /// </summary>
     public Dictionary<string, (TargetDiagnosis Diag, DateTimeOffset At, HashSet<long> Hwnds, HashSet<int> Pids, long Ver)> NegativeFindCache { get; } = new();
 
+    private readonly object _monitorLock = new();
     private ChangeMonitor? _monitor;
     private long _scopeHwndForMonitor;
+    private Timer? _monitorIdleTimer;
+    private const int MonitorIdleTimeoutMs = 30_000;
     private readonly List<string> _recentRefs = new();
 
     public McpSession(EmergencyControl control, string? telemetryPath = null, bool startEvents = true, IDesktopArbiter? arbiter = null,
@@ -416,7 +419,9 @@ public sealed class McpSession : IDisposable
     }
 
     /// <summary>Session monitor for wait_for_change/stable — created lazily
-    /// against the current scope window, with automatic foreground or desktop fallback.</summary>
+    /// against the current scope window, with automatic foreground or desktop fallback.
+    /// Automatically disposes after 30s of inactivity so WGC capture does not run
+    /// indefinitely while the MCP server sits idle.</summary>
     public ChangeMonitor MonitorFor(long hwnd)
     {
         if (hwnd == 0 || Rt?.WindowService?.GetWindow(hwnd) == null)
@@ -426,24 +431,55 @@ public sealed class McpSession : IDisposable
                 hwnd = fg;
         }
 
-        if (_monitor == null || _scopeHwndForMonitor != hwnd || !_monitor.Session.IsRunning)
+        lock (_monitorLock)
         {
-            _monitor?.Dispose();
-            try
+            if (_monitor == null || _scopeHwndForMonitor != hwnd || !_monitor.Session.IsRunning)
             {
-                var target = (hwnd != 0 && Rt?.WindowService?.GetWindow(hwnd) != null)
-                    ? (CaptureTarget)new CaptureTarget.Window(hwnd)
-                    : (CaptureTarget)new CaptureTarget.FullDesktop();
-                _monitor = Rt.Monitor(target);
-                _scopeHwndForMonitor = hwnd;
+                try { _monitor?.Dispose(); } catch { }
+                try
+                {
+                    var target = (hwnd != 0 && Rt?.WindowService?.GetWindow(hwnd) != null)
+                        ? (CaptureTarget)new CaptureTarget.Window(hwnd)
+                        : (CaptureTarget)new CaptureTarget.FullDesktop();
+                    _monitor = Rt.Monitor(target);
+                    _scopeHwndForMonitor = hwnd;
+                }
+                catch
+                {
+                    _monitor = Rt.Monitor(new CaptureTarget.FullDesktop());
+                    _scopeHwndForMonitor = 0;
+                }
             }
-            catch
-            {
-                _monitor = Rt.Monitor(new CaptureTarget.FullDesktop());
-                _scopeHwndForMonitor = 0;
-            }
+            TouchMonitorIdleTimerLocked();
+            return _monitor;
         }
-        return _monitor;
+    }
+
+    private void TouchMonitorIdleTimerLocked()
+    {
+        if (IsDisposed) return;
+        if (_monitorIdleTimer == null)
+        {
+            _monitorIdleTimer = new Timer(_ =>
+            {
+                try
+                {
+                    ChangeMonitor? toDispose = null;
+                    lock (_monitorLock)
+                    {
+                        toDispose = _monitor;
+                        _monitor = null;
+                        _scopeHwndForMonitor = 0;
+                    }
+                    toDispose?.Dispose();
+                }
+                catch { /* best-effort idle teardown */ }
+            }, null, MonitorIdleTimeoutMs, Timeout.Infinite);
+        }
+        else
+        {
+            try { _monitorIdleTimer.Change(MonitorIdleTimeoutMs, Timeout.Infinite); } catch { }
+        }
     }
 
     private void OnControlState(ComputerControlState s)
@@ -752,7 +788,13 @@ public sealed class McpSession : IDisposable
         try { VdmHolder.Dispose(); } catch { }
         try { Rt.PurgePendingWork(); } catch { }
         try { Reflex?.Dispose(); } catch { }
-        try { _monitor?.Dispose(); } catch { }
+        lock (_monitorLock)
+        {
+            try { _monitorIdleTimer?.Dispose(); } catch { }
+            _monitorIdleTimer = null;
+            try { _monitor?.Dispose(); } catch { }
+            _monitor = null;
+        }
         try { Rt.TargetHighlight.OnSessionDisconnected(SessionId); } catch { }
         try { Rt.Activity.ClearSessionActivity(SessionId); } catch { }
         try { Rt.Parts.Input.ReleaseAll(); } catch { }

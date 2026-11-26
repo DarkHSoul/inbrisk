@@ -196,7 +196,7 @@ public sealed class ConfirmChannel
 
     private static bool IsGrantableKind(ActionKind k) =>
         k is ActionKind.KeyPress or ActionKind.Hotkey or ActionKind.TypeText
-            or ActionKind.MouseLook;
+            or ActionKind.MouseLook or ActionKind.MouseHold;
 
     /// <summary>Live grants, for a local surface to list.</summary>
     public IReadOnlyList<WindowGrant> WindowGrants

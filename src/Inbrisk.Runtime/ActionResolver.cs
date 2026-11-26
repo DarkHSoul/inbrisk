@@ -272,7 +272,7 @@ public sealed class ActionResolver
             AgentActionKind.FocusElement
                 => a.ElementId != null ? ResolveElement(a.ElementId, out error) : null,
             AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey
-                or AgentActionKind.Look
+                or AgentActionKind.Look or AgentActionKind.MouseHold
                 => a.ElementId != null ? ResolveElement(a.ElementId, out error) : null,
             _ => null,
         };
@@ -296,12 +296,13 @@ public sealed class ActionResolver
             AgentActionKind.Key => ActionKind.KeyPress,
             AgentActionKind.Hotkey => ActionKind.Hotkey,
             AgentActionKind.Look => ActionKind.MouseLook,
+            AgentActionKind.MouseHold => ActionKind.MouseHold,
             _ => (ActionKind?)null,
         };
         if (kind == null) { error = $"unhandled action kind {a.Kind}"; return null; }
 
         if (target == null && kind is not (ActionKind.TypeText or ActionKind.KeyPress
-            or ActionKind.Hotkey or ActionKind.MouseLook))
+            or ActionKind.Hotkey or ActionKind.MouseLook or ActionKind.MouseHold))
         { error = $"{a.Kind} requires elementId or image point"; return null; }
 
         var args = new Dictionary<string, object?>();
@@ -319,6 +320,20 @@ public sealed class ActionResolver
                 // key: hold the key down this long instead of an instant tap
                 if (kind.Value == ActionKind.KeyPress && a.Ms is > 0)
                     args["holdMs"] = a.Ms.Value;
+                break;
+            case ActionKind.MouseHold:
+                if (a.Ms is not > 0) { error = "mouse requires ms (hold duration)"; return null; }
+                args["holdMs"] = a.Ms.Value;
+                args["button"] = a.Button ?? "left";
+                // keys held down together with the button (keys:"space" to
+                // pillar up, keys:"w" to mine while walking)
+                if (a.Key != null)
+                {
+                    if (!Enum.TryParse<KeyCode>(a.Key, true, out var mk))
+                    { error = $"key '{a.Key}' unknown"; return null; }
+                    args["key"] = mk.ToString();
+                }
+                if (a.Modifiers is { Count: > 0 }) args["modifiers"] = a.Modifiers;
                 break;
             case ActionKind.MouseLook:
                 if (a.Dx is null && a.Dy is null)

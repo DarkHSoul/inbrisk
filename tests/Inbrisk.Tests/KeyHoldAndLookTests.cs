@@ -77,6 +77,8 @@ public sealed class KeyHoldAndLookTests
         public void KeyDown(KeyCode key) => Log.Add($"down:{key}");
         public void KeyUp(KeyCode key) => Log.Add($"up:{key}");
         public void MoveMouseRelative(int dx, int dy) => Log.Add($"look:{dx},{dy}");
+        public void MouseDown(MouseButton button) => Log.Add($"mdown:{button}");
+        public void MouseUp(MouseButton button) => Log.Add($"mup:{button}");
         public void Hotkey(IReadOnlyList<KeyCode> modifiers, KeyCode key) { }
         public void TypeText(string text) { }
         public (int X, int Y) CursorPosition() => (0, 0);
@@ -130,6 +132,20 @@ public sealed class KeyHoldAndLookTests
     }
 
     [Fact]
+    public void Key_hold_can_press_several_keys_together_and_releases_in_reverse()
+    {
+        var (exec, input) = Build();
+        var r = exec.Perform(Key(new()
+        {
+            ["key"] = "Space",
+            ["modifiers"] = new[] { "W" },
+            ["holdMs"] = 120,
+        }));
+        Assert.True(r.Success, r.ErrorMessage);
+        Assert.Equal(new[] { "down:W", "down:Space", "up:Space", "up:W" }, input.Log);
+    }
+
+    [Fact]
     public void Key_hold_always_releases_when_cancelled()
     {
         var (exec, input) = Build();
@@ -152,6 +168,87 @@ public sealed class KeyHoldAndLookTests
         input.Log.Clear();
         exec.Perform(Look(900_000, -900_000));
         Assert.Equal(new[] { "look:4000,-4000" }, input.Log);
+    }
+
+    private static ActionIntent Mouse(string button, int holdMs) =>
+        new(ActionKind.MouseHold, TargetRef.Window(Hwnd),
+            new Dictionary<string, object?> { ["button"] = button, ["holdMs"] = holdMs });
+
+    [Fact]
+    public void Mouse_hold_presses_waits_and_releases_without_moving_the_pointer()
+    {
+        var (exec, input) = Build();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var r = exec.Perform(Mouse("left", 250));
+        sw.Stop();
+        Assert.True(r.Success, r.ErrorMessage);
+        Assert.Equal("SendInput.mousehold", r.Method);
+        Assert.Equal(new[] { "mdown:Left", "mup:Left" }, input.Log);
+        Assert.True(sw.ElapsedMilliseconds >= 230);
+    }
+
+    [Fact]
+    public void Mouse_hold_always_releases_when_cancelled_and_honours_the_button()
+    {
+        var (exec, input) = Build();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(80));
+        var r = exec.Perform(Mouse("right", 5000), new ActionContext(cts.Token));
+        Assert.False(r.Success);
+        Assert.Equal("mdown:Right", input.Log[0]);
+        Assert.Equal("mup:Right", input.Log[^1]);
+    }
+
+    [Fact]
+    public void Mouse_hold_can_hold_keys_together_and_releases_everything()
+    {
+        var (exec, input) = Build();
+        var r = exec.Perform(new ActionIntent(ActionKind.MouseHold, TargetRef.Window(Hwnd),
+            new Dictionary<string, object?>
+            {
+                ["button"] = "right", ["holdMs"] = 120,
+                ["key"] = "Space", ["modifiers"] = new[] { "W" },
+            }));
+        Assert.True(r.Success, r.ErrorMessage);
+        Assert.Equal(new[] { "down:W", "down:Space", "mdown:Right", "mup:Right", "up:Space", "up:W" },
+            input.Log);
+    }
+
+    [Fact]
+    public void Mouse_step_accepts_keys_and_still_requires_ms()
+    {
+        Assert.Null(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "mouse", Ms = 3000, Button = "right", Keys = "space" }));
+        Assert.NotNull(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "mouse", Keys = "space" }));
+    }
+
+    [Fact]
+    public void Mouse_hold_is_behind_the_confirm_gate_and_grantable()
+    {
+        var (exec, input) = Build(autoConfirm: false);
+        Assert.Equal(ErrorCode.ConfirmationRequired, exec.Perform(Mouse("left", 100)).Error);
+        Assert.Empty(input.Log);
+
+        var ch = new ConfirmChannel("test");
+        Assert.False(ch.Confirmer(Mouse("left", 100), null, Win()));
+        Assert.True(Assert.Single(ch.Pending).CanAllowWindow);
+    }
+
+    [Fact]
+    public void Mouse_step_requires_a_bounded_ms_and_a_known_button()
+    {
+        Assert.Null(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "mouse", Ms = 3000 }));
+        Assert.Null(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "mouse", Ms = 3000, Button = "right" }));
+        Assert.NotNull(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "mouse" }));
+        Assert.NotNull(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "mouse", Ms = 20_000 }));
+        Assert.NotNull(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "mouse", Ms = 500, Button = "side" }));
+        Assert.NotNull(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "key", Key = "w", Button = "left" })); // button only on mouse
     }
 
     [Fact]
@@ -197,6 +294,19 @@ public sealed class KeyHoldAndLookTests
             new InbriskTools.RunStep { Action = "key", Key = "w", Ms = 20_000 }));
         Assert.NotNull(InbriskTools.ValidateStep(
             new InbriskTools.RunStep { Action = "hotkey", Key = "w", Ms = 800 })); // ms only on key
+    }
+
+    [Fact]
+    public void Key_step_keys_combo_requires_ms_and_excludes_key()
+    {
+        Assert.Null(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "key", Keys = "w+space", Ms = 900 }));
+        Assert.NotNull(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "key", Keys = "w+space" }));
+        Assert.NotNull(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "key", Key = "w", Keys = "w+space", Ms = 900 }));
+        Assert.NotNull(InbriskTools.ValidateStep(
+            new InbriskTools.RunStep { Action = "key" }));
     }
 
     [Fact]

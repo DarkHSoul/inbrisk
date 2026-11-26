@@ -3541,7 +3541,7 @@ public sealed class InbriskTools
         "assert{elementId,contains|notContains|exact|state|enabled|value}, checkpoint{note}, " +
         "focus/focus_window{elementId|target|hwnd}, click|invoke|toggle|select|hover{elementId|target}, " +
         "set_value{elementId|target,text|value}, type{elementId|target,text,mode,position,submit}, " +
-        "key{key,count,ms=hold the key down for ms}, hotkey{key,modifiers OR keys:\"ctrl+s\"}, look{target,dx,dy: relative mouse look for games}, scroll{delta,target}, " +
+        "key{key,count,ms=hold the key down for ms; keys:\"w+space\"+ms holds several keys together}, hotkey{key,modifiers OR keys:\"ctrl+s\"}, look{target,dx,dy: relative mouse look for games}, mouse{target,button,ms[,keys]: hold a mouse button, optionally with keys held together, e.g. mining or space+right-click to pillar up}, scroll{delta,target}, " +
         "scroll_into_view{elementId|target}, drag{target,toX,toY}, wait{ms}, " +
         "wait_for{query,ms,target-scope:{within|process|window}}, wait_for_gone{query|target|elementId,ms}, wait_for_change/wait_for_stable{ms}, " +
         "scan/for_each{target,as,steps,where,collect,maxItems,maxPages,stopOn}, " +
@@ -6283,7 +6283,7 @@ public sealed class InbriskTools
 
                 IInputLease? physicalLease = null;
                 var requiresPhysical = built.Any(a =>
-                    a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.Look or AgentActionKind.FocusWindow or AgentActionKind.FocusElement
+                    a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.Look or AgentActionKind.MouseHold or AgentActionKind.FocusWindow or AgentActionKind.FocusElement
                     || (a.Kind is AgentActionKind.Invoke && (
                         a.ElementId == null ||
                         _s?.Rt?.Parts.Registry.Get(a.ElementId) is not { } el ||
@@ -6666,6 +6666,7 @@ public sealed class InbriskTools
         if (s.Reason != null) set.Add("reason");
         if (s.Dx != null) set.Add("dx");
         if (s.Dy != null) set.Add("dy");
+        if (s.Button != null) set.Add("button");
 
         string[]? allowed = a switch
         {
@@ -6690,9 +6691,11 @@ public sealed class InbriskTools
                 "select", "index", "orderby"],
             "type" => ["elementId", "target", "text", "value", "mode",
                 "position", "submit", "select", "index", "orderby"],
-            "key" => ["elementId", "target", "key", "count", "ms",
+            "key" => ["elementId", "target", "key", "keys", "count", "ms",
                 "select", "index", "orderby"],
             "look" => ["elementId", "target", "dx", "dy",
+                "select", "index", "orderby"],
+            "mouse" => ["elementId", "target", "button", "keys", "ms",
                 "select", "index", "orderby"],
             "hotkey" => ["elementId", "target", "key", "keys", "modifiers",
                 "select", "index", "orderby"],
@@ -6715,7 +6718,7 @@ public sealed class InbriskTools
             return $"unknown plan action '{s.Action}' — supported: scan, for_each, find, " +
                 "assert, checkpoint, human, human_takeover, pause_for_human, adapter, media, play, pause, next, previous, volume_up, volume_down, mute, " +
                 "focus, focus_window, click, rightclick, doubleclick, invoke, toggle, select, hover, set_value, type, " +
-                "key, hotkey, look, scroll, scroll_into_view, drag, wait, wait_for, wait_for_gone, wait_for_change, " +
+                "key, hotkey, look, mouse, scroll, scroll_into_view, drag, wait, wait_for, wait_for_gone, wait_for_change, " +
                 "wait_for_stable, launch";
         var bad = set.Where(f => !allowed.Contains(f,
             StringComparer.OrdinalIgnoreCase)).ToList();
@@ -6766,8 +6769,16 @@ public sealed class InbriskTools
                 "set_value requires text or value",
             "type" when s.Text == null && s.Value == null =>
                 "type requires text",
-            "key" when s.Key == null => "key requires a key name",
+            "key" when s.Key == null && s.Keys == null => "key requires a key name",
+            "key" when s.Key != null && s.Keys != null => "use either key or keys, not both",
+            "key" when s.Keys != null && s.Ms is null or <= 0 =>
+                "key with keys (e.g. \"w+space\" held together) requires ms",
             "key" when s.Ms is < 0 or > 10_000 => "key hold ms must be 0..10000",
+            "mouse" when s.Ms is null or <= 0 or > 10_000 =>
+                "mouse requires ms 1..10000 (how long to hold the button)",
+            "mouse" when s.Button != null &&
+                s.Button.ToLowerInvariant() is not ("left" or "right" or "middle") =>
+                "mouse button must be left|right|middle",
             "look" when s.Dx == null && s.Dy == null => "look requires dx and/or dy",
             "look" when Math.Abs(s.Dx ?? 0) > 4000 || Math.Abs(s.Dy ?? 0) > 4000 =>
                 "look dx/dy must be within ±4000",
@@ -7217,7 +7228,7 @@ public sealed class InbriskTools
                         var subAction = (sub.Action ?? "").ToLowerInvariant();
 
                         var effectiveSub = (sub.ElementId == null && sub.Target == null && sub.X == null &&
-                            subAction is not ("wait" or "wait_for" or "wait_for_change" or "wait_for_stable" or "key" or "hotkey" or "look" or "launch"))
+                            subAction is not ("wait" or "wait_for" or "wait_for_change" or "wait_for_stable" or "key" or "hotkey" or "look" or "mouse" or "launch"))
                             ? sub with { ElementId = $"${asVar}" }
                             : sub;
 
@@ -7655,6 +7666,7 @@ public sealed class InbriskTools
             "key" => AgentActionKind.Key,
             "hotkey" => AgentActionKind.Hotkey,
             "look" => AgentActionKind.Look,
+            "mouse" => AgentActionKind.MouseHold,
             "scroll" => AgentActionKind.Scroll,
             "scroll_into_view" => AgentActionKind.ScrollIntoView,
             "drag" => AgentActionKind.Drag,
@@ -7741,7 +7753,7 @@ public sealed class InbriskTools
             Text: s.Text ?? s.Value,
             Key: key, Modifiers: mods, Count: s.Count,
             Delta: s.Delta, Ms: s.Ms, Query: s.Query,
-            Dx: s.Dx, Dy: s.Dy)];
+            Dx: s.Dx, Dy: s.Dy, Button: s.Button)];
     }
 
     /// <summary>Does the target describe an element (role/name/relationships)
@@ -9431,7 +9443,7 @@ public sealed class InbriskTools
     /// primitives and local behaviors (scan/for_each). Conditions skip the
     /// step; they never fail it.</summary>
     public sealed record RunStep(
-        [Description("find|scan|for_each|focus|click|rightclick|doubleclick|invoke|toggle|select|hover|set_value|type|key|hotkey|look|scroll|drag|wait|wait_for|wait_for_change|wait_for_stable|assert|checkpoint|launch|human|human_takeover|pause_for_human")] string? Action = null,
+        [Description("find|scan|for_each|focus|click|rightclick|doubleclick|invoke|toggle|select|hover|set_value|type|key|hotkey|look|mouse|scroll|drag|wait|wait_for|wait_for_change|wait_for_stable|assert|checkpoint|launch|human|human_takeover|pause_for_human")] string? Action = null,
         [Description("semantic target {window,process,role,name,automationId,elementId}")] TargetSpec? Target = null,
         [Description("elementId or \"$name\" bound by an earlier find")] string? ElementId = null,
         [Description("find: bind the result under this name")] string? As = null,
@@ -9500,7 +9512,8 @@ public sealed class InbriskTools
         [Description("record this step's failure and keep executing the rest of the plan instead of pausing (batch continueOnError / failFast:false); EmergencyStopped/Cancelled still stop the run")] bool? ContinueOnError = null,
         [Description("deliver input via background window messages instead of foreground SendInput — no focus theft, works on unfocused/occluded windows; applies to click/invoke/toggle/type/set_value/close steps — unsupported kinds return NotSupported, never a silent SendInput fallback")] bool? Silent = null,
         [Description("look: relative mouse movement in raw counts, right = positive (camera look in games that capture the cursor)")] int? Dx = null,
-        [Description("look: relative mouse movement in raw counts, down = positive")] int? Dy = null)
+        [Description("look: relative mouse movement in raw counts, down = positive")] int? Dy = null,
+        [Description("mouse: button to hold, left|right|middle (default left) for ms milliseconds, pointer does not move")] string? Button = null)
     {
         /// <summary>Unknown JSON fields land here instead of being dropped —
         /// ValidateStep rejects them so a misspelled field can't fake success.</summary>
@@ -10567,7 +10580,7 @@ public sealed class InbriskTools
             // Silent (message-based) steps never touch the physical input
             // channel — they skip the PhysicalInput lease entirely.
             var requiresPhysical = steps.Any(a => !a.Silent &&
-                (a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.Look or AgentActionKind.FocusWindow or AgentActionKind.FocusElement
+                (a.Kind is AgentActionKind.Click or AgentActionKind.RightClick or AgentActionKind.DoubleClick or AgentActionKind.Drag or AgentActionKind.Scroll or AgentActionKind.Type or AgentActionKind.Key or AgentActionKind.Hotkey or AgentActionKind.Look or AgentActionKind.MouseHold or AgentActionKind.FocusWindow or AgentActionKind.FocusElement
                 || (a.Kind is AgentActionKind.Invoke && (
                     a.ElementId == null ||
                     _s?.Rt?.Parts.Registry.Get(a.ElementId) is not { } el ||

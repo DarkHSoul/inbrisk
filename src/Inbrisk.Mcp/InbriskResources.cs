@@ -222,6 +222,7 @@ public static class InbriskResources
                 ["set_value"] = new { fields = "elementId|target + text|value" },
                 ["type"] = new { fields = "elementId|target + text, mode:replace|append|insert, position:current|start|end, submit" },
                 ["key"] = new { fields = "key, count, ms (hold the key down for ms, max 10000)" },
+                ["mouse"] = new { fields = "elementId|target, ms (hold duration, max 10000), button:left|right|middle (default left) - pointer does not move; for mining/attacking in games" },
                 ["look"] = new { fields = "elementId|target, dx, dy (relative mouse movement in raw counts; for games that capture the cursor)" },
                 ["hotkey"] = new { fields = "key+modifiers:[ctrl,shift,alt,win]  OR  keys:\"ctrl+s\"" },
                 ["scroll"] = new { fields = "delta (+ elementId|target|point)" },
