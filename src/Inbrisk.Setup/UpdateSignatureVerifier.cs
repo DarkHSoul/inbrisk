@@ -138,4 +138,25 @@ public static class UpdateSignatureVerifier
             DSASignatureFormat.IeeeP1363FixedFieldConcatenation) ||
         key.VerifyData(canonicalManifest, signature, HashAlgorithmName.SHA256,
             DSASignatureFormat.Rfc3279DerSequence);
+
+    /// <summary>
+    /// Verifies the Authenticode signature of an extracted update binary using
+    /// <see cref="AuthenticodeVerifier"/>. When <paramref name="expectedThumbprint"/>
+    /// is provided, that thumbprint must match; otherwise configured build/env
+    /// thumbprints (if any) are enforced.
+    /// </summary>
+    public static AuthenticodeVerifier.VerificationResult VerifyExtractedBinary(
+        string binaryPath,
+        string? expectedThumbprint = null,
+        string? expectedSubjectContains = null)
+    {
+        if (!string.IsNullOrWhiteSpace(expectedThumbprint))
+        {
+            return AuthenticodeVerifier.Verify(binaryPath, expectedThumbprint, expectedSubjectContains);
+        }
+
+        var configured = AuthenticodeVerifier.GetConfiguredThumbprints();
+        return AuthenticodeVerifier.VerifyAgainstAllowedThumbprints(
+            binaryPath, configured, expectedSubjectContains);
+    }
 }

@@ -7,6 +7,24 @@
 #define MyAppURL "https://github.com/DarkHSoul/inbrisk"
 #define MyAppExeName "inbrisk.exe"
 
+; --- opt-in Authenticode signing (F31) --------------------------------------
+; Evaluated BEFORE [Setup] so SignTool / SignedUninstaller take effect cleanly.
+; Dev/source builds stay unsigned. Release builds pass /DSignCert plus /Sinbrisk=...
+; (wired automatically by tools\publish.ps1 -Sign) or set INBRISK_SIGN_SHA1,
+; INBRISK_SIGN_PFX, or INBRISK_AZURE_SIGNING_METADATA in the environment.
+#ifndef SignCert
+  #if GetEnv("INBRISK_SIGN_SHA1") != "" || GetEnv("INBRISK_SIGN_PFX") != "" || GetEnv("INBRISK_AZURE_SIGNING_METADATA") != ""
+    #define SignCert
+  #endif
+#endif
+#ifdef SignCert
+  #pragma message "inbrisk: Authenticode signing ENABLED"
+  #define ExeFlags "ignoreversion signonce"
+#else
+  #pragma message "inbrisk: unsigned build — pass /DSignCert or set INBRISK_SIGN_SHA1 / INBRISK_SIGN_PFX / INBRISK_AZURE_SIGNING_METADATA to sign"
+  #define ExeFlags "ignoreversion"
+#endif
+
 [Setup]
 AppId={{E5D4B261-2A1B-4C98-8F9E-379E9F3D83D1}
 AppName={#MyAppName}
@@ -19,14 +37,15 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 ; Per-user install by default (no UAC prompt required), with option to elevate to all users.
-; requestedExecutionLevel coverage (F31): Inno derives the setup/uninstall
-; manifest from PrivilegesRequired — "lowest" emits asInvoker, and the
-; overrides below relaunch elevated on demand rather than embedding
-; requireAdministrator. The SendInput binary's own manifest lives at
-; src\Inbrisk.Cli\app.manifest (no uiAccess — SendInput/UIA does not need it
-; from a non-accessibility, unsigned-or-user-signed binary).
+; When /DUiAccess is passed (signed Program Files build using app.uiaccess.manifest),
+; Windows requires the executable to reside in a secure location such as Program Files,
+; so we require administrative install scope.
+#ifdef UiAccess
+PrivilegesRequired=admin
+#else
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog commandline
+#endif
 OutputDir=..\artifacts\release
 OutputBaseFilename=InbriskSetup
 SetupIconFile=inbrisk.ico
@@ -41,26 +60,6 @@ DisableProgramGroupPage=yes
 #ifdef SignCert
 SignTool=inbrisk
 SignedUninstaller=yes
-#endif
-
-; --- opt-in Authenticode signing (F31) --------------------------------------
-; Dev/source builds stay unsigned. A release build signs the payload exe,
-; the setup binary and the uninstaller once a cert is configured — either
-; pass /DSignCert plus the sign-tool definition:
-;   iscc /DSignCert /Sinbrisk="signtool sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /sha1 $q<THUMBPRINT>$q $f" inbrisk.iss
-; or just set INBRISK_SIGN_SHA1 in the environment (the cert thumbprint the
-; release pipeline's signtool /S line already consumes).
-#ifndef SignCert
-  #if GetEnv("INBRISK_SIGN_SHA1") != ""
-    #define SignCert
-  #endif
-#endif
-#ifdef SignCert
-  #pragma message "inbrisk: Authenticode signing ENABLED (SignCert / INBRISK_SIGN_SHA1)"
-  #define ExeFlags "ignoreversion signonce"
-#else
-  #pragma message "inbrisk: unsigned build — set INBRISK_SIGN_SHA1 or pass /DSignCert to sign"
-  #define ExeFlags "ignoreversion"
 #endif
 
 [Languages]

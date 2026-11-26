@@ -9,7 +9,9 @@
     <UseWPF>true</UseWPF>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
-    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <InbriskUiAccess Condition="'$(InbriskUiAccess)' == ''">false</InbriskUiAccess>
+    <ApplicationManifest Condition="'$(InbriskUiAccess)' == 'true'">app.uiaccess.manifest</ApplicationManifest>
+    <ApplicationManifest Condition="'$(InbriskUiAccess)' != 'true'">app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\inbrisk.ico</ApplicationIcon>
     <AssemblyName>inbrisk</AssemblyName>
     <Version>1.0.0</Version>

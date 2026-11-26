@@ -280,7 +280,9 @@ public static class SelfInstaller
         // F31: base64 ECDSA P-256 signature over the canonical serialization
         // of every other field (see UpdateSignatureVerifier). signatureKeyId
         // names the signing key so the embedded anchor can rotate.
-        string? Signature = null, string? SignatureKeyId = null);
+        string? Signature = null, string? SignatureKeyId = null,
+        // Optional expected Authenticode signer SHA-1 thumbprint for the extracted exe.
+        string? SignerThumbprint = null);
 
     public sealed record UpdateResult(bool Ok, string Message,
         bool Deferred = false);
@@ -413,6 +415,22 @@ public static class SelfInstaller
             Directory.CreateDirectory(staging);
             ZipFile.ExtractToDirectory(tmp, staging);
             File.Delete(tmp);
+
+            // Verify Authenticode signature on the extracted executable when
+            // Authenticode enforcement is active or the manifest pins a signer thumbprint.
+            var stagedExe = Path.Combine(staging, InstallLayout.ExeName);
+            if (File.Exists(stagedExe) &&
+                (AuthenticodeVerifier.IsEnforced || !string.IsNullOrWhiteSpace(m.SignerThumbprint)))
+            {
+                var authResult = UpdateSignatureVerifier.VerifyExtractedBinary(
+                    stagedExe, expectedThumbprint: m.SignerThumbprint);
+                if (!authResult.IsValid)
+                {
+                    try { Directory.Delete(staging, true); } catch { }
+                    return new(false,
+                        $"Authenticode verification failed for {InstallLayout.ExeName}: {authResult.Message} — aborted");
+                }
+            }
 
             // never swap binaries under a live MCP session — defer instead
             var busy = Process.GetProcessesByName("inbrisk")
