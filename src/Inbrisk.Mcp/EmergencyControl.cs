@@ -6,7 +6,6 @@ using Inbrisk.Platform.Windows.Input;
 namespace Inbrisk.Mcp;
 
 public enum ComputerControlState { Active, Paused, EmergencyStopped }
-public enum HumanInterventionMode { Off, PauseOnKeyboard, PauseOnMouse, PauseOnAnyInput }
 
 public interface IEmergencyHotkeyRegistrar : IDisposable
 {
@@ -68,6 +67,52 @@ public sealed class FakeEmergencyHotkeyRegistrar : IEmergencyHotkeyRegistrar
 }
 
 /// <summary>
+/// Headless fake physical input monitor for deterministic unit testing without OS hooks.
+/// </summary>
+public sealed class FakePhysicalInputMonitor : IPhysicalInputMonitor
+{
+    public event Action<PhysicalInputEvent>? InputDetected;
+    public bool IsRunning { get; private set; }
+    public int MouseMoveThresholdPx { get; set; } = 12;
+    public int StartCount { get; private set; }
+    public int StopCount { get; private set; }
+    public bool Disposed { get; private set; }
+
+    public void Start()
+    {
+        if (Disposed) return;
+        IsRunning = true;
+        StartCount++;
+    }
+
+    public void Stop()
+    {
+        IsRunning = false;
+        StopCount++;
+    }
+
+    public void SimulateInput(PhysicalInputEvent ev) => InputDetected?.Invoke(ev);
+
+    public void SimulateKeyboard(uint vk = 0x41, uint flags = 0) =>
+        SimulateInput(new PhysicalInputEvent(PhysicalInputKind.Keyboard, DateTimeOffset.UtcNow, VirtualKey: vk, Flags: flags));
+
+    public void SimulateMouseMove(int x, int y, int deltaPx = 20, uint flags = 0) =>
+        SimulateInput(new PhysicalInputEvent(PhysicalInputKind.MouseMove, DateTimeOffset.UtcNow, X: x, Y: y, DeltaPx: deltaPx, Flags: flags));
+
+    public void SimulateMouseClick(int x = 100, int y = 100, uint flags = 0) =>
+        SimulateInput(new PhysicalInputEvent(PhysicalInputKind.MouseButton, DateTimeOffset.UtcNow, X: x, Y: y, DeltaPx: 0, Flags: flags));
+
+    public void SimulateMouseWheel(int x = 100, int y = 100, uint flags = 0) =>
+        SimulateInput(new PhysicalInputEvent(PhysicalInputKind.MouseWheel, DateTimeOffset.UtcNow, X: x, Y: y, DeltaPx: 0, Flags: flags));
+
+    public void Dispose()
+    {
+        Disposed = true;
+        IsRunning = false;
+    }
+}
+
+/// <summary>
 /// Process-wide emergency control. One process per machine owns the panic
 /// hotkey (the "authority"); every other Inbrisk process delegates to it via
 /// the shared stop-marker file — so an MCP host that spawns several server
@@ -83,7 +128,8 @@ public sealed class EmergencyControl : IDisposable
     public static EmergencyControl Process { get; internal set; } = new();
 
     /// <summary>Testing factory: provides an Active control instance without binding global OS hotkeys.</summary>
-    public static EmergencyControl ForTests(IEmergencyHotkeyRegistrar? registrar = null) => new(registrar ?? new FakeEmergencyHotkeyRegistrar(), testActive: true);
+    public static EmergencyControl ForTests(IEmergencyHotkeyRegistrar? registrar = null, IPhysicalInputMonitor? inputMonitor = null) =>
+        new(registrar ?? new FakeEmergencyHotkeyRegistrar(), testActive: true, inputMonitor: inputMonitor ?? new FakePhysicalInputMonitor());
 
     // scoped by chord + marker path: two processes delegate to each other
     // only when they share the exact same emergency configuration — a peer
@@ -93,8 +139,15 @@ public sealed class EmergencyControl : IDisposable
 
     private readonly object _gate = new();
     private readonly HashSet<IInputService> _inputs = new();
+    private readonly List<Func<bool>> _interventionSuppressors = new();
     private CancellationTokenSource _epoch = new();
     private readonly IEmergencyHotkeyRegistrar _registrar;
+    private readonly IPhysicalInputMonitor _inputMonitor;
+    private HumanInterventionMode _interventionMode = HumanInterventionMode.Off;
+    private int _mouseMoveThresholdPx = 12;
+    private bool _pausedByHumanIntervention;
+    private string? _pauseReason;
+    private PhysicalInputKind? _lastInterventionKind;
     private Mutex? _ownerMutex;
     private Timer? _markerWatch;
     // F18: while stopped, the authority parks a background thread holding a
@@ -118,13 +171,15 @@ public sealed class EmergencyControl : IDisposable
     private readonly bool _testMode;
     private bool _hotkeysStarted;
 
-    public EmergencyControl() : this(new RealEmergencyHotkeyRegistrar(), testActive: false)
+    public EmergencyControl() : this(new RealEmergencyHotkeyRegistrar(), testActive: false, inputMonitor: new PhysicalInputMonitor())
     {
     }
 
-    internal EmergencyControl(IEmergencyHotkeyRegistrar registrar, bool testActive = false)
+    internal EmergencyControl(IEmergencyHotkeyRegistrar registrar, bool testActive = false, IPhysicalInputMonitor? inputMonitor = null)
     {
         _registrar = registrar;
+        _inputMonitor = inputMonitor ?? new FakePhysicalInputMonitor();
+        _inputMonitor.InputDetected += OnPhysicalInput;
         if (testActive)
         {
             _state = ComputerControlState.Active;
@@ -148,12 +203,134 @@ public sealed class EmergencyControl : IDisposable
     /// <summary>Panic coverage exists but is owned by a peer process.</summary>
     public bool PanicDelegated { get { lock (_gate) return _peerAuthority; } }
     public ComputerControlState State { get { lock (_gate) return _state; } }
+    public HumanInterventionMode InterventionMode { get { lock (_gate) return _interventionMode; } }
+    public int MouseMoveThresholdPx { get { lock (_gate) return _mouseMoveThresholdPx; } }
+    public bool PausedByHumanIntervention { get { lock (_gate) return _pausedByHumanIntervention; } }
+    public string? PauseReason { get { lock (_gate) return _pauseReason; } }
+    public PhysicalInputKind? LastInterventionKind { get { lock (_gate) return _lastInterventionKind; } }
     /// <summary>The recorded panic authority (owner file) — for diagnostics
     /// surfaces like `inbrisk status`/`doctor`.</summary>
     public EmergencyGate.OwnerInfo? Authority => EmergencyGate.ReadOwner();
     /// <summary>Fired on any control-state transition — drives the screen
     /// indicator's emergency visual. Raised outside the lock.</summary>
     public event Action<ComputerControlState>? StateChanged;
+    /// <summary>Fired when physical human input pauses active control. Raised outside the lock.</summary>
+    public event Action<PhysicalInputEvent, string>? HumanInterventionDetected;
+
+    /// <summary>
+    /// Configures human-intervention auto-pause mode and mouse movement deadzone.
+    /// Starts or stops the underlying <see cref="IPhysicalInputMonitor"/> accordingly.
+    /// </summary>
+    public void ConfigureHumanIntervention(HumanInterventionMode mode, int mouseMoveThresholdPx = 12)
+    {
+        var clamped = Math.Max(0, mouseMoveThresholdPx);
+        bool shouldRun;
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _interventionMode = mode;
+            _mouseMoveThresholdPx = clamped;
+            shouldRun = mode != HumanInterventionMode.Off;
+        }
+
+        _inputMonitor.MouseMoveThresholdPx = clamped;
+        if (shouldRun)
+            _inputMonitor.Start();
+        else
+            _inputMonitor.Stop();
+    }
+
+    /// <summary>
+    /// Registers a suppression predicate (e.g. Ghost OS desktop mode) — while any registered
+    /// predicate returns true, interactive-desktop physical input will NOT pause control.
+    /// </summary>
+    public IDisposable RegisterInterventionSuppression(Func<bool> isSuppressed)
+    {
+        lock (_gate) _interventionSuppressors.Add(isSuppressed);
+        return new SuppressionRegistration(this, isSuppressed);
+    }
+
+    private void OnPhysicalInput(PhysicalInputEvent ev)
+    {
+        // Defense-in-depth: never react to injected events even if a custom monitor emits them.
+        if (ev.Kind == PhysicalInputKind.Keyboard && PhysicalInputMonitor.IsKeyboardEventInjected(ev.Flags))
+            return;
+        if (ev.Kind != PhysicalInputKind.Keyboard && PhysicalInputMonitor.IsMouseEventInjected(ev.Flags))
+            return;
+
+        IInputService[] inputs;
+        string reason;
+        lock (_gate)
+        {
+            if (_disposed || _stoppedByPanic || _state != ComputerControlState.Active)
+                return;
+
+            var matches = _interventionMode switch
+            {
+                HumanInterventionMode.Off => false,
+                HumanInterventionMode.PauseOnKeyboard => ev.Kind == PhysicalInputKind.Keyboard,
+                HumanInterventionMode.PauseOnMouse => ev.Kind is PhysicalInputKind.MouseMove or PhysicalInputKind.MouseButton or PhysicalInputKind.MouseWheel,
+                HumanInterventionMode.PauseOnAnyInput => true,
+                _ => false
+            };
+            if (!matches)
+                return;
+
+            // Defense-in-depth deadzone check for MouseMove (clicks/wheel always count).
+            if (ev.Kind == PhysicalInputKind.MouseMove && _mouseMoveThresholdPx > 0 && ev.DeltaPx < _mouseMoveThresholdPx)
+                return;
+
+            // Ghost OS / session-level suppression check.
+            foreach (var suppressor in _interventionSuppressors)
+            {
+                try { if (suppressor()) return; }
+                catch { /* fail-open to safe pause if predicate faults */ }
+            }
+
+            reason = ev.Kind == PhysicalInputKind.Keyboard
+                ? "HumanKeyboardIntervention"
+                : "HumanMouseIntervention";
+
+            _state = ComputerControlState.Paused;
+            _pausedByHumanIntervention = true;
+            _pauseReason = reason;
+            _lastInterventionKind = ev.Kind;
+            _epoch.Cancel();
+            inputs = _inputs.ToArray();
+        }
+
+        foreach (var input in inputs)
+            try { input.ReleaseAll(); }
+            catch (Exception e) { Log($"input release on human intervention failed: {e.Message}"); }
+
+        FireStateChanged();
+        try { HumanInterventionDetected?.Invoke(ev, reason); }
+        catch { /* never break control */ }
+        Log($"Paused ({reason})");
+    }
+
+    /// <summary>
+    /// Resumes control from a human-intervention <see cref="ComputerControlState.Paused"/> state.
+    /// NEVER clears <see cref="ComputerControlState.EmergencyStopped"/> — panic always requires
+    /// local resume.
+    /// </summary>
+    public bool ResumeFromPause(string source = "computer_resume_run")
+    {
+        lock (_gate)
+        {
+            if (_disposed || _stoppedByPanic || _state != ComputerControlState.Paused)
+                return false;
+            _epoch.Dispose();
+            _epoch = new CancellationTokenSource();
+            _state = ComputerControlState.Active;
+            _pausedByHumanIntervention = false;
+            _pauseReason = null;
+            _lastInterventionKind = null;
+        }
+        FireStateChanged();
+        Log($"Active ({source})");
+        return true;
+    }
 
     private void FireStateChanged()
     {
@@ -278,7 +455,7 @@ public sealed class EmergencyControl : IDisposable
             // own local gesture; mirror it. The lifetime event can only be
             // held by the authority process itself, so this branch is
             // unreachable after the authority is killed (F18).
-            ApplyResume("authority resume");
+            ApplyResume("authority resume", fromAuthoritySync: true);
         else
         {
             // Marker/mutex gone with NO live authority: the previous
@@ -481,6 +658,9 @@ public sealed class EmergencyControl : IDisposable
             if (recheckMarker && !EmergencyGate.IsStopped) return;
             _state = ComputerControlState.EmergencyStopped;
             _stoppedByPanic = true;
+            _pausedByHumanIntervention = false;
+            _pauseReason = null;
+            _lastInterventionKind = null;
             _epoch.Cancel();
             TryHoldStoppedMutexLocked();
             inputs = _inputs.ToArray();
@@ -498,23 +678,30 @@ public sealed class EmergencyControl : IDisposable
         Log($"EmergencyStopped ({source})");
     }
 
-    private void ApplyResume(string source)
+    private void ApplyResume(string source, bool fromAuthoritySync = false)
     {
         lock (_gate)
         {
+            if (_disposed) return;
+            // Authority sync only mirrors panic-stop clears; it must never
+            // auto-resume a local human-intervention Paused state.
+            if (fromAuthoritySync && !_stoppedByPanic) return;
+
             try { File.Delete(StopMarkerPath); }
             catch (Exception e) { Log($"stop marker delete failed: {e.Message}"); }
             // F18: release the held stop mutex under the same lock so peers
             // never observe "file gone, mutex still held" as a new stop.
             ReleaseStoppedMutexLocked();
 
-            if (_disposed) return;
             // SyncMarker invokes this every 150ms while no marker exists —
             // skip the teardown and broadcast unless we were actually stopped.
             if (_state == ComputerControlState.Active && !_stoppedByPanic) return;
             _epoch.Dispose();
             _epoch = new CancellationTokenSource();
             _stoppedByPanic = false;
+            _pausedByHumanIntervention = false;
+            _pauseReason = null;
+            _lastInterventionKind = null;
             _wedgeLogged = false;
             _state = ComputerControlState.Active;
             foreach (var input in _inputs)
@@ -575,6 +762,8 @@ public sealed class EmergencyControl : IDisposable
             _inputs.Clear();
         }
         _markerWatch?.Dispose();
+        try { _inputMonitor.InputDetected -= OnPhysicalInput; } catch { }
+        try { _inputMonitor.Dispose(); } catch { }
         _registrar.Dispose();
         try { _authorityEvent?.Dispose(); } catch { }
         try { _ownerMutex?.ReleaseMutex(); } catch { }
@@ -586,5 +775,10 @@ public sealed class EmergencyControl : IDisposable
     private sealed class InputRegistration(EmergencyControl owner, IInputService input) : IDisposable
     {
         public void Dispose() { lock (owner._gate) owner._inputs.Remove(input); }
+    }
+
+    private sealed class SuppressionRegistration(EmergencyControl owner, Func<bool> predicate) : IDisposable
+    {
+        public void Dispose() { lock (owner._gate) owner._interventionSuppressors.Remove(predicate); }
     }
 }

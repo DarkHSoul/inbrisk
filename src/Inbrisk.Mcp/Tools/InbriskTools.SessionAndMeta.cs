@@ -602,8 +602,8 @@ public sealed partial class InbriskTools
     {
         if (BadDetail(detail) is { } bd) return bd;
         return Text(Slim(detail)
-            ? InbriskResources.CapabilitiesJsonSlim(_s.Rt.Activity, _s.Desktop)
-            : InbriskResources.CapabilitiesJson(_s.Rt.Activity, _s.Desktop));
+            ? InbriskResources.CapabilitiesJsonSlim(_s.Rt.Activity, _s.Desktop, _s.Control)
+            : InbriskResources.CapabilitiesJson(_s.Rt.Activity, _s.Desktop, _s.Control));
     }
 
     // ------------------------------------------------------------ Desktop Shell & UI

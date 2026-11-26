@@ -98,11 +98,13 @@ public sealed partial class InbriskTools
             (e.Actions.Count > 0 ? $" {string.Join(",", e.Actions)}" : "");
     }
 
-    /// <summary>EmergencyStopped detail — always names the resume chord so
-    /// a zero-knowledge agent can tell the user how to restore control.</summary>
+    /// <summary>EmergencyStopped / Paused detail — always names how to restore control.</summary>
     private string StoppedDetail =>
-        $"computer control stopped by local hotkey; only the local user can " +
-        $"resume with {_s.Control.ResumeHotkey}";
+        _s.Control.State == ComputerControlState.Paused
+            ? $"computer control paused by human intervention ({_s.Control.PauseReason ?? "physical input"}); " +
+              $"call computer_resume_run or resume locally with {_s.Control.ResumeHotkey} to continue"
+            : $"computer control stopped by local hotkey; only the local user can " +
+              $"resume with {_s.Control.ResumeHotkey}";
 
     /// <summary>Schema text for the per-call desktop override. Kept as an
     /// override, not the mechanism: the session picks its desktop once via

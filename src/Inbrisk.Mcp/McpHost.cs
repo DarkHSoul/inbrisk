@@ -157,6 +157,9 @@ public static class McpHost
         control.StartHotkeys(
             Environment.GetEnvironmentVariable("INBRISK_PANIC_HOTKEY") ?? userSettings.PanicHotkey,
             Environment.GetEnvironmentVariable("INBRISK_RESUME_HOTKEY") ?? userSettings.ResumeHotkey);
+        control.ConfigureHumanIntervention(
+            userSettings.HumanInterventionMode,
+            userSettings.MouseMoveThresholdPx);
 
         var tray = new TrayIconService(userSettings);
         // tray callbacks run on the tray pump thread — a fault must never

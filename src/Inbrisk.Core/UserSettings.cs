@@ -106,6 +106,20 @@ public sealed class UserSettings
     /// </summary>
     public bool AllowScriptExecution { get; set; } = false;
 
+    /// <summary>
+    /// Automatic pause mode when real physical human keyboard/mouse input is detected
+    /// on the interactive desktop. Default Off.
+    /// </summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public HumanInterventionMode HumanInterventionMode { get; set; } = HumanInterventionMode.Off;
+
+    /// <summary>
+    /// Minimum cursor movement distance in pixels before mouse movement counts as human
+    /// intervention (filters 1-2px sensor jitter). Mouse clicks and wheel events always count.
+    /// Default 12px.
+    /// </summary>
+    public int MouseMoveThresholdPx { get; set; } = 12;
+
     [JsonIgnore]
     public static string SettingsPath => Path.Combine(DataDir, "settings.json");
 

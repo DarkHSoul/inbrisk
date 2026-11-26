@@ -21,6 +21,7 @@ public sealed class McpSession : IDisposable
     public InbriskRuntime Rt { get; }
     public EmergencyControl Control { get; }
     private readonly IDisposable _inputRegistration;
+    private readonly IDisposable _interventionSuppression;
     private readonly IDisposable _clientLease;
     public ObservationBuilder Obs { get; }
     public ActionResolver Resolver { get; }
@@ -370,6 +371,10 @@ public sealed class McpSession : IDisposable
         Reflex = ReflexEngines.CreateDefault(Rt);
         var p = Rt.Parts;
         _inputRegistration = control.RegisterInput(p.Input);
+        // Ghost OS exemption: when this session targets the isolated background desktop,
+        // physical input on the interactive host desktop must NOT pause Ghost execution.
+        _interventionSuppression = control.RegisterInterventionSuppression(() => OnGhostDesktop);
+        control.HumanInterventionDetected += OnHumanIntervention;
         // screen-control indicator: the session refcounted-lease pattern
         // means the smoke exists only while a client is attached —
         // Disconnected renders nothing, whatever the process state
@@ -487,6 +492,42 @@ public sealed class McpSession : IDisposable
         Rt.Activity.SetEmergency(s == ComputerControlState.EmergencyStopped);
         if (s == ComputerControlState.EmergencyStopped)
             Rt.PurgePendingWork();
+    }
+
+    private void OnHumanIntervention(PhysicalInputEvent ev, string reason)
+    {
+        if (IsDisposed || OnGhostDesktop) return;
+        try
+        {
+            var hudLabel = ev.Kind == PhysicalInputKind.Keyboard
+                ? "⏸ İnsan müdahalesi algılandı (Klavye)"
+                : "⏸ İnsan müdahalesi algılandı (Fare)";
+            try { Rt.PostHumanTakeover(hudLabel); } catch { }
+
+            List<RunState> activeRuns;
+            lock (Runs)
+                activeRuns = Runs.Values.Where(r => !r.IsPausedForHuman).ToList();
+
+            foreach (var run in activeRuns)
+            {
+                run.SafePointPauseRequested = true;
+                run.IsPausedForHuman = true;
+                run.PauseStatus = OutcomeKind.PausedForHuman.ToString();
+                run.PauseReason = reason;
+                run.PausedAt = DateTimeOffset.UtcNow;
+                try { Arbiter.CancelTask(run.RunId, reason); } catch { }
+            }
+
+            _ = NotifyAsync(DesktopEventNotification, new
+            {
+                kind = "HumanIntervention",
+                inputKind = ev.Kind.ToString(),
+                reason,
+                state = Control.State.ToString(),
+                at = ev.Timestamp
+            });
+        }
+        catch { /* never fault control callback */ }
     }
 
     private readonly Dictionary<long, AgentObservation> _observationHistory = new();
@@ -799,6 +840,8 @@ public sealed class McpSession : IDisposable
         try { Rt.Activity.ClearSessionActivity(SessionId); } catch { }
         try { Rt.Parts.Input.ReleaseAll(); } catch { }
         try { _inputRegistration.Dispose(); } catch { }
+        try { _interventionSuppression.Dispose(); } catch { }
+        try { Control.HumanInterventionDetected -= OnHumanIntervention; } catch { }
         try { Control.StateChanged -= OnControlState; } catch { }
         try { _clientLease.Dispose(); } catch { }
         // Reap processes this session spawned — graceful WM_CLOSE first, a

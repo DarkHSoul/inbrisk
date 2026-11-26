@@ -1062,6 +1062,94 @@ public sealed class InbriskControlWindow : Window
         lifeCard.Child = stLife;
         p.Children.Add(lifeCard);
 
+        // Card 3: Human Intervention Mode (Auto-Pause on Physical Input)
+        var hiCard = new Border
+        {
+            Background = InbriskTheme.Surface,
+            BorderBrush = InbriskTheme.BorderSubtle,
+            BorderThickness = new Thickness(1),
+            CornerRadius = InbriskTheme.RadiusPanel,
+            Padding = new Thickness(14, 12, 14, 12),
+            Margin = new Thickness(0, 0, 0, 10)
+        };
+        var stHi = new StackPanel();
+        stHi.Children.Add(new TextBlock
+        {
+            Text = "HUMAN INTERVENTION MODE (AUTO-PAUSE ON PHYSICAL INPUT)",
+            FontSize = 11.5,
+            FontWeight = FontWeights.Bold,
+            Foreground = InbriskTheme.TextEmber,
+            Margin = new Thickness(0, 0, 0, 4)
+        });
+        stHi.Children.Add(new TextBlock
+        {
+            Text = "Automatically pauses AI control on the interactive desktop when real physical keyboard or mouse input is detected (AI-injected inputs and Ghost OS desktop sessions are exempt).",
+            FontSize = 10.5,
+            Foreground = InbriskTheme.TextSecondary,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 8)
+        });
+
+        var modeCombo = new ComboBox
+        {
+            Width = 230,
+            FontSize = 11.5,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var modeOptions = new (HumanInterventionMode Mode, string Label)[]
+        {
+            (HumanInterventionMode.Off, "Off (Disabled)"),
+            (HumanInterventionMode.PauseOnKeyboard, "Pause on Keyboard"),
+            (HumanInterventionMode.PauseOnMouse, "Pause on Mouse"),
+            (HumanInterventionMode.PauseOnAnyInput, "Pause on Any Input (Keyboard & Mouse)")
+        };
+        foreach (var opt in modeOptions)
+            modeCombo.Items.Add(new ComboBoxItem { Content = opt.Label, Tag = opt.Mode });
+        var selectedModeIdx = Array.FindIndex(modeOptions, o => o.Mode == _settings.HumanInterventionMode);
+        modeCombo.SelectedIndex = selectedModeIdx >= 0 ? selectedModeIdx : 0;
+        modeCombo.SelectionChanged += (_, _) =>
+        {
+            if (modeCombo.SelectedItem is ComboBoxItem item && item.Tag is HumanInterventionMode selectedMode)
+            {
+                _settings.HumanInterventionMode = selectedMode;
+                _settings.Save();
+                EmergencyControl.Process.ConfigureHumanIntervention(selectedMode, _settings.MouseMoveThresholdPx);
+            }
+        };
+        stHi.Children.Add(CreateConfigRow("Auto-Pause Mode", modeCombo));
+
+        var thresholdCombo = new ComboBox
+        {
+            Width = 230,
+            FontSize = 11.5,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var thresholdOptions = new (int Px, string Label)[]
+        {
+            (4, "4 px (High Sensitivity)"),
+            (8, "8 px (Sensitive)"),
+            (12, "12 px (Default Deadzone)"),
+            (20, "20 px (Relaxed)"),
+            (32, "32 px (Low Sensitivity)")
+        };
+        foreach (var opt in thresholdOptions)
+            thresholdCombo.Items.Add(new ComboBoxItem { Content = opt.Label, Tag = opt.Px });
+        var selectedThreshIdx = Array.FindIndex(thresholdOptions, o => o.Px == _settings.MouseMoveThresholdPx);
+        thresholdCombo.SelectedIndex = selectedThreshIdx >= 0 ? selectedThreshIdx : 2;
+        thresholdCombo.SelectionChanged += (_, _) =>
+        {
+            if (thresholdCombo.SelectedItem is ComboBoxItem item && item.Tag is int px)
+            {
+                _settings.MouseMoveThresholdPx = px;
+                _settings.Save();
+                EmergencyControl.Process.ConfigureHumanIntervention(_settings.HumanInterventionMode, px);
+            }
+        };
+        stHi.Children.Add(CreateConfigRow("Mouse Move Deadzone", thresholdCombo));
+
+        hiCard.Child = stHi;
+        p.Children.Add(hiCard);
+
         scroller.Content = p;
         return scroller;
     }

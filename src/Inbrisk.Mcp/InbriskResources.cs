@@ -93,24 +93,30 @@ public static class InbriskResources
     /// inbrisk://capabilities resource and the computer_capabilities tool.</summary>
     internal static string CapabilitiesJson(
         ComputerControlActivityService? activity = null,
-        SessionDesktop? sessionDesktop = null) => JsonSerializer.Serialize(new
+        SessionDesktop? sessionDesktop = null,
+        EmergencyControl? control = null)
     {
-        server = "inbrisk",
-        build = BuildProvenance(),
-        controlState = EmergencyControl.Process.State.ToString(),
-        sessionDesktop = sessionDesktop == null ? null : SessionDesktops.ToWire(sessionDesktop.Value),
-        indicator = activity == null ? null : new
+        var ctrl = control ?? EmergencyControl.Process;
+        return JsonSerializer.Serialize(new
         {
-            state = activity.State.ToString(),
-            activeClients = activity.ActiveClients,
-            activeLeases = activity.ActiveLeases,
-        },
-        emergencyHotkey = EmergencyControl.Process.PanicHotkey,
-        emergencyHotkeyAvailable = EmergencyControl.Process.PanicAvailable,
-        panicAuthority = EmergencyControl.Process.PanicAvailable ? "local"
-            : EmergencyControl.Process.PanicDelegated ? "peer-process" : "none",
-        resumeHotkey = EmergencyControl.Process.ResumeHotkey,
-        resumeHotkeyAvailable = EmergencyControl.Process.ResumeAvailable,
+            server = "inbrisk",
+            build = BuildProvenance(),
+            controlState = ctrl.State.ToString(),
+            humanInterventionMode = ctrl.InterventionMode.ToString(),
+            pausedByHumanIntervention = ctrl.PausedByHumanIntervention,
+            sessionDesktop = sessionDesktop == null ? null : SessionDesktops.ToWire(sessionDesktop.Value),
+            indicator = activity == null ? null : new
+            {
+                state = activity.State.ToString(),
+                activeClients = activity.ActiveClients,
+                activeLeases = activity.ActiveLeases,
+            },
+            emergencyHotkey = ctrl.PanicHotkey,
+            emergencyHotkeyAvailable = ctrl.PanicAvailable,
+            panicAuthority = ctrl.PanicAvailable ? "local"
+                : ctrl.PanicDelegated ? "peer-process" : "none",
+            resumeHotkey = ctrl.ResumeHotkey,
+            resumeHotkeyAvailable = ctrl.ResumeAvailable,
         observationModes = new[] { "auto", "semantic", "visual", "both" },
         coordinateSpace = "image-space (per-frame; always pass frameId + observationId)",
         confirmation = "the client's explicit tool call is the confirmation; " +
@@ -364,24 +370,31 @@ public static class InbriskResources
             "environment awareness: NEVER close or kill your host terminal, IDE, or Colab/Jupyter notebook tabs — only close user application windows that you opened for the task",
             "system flyouts & modal popups: modern flyouts (e.g. Share/Paylaş, Open with) and dialogs (e.g. Save As, error popups) block desktop and background window input. When an active popup is reported, you must dismiss it (press Escape via computer_hotkey(key: 'Escape') or click its controls) before background interactions will succeed.",
         },
-    });
+        });
+    }
 
     /// <summary>Compact cheat-sheet for small-context models — same facts
     /// as the full schema minus per-action field tables. ~6x smaller;
     /// computer_capabilities{detail:"full"} returns the complete schema.</summary>
     internal static string CapabilitiesJsonSlim(
         ComputerControlActivityService? activity = null,
-        SessionDesktop? sessionDesktop = null) => JsonSerializer.Serialize(new
+        SessionDesktop? sessionDesktop = null,
+        EmergencyControl? control = null)
     {
-        server = "inbrisk",
-        version = typeof(InbriskResources).Assembly
-            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
-            ?.InformationalVersion
-            ?? typeof(InbriskResources).Assembly.GetName().Version?.ToString(),
-        controlState = EmergencyControl.Process.State.ToString(),
-        sessionDesktop = sessionDesktop == null ? null : SessionDesktops.ToWire(sessionDesktop.Value),
-        emergencyHotkey = EmergencyControl.Process.PanicHotkey,
-        resumeHotkey = EmergencyControl.Process.ResumeHotkey,
+        var ctrl = control ?? EmergencyControl.Process;
+        return JsonSerializer.Serialize(new
+        {
+            server = "inbrisk",
+            version = typeof(InbriskResources).Assembly
+                .GetCustomAttribute<AssemblyInformationalVersionAttribute>()
+                ?.InformationalVersion
+                ?? typeof(InbriskResources).Assembly.GetName().Version?.ToString(),
+            controlState = ctrl.State.ToString(),
+            humanInterventionMode = ctrl.InterventionMode.ToString(),
+            pausedByHumanIntervention = ctrl.PausedByHumanIntervention,
+            sessionDesktop = sessionDesktop == null ? null : SessionDesktops.ToWire(sessionDesktop.Value),
+            emergencyHotkey = ctrl.PanicHotkey,
+            resumeHotkey = ctrl.ResumeHotkey,
         outputDetail =
             "find|observe|inspect|run|capabilities accept " +
             "detail:\"slim\"|\"full\"; default via INBRISK_DETAIL env or " +
@@ -445,7 +458,8 @@ public static class InbriskResources
             "full schema: computer_capabilities{detail:\"full\"} " +
                 "or resource inbrisk://capabilities",
         },
-    });
+        });
+    }
 
     /// <summary>Which binary answered this handshake — version, build time,
     /// commit (when built inside a repo) and the executable's own file

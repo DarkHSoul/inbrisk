@@ -938,6 +938,10 @@ public sealed partial class InbriskTools
         CancellationToken ct = default)
     {
         if (BadDetail(detail) is { } bd) return bd;
+        if (_s.Control.State == ComputerControlState.EmergencyStopped)
+            return Error(OutcomeKind.EmergencyStopped, StoppedDetail);
+        if (_s.Control.State == ComputerControlState.Paused)
+            _s.Control.ResumeFromPause("computer_resume_run");
         if (!_s.Runs.TryGetValue(runId, out var state))
         {
             state = new RunState { RunId = runId, Slim = Slim(detail) };

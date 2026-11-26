@@ -94,9 +94,11 @@ public sealed partial class InbriskTools
 
         var slim = Slim(detail);
         var sb = new StringBuilder(UntrustedHeader("uia") + "\n");
-        if (!slim || _s.Control.State != ComputerControlState.Active)
+        if (!slim || _s.Control.State != ComputerControlState.Active || _s.Control.InterventionMode != HumanInterventionMode.Off)
         {
             sb.AppendLine($"controlState: {_s.Control.State}");
+            sb.AppendLine($"humanInterventionMode: {_s.Control.InterventionMode}");
+            sb.AppendLine($"pausedByHumanIntervention: {_s.Control.PausedByHumanIntervention.ToString().ToLowerInvariant()}");
             sb.AppendLine($"emergencyHotkey: {_s.Control.PanicHotkey}");
             sb.AppendLine($"emergencyHotkeyAvailable: {_s.Control.PanicAvailable}");
         }
